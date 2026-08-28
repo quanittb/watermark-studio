@@ -1,11 +1,11 @@
 # Task status checkpoints
 
-## Safety note — current local sample state (2026-08-28)
+## Safety note — current local sample state (2026-08-28, supersedes earlier note)
 
-- The previously validated render outputs were produced before the current project JSON was last saved.
-- Current project `7d4d4da4-8b57-42d1-a786-62b80fcaa758` has `OCCLUDED=150`, `MANUAL=5`, `NEED_REVIEW=748`, `AUTO_WEAK=1`, and 4 problem ranges (`151–291`, `293–479`, `481–652`, `654–902`).
-- Rendering this project is intentionally blocked by the existing unresolved-frame safety gate. No tracking data was overwritten or force-accepted.
-- Other local project folders were inspected but use a different frame-100 anchor and different templates, so they are not valid snapshots for this sample.
+- Project `7d4d4da4-8b57-42d1-a786-62b80fcaa758` was backed up before tracking interpolation at `project.json.pre-interpolation-20260828.bak`.
+- Current tracking state is `OCCLUDED=150`, `MANUAL=5`, `INTERPOLATED=749`, `NEED_REVIEW=0`, `AUTO_WEAK=0`, with `problemRanges=0`.
+- No frame was force-accepted as `MANUAL`; manual anchors remain locked and interpolated ranges retain their existing status semantics.
+- The renders below were produced after this clean tracking state was confirmed.
 
 ## Goal Set 1 — Tracking and manual enrollment
 
@@ -31,6 +31,14 @@
 - Audio: AAC preserved in both rendered outputs.
 - Outputs: `output-temporal.mp4` and `output-auto-best.mp4` render and decode successfully.
 - Current quality caveat: faint watermark residue remains in difficult textured/background ranges; do not treat this checkpoint as production-quality completion.
+
+## Explicit Inpaint render checkpoint — 2026-08-28
+
+- The current project was rendered through the Tauri UI with `RemovalMode=INPAINT`; the app completed successfully and wrote `output-inpaint.mp4`.
+- Decode validation: H.264 video, `1080×1920`, `904` frames, `7232/241` FPS, AAC 48 kHz stereo, duration `30.125s`.
+- Visual QA used the same tracked ROI on frames `170, 292, 350, 530, 710`. The new explicit path is functional and the local BFS fill avoids the old fixed-pass implementation, but frame 292 still contains readable `Learna AI` residue on textured hair; seam/texture differences remain in some ranges.
+- Acceptance result: explicit Inpaint is validated as runnable, but K (consistent visual improvement over the previous MVP) and M (visual quality acceptance) remain `PARTIAL`. Temporal and AutoBest also remain `PARTIAL` because difficult ranges are not yet residue-free.
+- QA artifacts are kept outside the repository under `C:\Users\quant\AppData\Local\Temp\watermark-studio-qa-20260828`.
 
 ## Restoration refinement checkpoint — 2026-08-28
 
