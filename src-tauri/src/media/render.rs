@@ -7,7 +7,7 @@ use crate::media::restoration::{artifact, fallback, selector, temporal};
 use crate::project::model::{
     BoundingBox, Project, RemovalConfig, RemovalMode, TrackingFrame, TrackingStatus,
 };
-use image::{imageops, GrayImage, Rgb, RgbImage};
+use image::{imageops, GrayImage, Luma, Rgb, RgbImage};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,7 +59,14 @@ where
         })?;
     // Expand the glyph-derived mask slightly so anti-aliased watermark strokes
     // are covered without falling back to a full rectangular blur.
-    let mask = dilate_mask(&solidify_mask(&load_mask(&mask_path)?, 64, 1), 3);
+    // Close small gaps in the edge-derived glyph mask before the final
+    // feather/dilation. This remains a render-time derived mask and does not
+    // alter the persisted template or tracking coordinates.
+    let mask = dilate_mask(&solidify_mask(&load_mask(&mask_path)?, 64, 2), 3);
+    // Restoration modes must cover glyph interiors even when the persisted
+    // edge-derived mask has open strokes. Keep the stronger coverage mask
+    // render-time only and bounded by each tracked bbox.
+    let restoration_mask = full_coverage_mask(&mask);
     let replacement = if matches!(config.mode, RemovalMode::Replacement) {
         Some(load_replacement(config)?)
     } else {
@@ -69,7 +76,15 @@ where
         config.mode,
         RemovalMode::TemporalRestore | RemovalMode::AutoBest
     ) {
-        return render_temporal_project(directory, project, config, &mask, cancel, on_progress);
+        return render_temporal_project(
+            directory,
+            project,
+            config,
+            &restoration_mask,
+            &mask,
+            cancel,
+            on_progress,
+        );
     }
     let raw_video = directory.join("cache").join("render-video.mp4");
     let final_temp = directory.join("cache").join("render-final.mp4");
@@ -107,7 +122,11 @@ where
             process_frame(
                 &mut frame,
                 tracking_frame,
-                &mask,
+                if config.mode == RemovalMode::Inpaint {
+                    &restoration_mask
+                } else {
+                    &mask
+                },
                 config,
                 replacement.as_ref(),
             )?;
@@ -136,7 +155,8 @@ fn render_temporal_project<F>(
     directory: &Path,
     project: &Project,
     config: &RemovalConfig,
-    mask: &GrayImage,
+    restoration_mask: &GrayImage,
+    spatial_mask: &GrayImage,
     cancel: &AtomicBool,
     mut on_progress: F,
 ) -> Result<PathBuf, AppError>
@@ -224,7 +244,12 @@ where
                 &tracking_frame.bbox,
                 config.mask_padding,
             ) {
-                let mask_region = prepare_mask_region(mask, x1 - x0 + 1, y1 - y0 + 1, config);
+                let restoration_mask_region =
+                    prepare_mask_region(restoration_mask, x1 - x0 + 1, y1 - y0 + 1, config);
+                // Keep Blur's original shaped mask so its safer fallback does
+                // not turn the entire tracked rectangle into a dark seam.
+                let spatial_mask_region =
+                    prepare_mask_region(spatial_mask, x1 - x0 + 1, y1 - y0 + 1, config);
                 let tracking_frames = &project
                     .tracking
                     .as_ref()
@@ -245,7 +270,7 @@ where
                 let temporal_result = temporal::restore_frame(
                     &mut temporal_frame,
                     tracking_frame,
-                    &mask_region,
+                    &restoration_mask_region,
                     x0,
                     y0,
                     &candidate_frames,
@@ -277,21 +302,26 @@ where
                         let mut fallback_frame = source_frame.clone();
                         let score = match fallback_mode {
                             RemovalMode::Inpaint => {
-                                apply_inpaint(&mut fallback_frame, &mask_region, x0, y0)?;
+                                apply_inpaint(
+                                    &mut fallback_frame,
+                                    &restoration_mask_region,
+                                    x0,
+                                    y0,
+                                )?;
                                 artifact::spatial_artifact_score(
                                     &source_frame,
                                     &fallback_frame,
-                                    &mask_region,
+                                    &restoration_mask_region,
                                     x0,
                                     y0,
                                 )
                             }
                             RemovalMode::Blur => {
-                                apply_blur(&mut fallback_frame, &mask_region, x0, y0)?;
+                                apply_blur(&mut fallback_frame, &spatial_mask_region, x0, y0)?;
                                 artifact::spatial_artifact_score(
                                     &source_frame,
                                     &fallback_frame,
-                                    &mask_region,
+                                    &spatial_mask_region,
                                     x0,
                                     y0,
                                 )
@@ -345,11 +375,16 @@ where
                                 RemovalMode::Inpaint => {
                                     inpaint_fallbacks += 1;
                                     let mut inpainted = frame.clone();
-                                    apply_inpaint(&mut inpainted, &mask_region, x0, y0)?;
+                                    apply_inpaint(
+                                        &mut inpainted,
+                                        &restoration_mask_region,
+                                        x0,
+                                        y0,
+                                    )?;
                                     let score = artifact::spatial_artifact_score(
                                         &source_frame,
                                         &inpainted,
-                                        &mask_region,
+                                        &restoration_mask_region,
                                         x0,
                                         y0,
                                     );
@@ -360,7 +395,7 @@ where
                                 }
                                 RemovalMode::Blur => {
                                     blur_fallbacks += 1;
-                                    apply_blur(&mut frame, &mask_region, x0, y0)?;
+                                    apply_blur(&mut frame, &spatial_mask_region, x0, y0)?;
                                     break;
                                 }
                                 _ => {}
@@ -424,6 +459,10 @@ fn fill_temporal_buffer(
         *next_frame += 1;
     }
     Ok(())
+}
+
+fn full_coverage_mask(mask: &GrayImage) -> GrayImage {
+    GrayImage::from_pixel(mask.width(), mask.height(), Luma([u8::MAX]))
 }
 
 fn prepare_mask_region(

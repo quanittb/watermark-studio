@@ -96,7 +96,11 @@ pub fn restore_frame(
                 let cx = tx + translation.dx;
                 let cy = ty + translation.dy;
                 if !in_bounds(candidate.image, cx, cy)
-                    || inside_bbox(cx, cy, &candidate.tracking.bbox, 3.0)
+                    // Keep a conservative margin around the candidate bbox:
+                    // antialiased watermark pixels can extend a few pixels
+                    // past the tracked rectangle and would otherwise leak
+                    // back into the reconstruction.
+                    || inside_bbox(cx, cy, &candidate.tracking.bbox, 8.0)
                 {
                     continue;
                 }
@@ -267,18 +271,18 @@ mod tests {
 
     #[test]
     fn reconstructs_masked_pixels_from_a_clean_neighbor() {
-        let mut target = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
-        for y in 6..10 {
-            for x in 6..10 {
+        let mut target = RgbImage::from_pixel(24, 24, Rgb([100, 100, 100]));
+        for y in 12..16 {
+            for x in 12..16 {
                 target.put_pixel(x, y, Rgb([0, 0, 0]));
             }
         }
-        let candidate = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
+        let candidate = RgbImage::from_pixel(24, 24, Rgb([100, 100, 100]));
         let target_tracking = tracking(
             1,
             BoundingBox {
-                x: 6.0,
-                y: 6.0,
+                x: 12.0,
+                y: 12.0,
                 width: 4.0,
                 height: 4.0,
             },
@@ -309,8 +313,8 @@ mod tests {
             &mut target,
             &target_tracking,
             &mask,
-            6,
-            6,
+            12,
+            12,
             &[
                 CandidateFrame {
                     frame: 0,
@@ -332,7 +336,7 @@ mod tests {
         );
 
         assert!(result.success, "{result:?}");
-        assert_eq!(target.get_pixel(8, 8), &Rgb([100, 100, 100]));
+        assert_eq!(target.get_pixel(14, 14), &Rgb([100, 100, 100]));
     }
 
     #[test]

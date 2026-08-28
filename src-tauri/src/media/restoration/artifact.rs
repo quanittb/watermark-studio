@@ -30,6 +30,8 @@ pub fn spatial_artifact_score(
     let mut restored_context = 0.0;
     let mut glyph_count = 0usize;
     let mut context_count = 0usize;
+    let mut source_change = 0.0;
+    let mut source_change_count = 0usize;
     for y in 0..analysis_mask.height() {
         for x in 0..analysis_mask.width() {
             let px = x0 + x as i32;
@@ -39,8 +41,12 @@ pub fn spatial_artifact_score(
             }
             let mask_value = analysis_mask.get_pixel(x, y)[0];
             if mask_value >= 180 {
-                original_glyph += luma(original.get_pixel(px as u32, py as u32));
-                restored_glyph += luma(restored.get_pixel(px as u32, py as u32));
+                let original_pixel = original.get_pixel(px as u32, py as u32);
+                let restored_pixel = restored.get_pixel(px as u32, py as u32);
+                original_glyph += luma(original_pixel);
+                restored_glyph += luma(restored_pixel);
+                source_change += color_distance(original_pixel, restored_pixel);
+                source_change_count += 1;
                 glyph_count += 1;
             } else if mask_value <= 64 {
                 original_context += luma(original.get_pixel(px as u32, py as u32));
@@ -83,6 +89,33 @@ pub fn spatial_artifact_score(
                     boundary_count += 1;
                 }
             }
+            // A full coverage restoration mask has no inactive neighbor
+            // inside the ROI, so also inspect the outer ROI perimeter. This
+            // catches a flat inpaint block or hard temporal seam at the
+            // tracked boundary.
+            for (nx, ny) in [
+                (x as i32 - 1, y as i32),
+                (x as i32 + 1, y as i32),
+                (x as i32, y as i32 - 1),
+                (x as i32, y as i32 + 1),
+            ] {
+                if nx >= 0
+                    && ny >= 0
+                    && nx < analysis_mask.width() as i32
+                    && ny < analysis_mask.height() as i32
+                {
+                    continue;
+                }
+                let bx = x0 + nx;
+                let by = y0 + ny;
+                if in_bounds(restored, bx, by) {
+                    boundary_error += color_distance(
+                        restored.get_pixel(px as u32, py as u32),
+                        restored.get_pixel(bx as u32, by as u32),
+                    );
+                    boundary_count += 1;
+                }
+            }
         }
     }
     if detail_count == 0 {
@@ -104,7 +137,18 @@ pub fn spatial_artifact_score(
             (restored_glyph / glyph_count as f64 - restored_context / context_count as f64).abs();
         (restored_contrast / original_contrast.max(8.0)).clamp(0.0, 1.0)
     };
-    (residual_detail * 0.50 + seam * 0.25 + glyph_residual * 0.25).clamp(0.0, 1.0)
+    // A result that barely differs from the source inside a known watermark
+    // region is suspicious: the semi-transparent glyph may still be present.
+    // Keep this cue conservative because valid temporal reconstruction can
+    // legitimately resemble the source on a static background.
+    let unchanged_residual = if source_change_count == 0 {
+        0.0
+    } else {
+        let mean_change = source_change / source_change_count as f64;
+        (1.0 - mean_change / 0.025).clamp(0.0, 1.0)
+    };
+    (residual_detail * 0.40 + seam * 0.20 + glyph_residual * 0.20 + unchanged_residual * 0.20)
+        .clamp(0.0, 1.0)
 }
 
 fn densify_analysis_mask(mask: &GrayImage) -> GrayImage {
@@ -214,5 +258,23 @@ mod tests {
 
         let small = GrayImage::new(8, 8);
         assert_eq!(densify_analysis_mask(&small), small);
+    }
+
+    #[test]
+    fn spatial_score_penalizes_a_hard_roi_boundary() {
+        let original = RgbImage::from_pixel(8, 8, Rgb([100, 100, 100]));
+        let mut smooth = original.clone();
+        let mut hard = original.clone();
+        for y in 2..6 {
+            for x in 2..6 {
+                smooth.put_pixel(x, y, Rgb([80, 80, 80]));
+                hard.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let mask = GrayImage::from_pixel(4, 4, Luma([255]));
+        assert!(
+            spatial_artifact_score(&original, &smooth, &mask, 2, 2)
+                < spatial_artifact_score(&original, &hard, &mask, 2, 2)
+        );
     }
 }

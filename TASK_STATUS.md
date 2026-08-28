@@ -64,3 +64,13 @@
 - TemporalRestore was rendered through the Tauri UI after the clean tracking state was confirmed. The app reported `Render complete` for `output-temporal.mp4`; decode validation passed with H.264 `1080×1920`, `904` frames, `7232/241` FPS, AAC 48 kHz stereo, and duration `30.125s`.
 - Visual QA reviewed frames `170, 292, 350, 530, 710` against the source and spatial outputs. Temporal/AutoBest are cleaner in several ranges, but frame 292 still shows readable `Learna AI` residue on textured hair and some seam/texture differences remain.
 - Acceptance result: artifact scoring and the Temporal render are operational, but H, I, J, K, and M remain `PARTIAL` because visual residue is not consistently eliminated. No tracking data was changed during this checkpoint.
+
+## AutoBest and explicit Inpaint re-render checkpoint — 2026-08-28
+
+- Computer Use render of `RemovalMode=AutoBest` completed successfully at 100% and wrote `output-auto-best.mp4`.
+- Output validation passed: H.264 video, `1080×1920`, `904` frames, `7232/241` FPS, duration `30.125s`, AAC audio preserved; full audio/video decode completed without FFmpeg errors.
+- Visual QA reviewed fresh output frames `170, 292, 350, 530, 710`. Frames `170`, `292`, `350`, and `710` do not show readable `Learna AI` residue in the reviewed regions; frame `530` still shows the watermark clearly.
+- The frame `530` residual is explained by the existing tracking state: its interpolated bbox is around `(x=718.99, y=620.23)`, while the visible watermark is around the upper-left area of the source frame. Tracking was not changed or force-accepted during this checkpoint.
+- Computer Use render of explicit `Spatial Inpaint` also completed successfully and wrote `output-inpaint.mp4`. Its SHA-256 is byte-identical to the AutoBest output for this project/settings; it remains a functional selectable mode, but this run does not prove consistent visual superiority.
+- Validated commands: `cargo fmt --all -- --check`, `cargo test` (32 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build` from `src-tauri`, and `npm run build` from the workspace root.
+- Acceptance remains `PARTIAL` for H, I, J, K, and M because the real sample still contains a clearly visible residual in a difficult tracking range. QA artifacts remain outside the repository under `C:\Users\quant\AppData\Local\Temp\watermark-studio-qa-20260828`.
