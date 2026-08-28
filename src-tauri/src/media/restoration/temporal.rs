@@ -157,7 +157,12 @@ pub fn restore_frame(
         }
     }
     let residual_artifact = if provisional_success {
-        spatial_artifact_score(&original, target, mask, x0, y0)
+        // Score against a small inactive context ring as well as the tracked
+        // ROI. A full-coverage restoration mask otherwise has no interior
+        // boundary, allowing a flat/dark temporal block to pass when the
+        // tracked background is also low-luminance.
+        let (score_mask, score_x0, score_y0) = mask_with_context(mask, x0, y0, 16);
+        spatial_artifact_score(&original, target, &score_mask, score_x0, score_y0)
     } else {
         1.0
     };
@@ -175,6 +180,23 @@ pub fn restore_frame(
         valid_pixel_ratio: valid_ratio,
         fallback_used: false,
     }
+}
+
+fn mask_with_context(mask: &GrayImage, x0: i32, y0: i32, margin: u32) -> (GrayImage, i32, i32) {
+    let left = margin.min(x0.max(0) as u32);
+    let top = margin.min(y0.max(0) as u32);
+    let right = margin;
+    let bottom = margin;
+    let mut expanded = GrayImage::new(
+        mask.width().saturating_add(left).saturating_add(right),
+        mask.height().saturating_add(top).saturating_add(bottom),
+    );
+    for y in 0..mask.height() {
+        for x in 0..mask.width() {
+            expanded.put_pixel(x + left, y + top, *mask.get_pixel(x, y));
+        }
+    }
+    (expanded, x0 - left as i32, y0 - top as i32)
 }
 
 fn bbox_bounds(bbox: &BoundingBox, margin: i32) -> (i32, i32, u32, u32) {
@@ -239,7 +261,7 @@ fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{restore_frame, CandidateFrame};
+    use super::{mask_with_context, restore_frame, CandidateFrame};
     use crate::project::model::{
         BoundingBox, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
     };
@@ -337,6 +359,18 @@ mod tests {
 
         assert!(result.success, "{result:?}");
         assert_eq!(target.get_pixel(14, 14), &Rgb([100, 100, 100]));
+    }
+
+    #[test]
+    fn temporal_artifact_scoring_mask_includes_only_an_inactive_context_ring() {
+        let mask = GrayImage::from_pixel(4, 3, Luma([255]));
+        let (expanded, x0, y0) = mask_with_context(&mask, 8, 9, 2);
+
+        assert_eq!((expanded.width(), expanded.height()), (8, 7));
+        assert_eq!((x0, y0), (6, 7));
+        assert_eq!(expanded.get_pixel(0, 0), &Luma([0]));
+        assert_eq!(expanded.get_pixel(2, 2), &Luma([255]));
+        assert_eq!(expanded.get_pixel(7, 6), &Luma([0]));
     }
 
     #[test]

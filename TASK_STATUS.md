@@ -74,3 +74,11 @@
 - Computer Use render of explicit `Spatial Inpaint` also completed successfully and wrote `output-inpaint.mp4`. Its SHA-256 is byte-identical to the AutoBest output for this project/settings; it remains a functional selectable mode, but this run does not prove consistent visual superiority.
 - Validated commands: `cargo fmt --all -- --check`, `cargo test` (32 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build` from `src-tauri`, and `npm run build` from the workspace root.
 - Acceptance remains `PARTIAL` for H, I, J, K, and M because the real sample still contains a clearly visible residual in a difficult tracking range. QA artifacts remain outside the repository under `C:\Users\quant\AppData\Local\Temp\watermark-studio-qa-20260828`.
+
+## Full-mode audit and temporal scoring-context checkpoint — 2026-08-28
+
+- Rebuilt the Rust binary after adding an inactive context ring to Temporal artifact scoring; the render mask remains unchanged and tracking data remains untouched.
+- Reopened the rebuilt application, confirmed the saved project loads with `0 problem range(s)`, and rendered `Temporal Restore` successfully through the UI. The output again passed full audio/video decode with `1080×1920`, `904` frames, `7232/241` FPS, `30.125s`, and AAC audio.
+- The context-ring scorer and its unit test pass, but fresh frame QA shows frame `170` still has a dark patch at the interpolated ROI while the source watermark is elsewhere. The current interpolated bbox is approximately `(x=436.55, y=449.12)` and does not cover the visible source watermark; this confirms the remaining failure is an upstream tracking mismatch, not a reason to expand the render mask or force-accept the frame.
+- Re-rendered explicit `Blur mask` and `Replacement PNG` through the UI; both completed successfully and passed the same metadata/decode audit. Together with the current `Spatial inpaint`, `Temporal Restore`, and `AutoBest` renders, all five selectable modes are operational.
+- Current code gates: `cargo fmt --all -- --check`, `cargo test` (33 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`, and `npm run build` all pass. H, I, J, K, and M remain `PARTIAL` because the real sample still contains tracking-mismatch residue and a Temporal artifact case.
