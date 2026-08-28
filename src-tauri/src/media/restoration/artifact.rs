@@ -14,6 +14,11 @@ pub fn spatial_artifact_score(
     x0: i32,
     y0: i32,
 ) -> f64 {
+    // Edge-derived masks are intentionally sparse so they blend cleanly, but
+    // that same sparsity can hide readable glyph interiors from the quality
+    // metric. Densify only the analysis mask; the render mask itself remains
+    // unchanged, so this cannot expand the pixels being modified.
+    let analysis_mask = densify_analysis_mask(mask);
     let mut original_detail = 0.0;
     let mut restored_detail = 0.0;
     let mut detail_count = 0usize;
@@ -25,14 +30,14 @@ pub fn spatial_artifact_score(
     let mut restored_context = 0.0;
     let mut glyph_count = 0usize;
     let mut context_count = 0usize;
-    for y in 0..mask.height() {
-        for x in 0..mask.width() {
+    for y in 0..analysis_mask.height() {
+        for x in 0..analysis_mask.width() {
             let px = x0 + x as i32;
             let py = y0 + y as i32;
             if !in_bounds(original, px, py) || px < 1 || py < 1 {
                 continue;
             }
-            let mask_value = mask.get_pixel(x, y)[0];
+            let mask_value = analysis_mask.get_pixel(x, y)[0];
             if mask_value >= 180 {
                 original_glyph += luma(original.get_pixel(px as u32, py as u32));
                 restored_glyph += luma(restored.get_pixel(px as u32, py as u32));
@@ -62,9 +67,9 @@ pub fn spatial_artifact_score(
             ] {
                 if nx < 0
                     || ny < 0
-                    || nx >= mask.width() as i32
-                    || ny >= mask.height() as i32
-                    || mask.get_pixel(nx as u32, ny as u32)[0] >= 64
+                    || nx >= analysis_mask.width() as i32
+                    || ny >= analysis_mask.height() as i32
+                    || analysis_mask.get_pixel(nx as u32, ny as u32)[0] >= 64
                 {
                     continue;
                 }
@@ -100,6 +105,28 @@ pub fn spatial_artifact_score(
         (restored_contrast / original_contrast.max(8.0)).clamp(0.0, 1.0)
     };
     (residual_detail * 0.50 + seam * 0.25 + glyph_residual * 0.25).clamp(0.0, 1.0)
+}
+
+fn densify_analysis_mask(mask: &GrayImage) -> GrayImage {
+    if mask.width() < 16 || mask.height() < 16 {
+        return mask.clone();
+    }
+
+    let active = mask.pixels().filter(|pixel| pixel[0] >= 64).count() as f64;
+    let total = f64::from(mask.width() * mask.height());
+    if active / total >= 0.70 {
+        return mask.clone();
+    }
+
+    let border_x = (mask.width() / 16).clamp(3, 12);
+    let border_y = (mask.height() / 12).clamp(3, 10);
+    let mut dense = mask.clone();
+    for y in border_y..mask.height().saturating_sub(border_y) {
+        for x in border_x..mask.width().saturating_sub(border_x) {
+            dense.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    dense
 }
 
 fn local_detail(image: &RgbImage, x: i32, y: i32) -> Option<f64> {
@@ -144,7 +171,8 @@ pub fn accept_temporal_patch(valid_ratio: f64, artifact_score: f64, threshold: f
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_temporal_patch, artifact_score, spatial_artifact_score, temporal_consistency,
+        accept_temporal_patch, artifact_score, densify_analysis_mask, spatial_artifact_score,
+        temporal_consistency,
     };
     use image::{GrayImage, Luma, Rgb, RgbImage};
 
@@ -175,5 +203,16 @@ mod tests {
             spatial_artifact_score(&original, &original, &mask, 3, 3)
                 < spatial_artifact_score(&noisy, &noisy, &mask, 3, 3)
         );
+    }
+
+    #[test]
+    fn sparse_analysis_mask_covers_glyph_interior_without_changing_small_masks() {
+        let sparse = GrayImage::new(32, 24);
+        let dense = densify_analysis_mask(&sparse);
+        assert_eq!(dense.get_pixel(16, 12)[0], 255);
+        assert_eq!(dense.get_pixel(0, 0)[0], 0);
+
+        let small = GrayImage::new(8, 8);
+        assert_eq!(densify_analysis_mask(&small), small);
     }
 }

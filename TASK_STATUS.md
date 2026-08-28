@@ -56,3 +56,11 @@
 - Existing explicit modes and fallback policies remain unchanged; Replacement remains an explicit deliberate mode.
 - Added selector tests for lowest score, stable tie preference, failed candidates, and near-equal previous-method preference.
 - Validation: `cargo fmt --all -- --check`, `cargo test` (30 passed), `cargo clippy --all-targets --all-features -- -D warnings`, and `npm run build` pass.
+
+## Artifact scoring and Temporal render checkpoint — 2026-08-28
+
+- Artifact analysis now densifies only sparse analysis masks before scoring, so enclosed glyph interiors contribute to residual detection without expanding the render-time mask or changing persisted tracking data.
+- Validation: `cargo fmt --all -- --check`, `cargo test` (31 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`, and `npm run build` pass.
+- TemporalRestore was rendered through the Tauri UI after the clean tracking state was confirmed. The app reported `Render complete` for `output-temporal.mp4`; decode validation passed with H.264 `1080×1920`, `904` frames, `7232/241` FPS, AAC 48 kHz stereo, and duration `30.125s`.
+- Visual QA reviewed frames `170, 292, 350, 530, 710` against the source and spatial outputs. Temporal/AutoBest are cleaner in several ranges, but frame 292 still shows readable `Learna AI` residue on textured hair and some seam/texture differences remain.
+- Acceptance result: artifact scoring and the Temporal render are operational, but H, I, J, K, and M remain `PARTIAL` because visual residue is not consistently eliminated. No tracking data was changed during this checkpoint.
