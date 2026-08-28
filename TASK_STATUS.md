@@ -122,3 +122,9 @@
 - Tracker policy confirmed: only `AUTO_GOOD` advances the prediction trajectory; `AUTO_WEAK` and `NEED_REVIEW` remain visible for manual review. Rust and UI render gates reject unresolved weak/review frames.
 - Repository verification: working tree clean and `HEAD` matches `origin/main` at `8ac9876` (`make tracking review action explicit`).
 - Goal Set 2 remains active and not complete until the user reviews the three ranges and fresh rendered outputs pass visual quality validation.
+
+## Quality-gate verification checkpoint — 2026-08-28
+
+- Re-ran the required checks on the current source after the review-gated changes: `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml` (37 passed), `cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo build --manifest-path src-tauri/Cargo.toml`, and `npm run build`.
+- All commands passed with no warnings/errors requiring action.
+- No tracking data was changed by this validation. The project remains intentionally blocked from rendering until the user reviews `125–128`, `136`, and `139–140`.
