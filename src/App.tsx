@@ -320,6 +320,17 @@ export default function App() {
     if (next) { setVideoFrame(next.worstFrame); setMessage(`Review frame ${next.worstFrame} (${next.startFrame}–${next.endFrame}).`); }
   };
 
+  const handleTrackingNavigation = () => {
+    if (!project || isBusy) return;
+    if (project.tracking?.problemRanges.length) {
+      nextProblem();
+    } else if (project.tracking) {
+      setMessage('Tracking is complete. Use Re-analyze track only if a new analysis is intended.');
+    } else {
+      void runAnalyzeTrack();
+    }
+  };
+
   const interpolateCurrentRange = async () => {
     if (!project?.tracking || isBusy) return;
     const range = project.tracking.problemRanges.find((item) => currentFrame >= item.startFrame && currentFrame <= item.endFrame) ?? project.tracking.problemRanges[0];
@@ -386,7 +397,7 @@ export default function App() {
         <div className="brand"><div className="brand-mark">W</div><div><strong>Watermark Studio</strong><span>Desktop beta</span></div></div>
         <nav className="nav-stack">
           <button className="nav-item active"><Icon>◫</Icon> Project</button>
-          <button className="nav-item" onClick={() => void runAnalyzeTrack()} disabled={!project || isBusy || !project.watermark.anchor}><Icon>⌁</Icon> Track</button>
+          <button className="nav-item" onClick={handleTrackingNavigation} disabled={!project || isBusy || !project.watermark.anchor} title={project?.tracking ? 'Jump to the next frame that needs review' : 'Analyze the watermark track'}><Icon>⌁</Icon> {project?.tracking ? 'Review' : 'Track'}</button>
           <button className="nav-item" onClick={() => setMessage('Choose a removal mode in the inspector.')} disabled={!project?.tracking}><Icon>◌</Icon> Remove</button>
           <button className="nav-item" disabled title="Available in a later phase"><Icon>⚙</Icon> Settings</button>
         </nav>
@@ -403,7 +414,7 @@ export default function App() {
           <div><span className="eyebrow">PROJECT</span><h1>Moving Watermark Removal</h1></div>
           <div className="top-actions">
             <button className="button secondary" onClick={() => void chooseAndOpenVideo()} disabled={isBusy}>{loadingTask === 'opening' ? 'Opening…' : 'Open video'}</button>
-            <button className="button secondary" onClick={() => void runAnalyzeTrack()} disabled={!project || isBusy || !project.watermark.anchor}>{loadingTask === 'tracking' ? 'Tracking…' : 'Analyze track'}</button>
+            <button className="button secondary" onClick={() => void runAnalyzeTrack()} disabled={!project || isBusy || !project.watermark.anchor}>{loadingTask === 'tracking' ? 'Tracking…' : project?.tracking ? 'Re-analyze track' : 'Analyze track'}</button>
           </div>
         </header>
         {error && <div className="error-banner" role="alert">{error}</div>}
