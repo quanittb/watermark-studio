@@ -26,21 +26,7 @@ where
     let tracking = project.tracking.as_ref().ok_or_else(|| {
         AppError::InvalidRequest("Analyze the track before rendering.".to_string())
     })?;
-    if tracking.frames.len() != project.video.frame_count as usize {
-        return Err(AppError::InvalidRequest(
-            "Tracking data does not cover the complete video.".to_string(),
-        ));
-    }
-    if tracking.frames.iter().any(|frame| {
-        matches!(
-            frame.status,
-            TrackingStatus::NeedReview | TrackingStatus::AutoWeak
-        )
-    }) {
-        return Err(AppError::InvalidRequest(
-            "There are unresolved tracking frames. Review them before rendering.".to_string(),
-        ));
-    }
+    validate_tracking_for_render(&tracking.frames, project.video.frame_count as usize)?;
     if matches!(config.mode, RemovalMode::Replacement) && config.replacement_path.is_none() {
         return Err(AppError::InvalidRequest(
             "Choose a replacement PNG before rendering.".to_string(),
@@ -156,6 +142,28 @@ where
 struct BufferedFrame {
     index: u64,
     image: RgbImage,
+}
+
+fn validate_tracking_for_render(
+    frames: &[TrackingFrame],
+    expected_frame_count: usize,
+) -> Result<(), AppError> {
+    if frames.len() != expected_frame_count {
+        return Err(AppError::InvalidRequest(
+            "Tracking data does not cover the complete video.".to_string(),
+        ));
+    }
+    if frames.iter().any(|frame| {
+        matches!(
+            frame.status,
+            TrackingStatus::NeedReview | TrackingStatus::AutoWeak
+        )
+    }) {
+        return Err(AppError::InvalidRequest(
+            "There are unresolved tracking frames. Review them before rendering.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn render_temporal_project<F>(
@@ -1036,9 +1044,66 @@ fn mux_audio(video: &Path, source: &Path, output: &Path) -> Result<(), AppError>
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_inpaint, mask_bounds, record_strategy_segment};
-    use crate::project::model::{BoundingBox, RemovalMode};
+    use super::{
+        apply_inpaint, mask_bounds, record_strategy_segment, validate_tracking_for_render,
+    };
+    use crate::error::AppError;
+    use crate::project::model::{
+        BoundingBox, RemovalMode, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
+    };
     use image::{GrayImage, Rgb, RgbImage};
+
+    fn tracking_frame(status: TrackingStatus) -> TrackingFrame {
+        TrackingFrame {
+            frame: 0,
+            timestamp_seconds: 0.0,
+            bbox: BoundingBox {
+                x: 2.0,
+                y: 2.0,
+                width: 8.0,
+                height: 8.0,
+            },
+            confidence: 1.0,
+            status,
+            source: TrackingSource::Forward,
+            locked: false,
+            scores: TrackingScores {
+                template: 1.0,
+                highpass: 1.0,
+                edge: 1.0,
+                motion: 1.0,
+                position: 1.0,
+                size: 1.0,
+                optical_flow: Some(1.0),
+                forward_backward: Some(1.0),
+                motion_smoothness: Some(1.0),
+                match_margin: Some(1.0),
+            },
+        }
+    }
+
+    #[test]
+    fn render_gate_blocks_unresolved_tracking_but_allows_occluded_frames() {
+        for status in [TrackingStatus::AutoWeak, TrackingStatus::NeedReview] {
+            let error = validate_tracking_for_render(&[tracking_frame(status)], 1)
+                .expect_err("unresolved tracking must block rendering");
+            assert!(matches!(
+                error,
+                AppError::InvalidRequest(message)
+                    if message.contains("unresolved tracking frames")
+            ));
+        }
+
+        validate_tracking_for_render(
+            &[
+                tracking_frame(TrackingStatus::Occluded),
+                tracking_frame(TrackingStatus::Manual),
+                tracking_frame(TrackingStatus::Interpolated),
+            ],
+            3,
+        )
+        .expect("occluded frames are safe no-op frames");
+    }
 
     #[test]
     fn mask_bounds_cover_the_full_bbox_and_padding() {

@@ -134,3 +134,10 @@
 - Added a deterministic synthetic restoration test with a moving semi-transparent watermark over a textured gradient. It verifies that clean neighboring candidates reconstruct the target ROI while pixels outside the ROI remain unchanged.
 - The full Rust suite now passes `38/38`; formatting was normalized and `cargo fmt --check` passes.
 - This strengthens the engine-level temporal acceptance evidence, but does not replace visual QA on the real 904-frame project. That QA remains pending until the user resolves the three review ranges.
+
+## Render-gate regression checkpoint — 2026-08-28
+
+- Extracted the unresolved-tracking render gate into a dedicated validator and added a regression test: `AUTO_WEAK` and `NEED_REVIEW` are rejected, while `OCCLUDED`, `MANUAL`, and `INTERPOLATED` remain render-eligible (`OCCLUDED` is a no-op at frame processing).
+- Full Rust suite passes `39/39`; `cargo fmt --check`, Clippy, Rust build, and `npm run build` pass.
+- Rebuilt and restarted the app after the change. Computer Use confirms exactly one responsive window, the saved project loads, `Review` and `Re-analyze track` are visible, and `Render video` is disabled while the three unresolved ranges remain.
+- The real project state is unchanged: `INTERPOLATED=745`, `MANUAL=10`, `OCCLUDED=142`, `NEED_REVIEW=7`; no review frame was auto-resolved.
