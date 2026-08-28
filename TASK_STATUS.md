@@ -19,7 +19,7 @@
 - G Restoration Architecture: `COMPLETE` — restoration layer, model, alignment, artifact, temporal, and fallback modules exist.
 - H Temporal Restoration Core: `PARTIAL` — neighboring-frame selection, lookbehind/lookahead buffering, local translation alignment, median reconstruction, and conservative rejection are implemented; the real sample still has difficult scenes with visible residue.
 - I Artifact Reduction / Anti-Flicker: `PARTIAL` — alignment outlier filtering, post-composite artifact checks, glyph-residual heuristic, and deterministic fallback reduce bad patches; visual review still found residual blur in some ranges.
-- J AutoBest / Fallback Cascade: `PARTIAL` — AutoBest is wired and deterministic, with Temporal → Inpaint → Blur fallback; it currently uses the same per-frame scoring path as Temporal Restore and is not yet segment-optimized.
+- J AutoBest / Fallback Cascade: `PARTIAL` — AutoBest now evaluates successful Temporal, Inpaint, and Blur candidates on each frame according to the configured fallback policy, then selects deterministically with strategy hysteresis; real-case visual proof is still pending.
 - K Inpaint Quality Improvement: `PARTIAL` — inpaint remains functional and can be evaluated before Blur fallback, but the real sample does not yet prove a consistent visual improvement over the previous MVP in every range.
 - L UI Integration: `COMPLETE` — Temporal Restore, Auto Best, restoration settings, ROI padding, fallback policy, and progress behavior are integrated without redesigning the UI.
 - M Tests / Validation: `PARTIAL` — unit tests, Rust/TypeScript quality gates, and real 904-frame Temporal/AutoBest renders pass container/decode checks; visual quality acceptance is intentionally not marked complete.
@@ -40,3 +40,11 @@
 - Tests added for wide-mask inpaint coverage, unusable temporal candidates, and deterministic majority-pixel selection.
 - Validation: `cargo fmt --all -- --check`, `cargo test` (26 passed), `cargo clippy --all-targets --all-features -- -D warnings`, and `npm run build` pass.
 - Visual/904-frame validation remains pending until the same sample project has a clean, confirmed tracking state; existing outputs must not be treated as validation of this refinement checkpoint.
+
+## AutoBest selection checkpoint — 2026-08-28
+
+- Added `restoration/selector.rs` with deterministic quality-score selection and a small previous-strategy hysteresis penalty to reduce adjacent-frame mode switching.
+- `AutoBest` now evaluates TemporalRestore, configured spatial fallbacks, and chooses the lowest-scoring successful result instead of aliasing the TemporalRestore path.
+- Existing explicit modes and fallback policies remain unchanged; Replacement remains an explicit deliberate mode.
+- Added selector tests for lowest score, stable tie preference, failed candidates, and near-equal previous-method preference.
+- Validation: `cargo fmt --all -- --check`, `cargo test` (30 passed), `cargo clippy --all-targets --all-features -- -D warnings`, and `npm run build` pass.

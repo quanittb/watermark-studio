@@ -3,7 +3,7 @@ use crate::media::ffmpeg;
 use crate::media::mask::{dilate_mask, load_mask, solidify_mask};
 use crate::media::restoration::model::TemporalSettings;
 use crate::media::restoration::temporal::CandidateFrame;
-use crate::media::restoration::{artifact, fallback, temporal};
+use crate::media::restoration::{artifact, fallback, selector, temporal};
 use crate::project::model::{
     BoundingBox, Project, RemovalConfig, RemovalMode, TrackingFrame, TrackingStatus,
 };
@@ -178,6 +178,7 @@ where
     let mut temporal_fallbacks = 0u64;
     let mut inpaint_fallbacks = 0u64;
     let mut blur_fallbacks = 0u64;
+    let mut previous_auto_mode = None;
     let mut next_frame = 0u64;
     let mut current = 0u64;
     fill_temporal_buffer(
@@ -239,8 +240,10 @@ where
                     })
                     .collect::<Vec<_>>();
                 candidate_frames.sort_by_key(|item| item.frame.abs_diff(current));
+                let source_frame = frame.clone();
+                let mut temporal_frame = source_frame.clone();
                 let temporal_result = temporal::restore_frame(
-                    &mut frame,
+                    &mut temporal_frame,
                     tracking_frame,
                     &mask_region,
                     x0,
@@ -248,42 +251,120 @@ where
                     &candidate_frames,
                     settings,
                 );
-                let _quality_snapshot = (
+                // Keep the structured diagnostics live for future render
+                // telemetry, even when the selected output is a fallback.
+                let _temporal_quality_snapshot = (
                     temporal_result.strategy,
-                    temporal_result.artifact_score,
                     temporal_result.temporal_consistency_score,
                     temporal_result.valid_pixel_ratio,
                     temporal_result.fallback_used,
                 );
-                if temporal_result.success {
-                    temporal_successes += 1;
-                } else {
-                    temporal_fallbacks += 1;
-                    let source_frame = frame.clone();
+                if config.mode == RemovalMode::AutoBest {
+                    let mut evaluated = Vec::new();
+                    if temporal_result.success {
+                        evaluated.push((
+                            selector::StrategyCandidate {
+                                mode: RemovalMode::TemporalRestore,
+                                score: temporal_result.artifact_score,
+                                success: true,
+                            },
+                            temporal_frame,
+                        ));
+                    } else {
+                        temporal_fallbacks += 1;
+                    }
                     for fallback_mode in fallback::fallback_modes(config.fallback_policy) {
-                        match fallback_mode {
+                        let mut fallback_frame = source_frame.clone();
+                        let score = match fallback_mode {
                             RemovalMode::Inpaint => {
-                                inpaint_fallbacks += 1;
-                                let mut inpainted = frame.clone();
-                                apply_inpaint(&mut inpainted, &mask_region, x0, y0)?;
-                                let score = artifact::spatial_artifact_score(
+                                apply_inpaint(&mut fallback_frame, &mask_region, x0, y0)?;
+                                artifact::spatial_artifact_score(
                                     &source_frame,
-                                    &inpainted,
+                                    &fallback_frame,
                                     &mask_region,
                                     x0,
                                     y0,
-                                );
-                                frame = inpainted;
-                                if score <= settings.artifact_threshold {
-                                    break;
-                                }
+                                )
                             }
                             RemovalMode::Blur => {
-                                blur_fallbacks += 1;
-                                apply_blur(&mut frame, &mask_region, x0, y0)?;
-                                break;
+                                apply_blur(&mut fallback_frame, &mask_region, x0, y0)?;
+                                artifact::spatial_artifact_score(
+                                    &source_frame,
+                                    &fallback_frame,
+                                    &mask_region,
+                                    x0,
+                                    y0,
+                                )
                             }
-                            _ => {}
+                            _ => continue,
+                        };
+                        evaluated.push((
+                            selector::StrategyCandidate {
+                                mode: fallback_mode,
+                                score,
+                                success: true,
+                            },
+                            fallback_frame,
+                        ));
+                    }
+                    let choices = evaluated
+                        .iter()
+                        .map(|(candidate, _)| *candidate)
+                        .collect::<Vec<_>>();
+                    let selected_mode =
+                        selector::select_best_with_preference(&choices, previous_auto_mode)
+                            .ok_or_else(|| {
+                                AppError::InvalidRequest(
+                                    "No restoration strategy produced a valid frame.".to_string(),
+                                )
+                            })?;
+                    previous_auto_mode = Some(selected_mode);
+                    frame = evaluated
+                        .into_iter()
+                        .find(|(candidate, _)| candidate.mode == selected_mode)
+                        .map(|(_, image)| image)
+                        .ok_or_else(|| {
+                            AppError::InvalidRequest(
+                                "Selected restoration strategy was not evaluated.".to_string(),
+                            )
+                        })?;
+                    match selected_mode {
+                        RemovalMode::TemporalRestore => temporal_successes += 1,
+                        RemovalMode::Inpaint => inpaint_fallbacks += 1,
+                        RemovalMode::Blur => blur_fallbacks += 1,
+                        _ => {}
+                    }
+                } else {
+                    frame = temporal_frame;
+                    if temporal_result.success {
+                        temporal_successes += 1;
+                    } else {
+                        temporal_fallbacks += 1;
+                        for fallback_mode in fallback::fallback_modes(config.fallback_policy) {
+                            match fallback_mode {
+                                RemovalMode::Inpaint => {
+                                    inpaint_fallbacks += 1;
+                                    let mut inpainted = frame.clone();
+                                    apply_inpaint(&mut inpainted, &mask_region, x0, y0)?;
+                                    let score = artifact::spatial_artifact_score(
+                                        &source_frame,
+                                        &inpainted,
+                                        &mask_region,
+                                        x0,
+                                        y0,
+                                    );
+                                    frame = inpainted;
+                                    if score <= settings.artifact_threshold {
+                                        break;
+                                    }
+                                }
+                                RemovalMode::Blur => {
+                                    blur_fallbacks += 1;
+                                    apply_blur(&mut frame, &mask_region, x0, y0)?;
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
