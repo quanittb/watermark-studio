@@ -147,3 +147,9 @@
 - Rebuilt the debug executable after adding the render-gate regression test; the only build interruption was the expected lock from the previously running executable, which was stopped and restarted cleanly.
 - Current runtime has one `watermark-studio` process/window and reloads the saved project with the review gate active.
 - The added validator is now covered by the full `39/39` Rust test suite, including both unresolved-state rejection and safe `OCCLUDED` handling.
+
+## Review queue UI checkpoint — 2026-08-28
+
+- Added an explicit review-queue summary to the inspector so the exact unresolved ranges are visible: `125–128`, `136`, and `139–140`.
+- This is display/navigation-only: it does not modify tracking data, accept frames, interpolate ranges, or bypass the render gate.
+- `npm run build` passes, and the rebuilt runtime visibly loads the saved project with the queue summary and disabled `Render video` action.
