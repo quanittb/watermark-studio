@@ -141,3 +141,9 @@
 - Full Rust suite passes `39/39`; `cargo fmt --check`, Clippy, Rust build, and `npm run build` pass.
 - Rebuilt and restarted the app after the change. Computer Use confirms exactly one responsive window, the saved project loads, `Review` and `Re-analyze track` are visible, and `Render video` is disabled while the three unresolved ranges remain.
 - The real project state is unchanged: `INTERPOLATED=745`, `MANUAL=10`, `OCCLUDED=142`, `NEED_REVIEW=7`; no review frame was auto-resolved.
+
+## Runtime regression verification checkpoint — 2026-08-28
+
+- Rebuilt the debug executable after adding the render-gate regression test; the only build interruption was the expected lock from the previously running executable, which was stopped and restarted cleanly.
+- Current runtime has one `watermark-studio` process/window and reloads the saved project with the review gate active.
+- The added validator is now covered by the full `39/39` Rust test suite, including both unresolved-state rejection and safe `OCCLUDED` handling.
