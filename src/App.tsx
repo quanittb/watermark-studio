@@ -293,7 +293,7 @@ export default function App() {
       setSelection(null);
       setMessage(`Tracking complete. ${updatedProject.tracking?.problemRanges.length ?? 0} problem range(s) need review.`);
     } catch (trackingError) { setError(getErrorMessage(trackingError)); setMessage('Tracking failed'); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const runRetrack = async () => {
@@ -305,7 +305,7 @@ export default function App() {
       setSelection(null);
       setMessage(`Section re-tracked. ${updatedProject.tracking?.problemRanges.length ?? 0} problem range(s) remain.`);
     } catch (trackingError) { setError(getErrorMessage(trackingError)); setMessage('Re-track failed'); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const cancelBusy = () => {
@@ -327,7 +327,7 @@ export default function App() {
     setLoadingTask('saving'); setError(null); setMessage(`Interpolating frames ${range.startFrame}–${range.endFrame} between locked anchors…`);
     try { setProject(await interpolateTrackingRange(project.id, range.startFrame, range.endFrame)); setSelection(null); setMessage('Range interpolated and marked explicitly as INTERPOLATED.'); }
     catch (interpolationError) { setError(getErrorMessage(interpolationError)); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const acceptCurrentFrame = async () => {
@@ -335,7 +335,7 @@ export default function App() {
     setLoadingTask('saving'); setError(null);
     try { setProject(await acceptTrackingFrame(project.id, currentFrame)); setMessage(`Frame ${currentFrame} accepted and locked.`); }
     catch (acceptError) { setError(getErrorMessage(acceptError)); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const markCurrentRangeOccluded = async () => {
@@ -348,7 +348,7 @@ export default function App() {
       setSelection(null);
       setMessage(`Frames ${range.startFrame}–${range.endFrame} marked occluded; rendering is a no-op for this range.`);
     } catch (occludedError) { setError(getErrorMessage(occludedError)); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const chooseReplacement = async () => {
@@ -365,7 +365,7 @@ export default function App() {
       const result = await renderVideo(saved.id, removal);
       setMessage(`Render complete: ${result.outputPath}`);
     } catch (renderError) { setError(getErrorMessage(renderError)); setMessage('Render failed'); }
-    finally { setLoadingTask(null); }
+    finally { setLoadingTask(null); setProgress(null); }
   };
 
   const togglePlayback = () => {

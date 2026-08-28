@@ -1,5 +1,10 @@
 # Task status checkpoints
 
+## Progress lifecycle checkpoint — 2026-08-28
+
+- Cleared stale operation progress when tracking, interpolation, manual correction, occlusion marking, or rendering finishes or fails, so a canceled/failed operation cannot appear to keep running.
+- TypeScript/Vite production build passes after the UI change; tracking data remains untouched and review gating is unchanged.
+
 ## Review-safe UI verification checkpoint — 2026-08-28
 
 - Restarted the debug app after the previous unresponsive instance; only one responsive `watermark-studio` process/window remains.
