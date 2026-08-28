@@ -53,11 +53,71 @@ pub fn solidify_mask(mask: &GrayImage, threshold: u8, close_radius: u32) -> Gray
     for (x, y, pixel) in mask.enumerate_pixels() {
         binary.put_pixel(x, y, Luma([if pixel[0] >= threshold { 255 } else { 0 }]));
     }
-    if close_radius == 0 {
-        return binary;
+    let closed = if close_radius == 0 {
+        binary
+    } else {
+        let expanded = morphology_dilate(&binary, close_radius);
+        morphology_erode(&expanded, close_radius)
+    };
+    // The template mask is edge-derived. Filling enclosed holes turns closed
+    // glyph outlines into coverage masks, so the glyph interior is restored as
+    // well instead of leaving the watermark readable in its center.
+    fill_enclosed_regions(&closed)
+}
+
+fn fill_enclosed_regions(mask: &GrayImage) -> GrayImage {
+    let width = mask.width() as usize;
+    let height = mask.height() as usize;
+    if width == 0 || height == 0 {
+        return mask.clone();
     }
-    let expanded = morphology_dilate(&binary, close_radius);
-    morphology_erode(&expanded, close_radius)
+
+    let mut outside = vec![false; width * height];
+    let mut pending = std::collections::VecDeque::new();
+    let enqueue = |x: usize,
+                   y: usize,
+                   outside: &mut [bool],
+                   pending: &mut std::collections::VecDeque<(usize, usize)>| {
+        let index = y * width + x;
+        if mask.get_pixel(x as u32, y as u32)[0] == 0 && !outside[index] {
+            outside[index] = true;
+            pending.push_back((x, y));
+        }
+    };
+
+    for x in 0..width {
+        enqueue(x, 0, &mut outside, &mut pending);
+        enqueue(x, height - 1, &mut outside, &mut pending);
+    }
+    for y in 0..height {
+        enqueue(0, y, &mut outside, &mut pending);
+        enqueue(width - 1, y, &mut outside, &mut pending);
+    }
+
+    while let Some((x, y)) = pending.pop_front() {
+        for (nx, ny) in [
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ] {
+            if nx >= width || ny >= height {
+                continue;
+            }
+            enqueue(nx, ny, &mut outside, &mut pending);
+        }
+    }
+
+    let mut filled = mask.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if mask.get_pixel(x as u32, y as u32)[0] == 0 && !outside[index] {
+                filled.put_pixel(x as u32, y as u32, Luma([255]));
+            }
+        }
+    }
+    filled
 }
 
 fn morphology_dilate(mask: &GrayImage, radius: u32) -> GrayImage {
@@ -156,6 +216,6 @@ mod tests {
         let solid = solidify_mask(&mask, 18, 1);
 
         assert_eq!(solid.get_pixel(0, 0)[0], 255);
-        assert_eq!(solid.get_pixel(2, 2)[0], 0);
+        assert_eq!(solid.get_pixel(2, 2)[0], 255);
     }
 }

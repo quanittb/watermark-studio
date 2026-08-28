@@ -12,9 +12,16 @@ pub struct CandidateFrame<'a> {
     pub tracking: &'a TrackingFrame,
 }
 
+#[derive(Clone, Copy)]
+struct PixelSample {
+    pixel: Rgb<u8>,
+    alignment_error: f64,
+    frame_distance: u64,
+}
+
 /// Reconstructs the tracked mask from nearby clean frames. Candidate pixels
 /// are aligned locally, rejected if still inside a candidate watermark box,
-/// and combined with a per-pixel median to resist ghosting.
+/// and combined with a per-pixel consensus representative to resist ghosting.
 pub fn restore_frame(
     target: &mut RgbImage,
     target_tracking: &TrackingFrame,
@@ -26,7 +33,12 @@ pub fn restore_frame(
 ) -> RestorationResult {
     let candidates = candidates
         .iter()
-        .filter(|candidate| candidate.tracking.status != TrackingStatus::Occluded)
+        .filter(|candidate| {
+            !matches!(
+                candidate.tracking.status,
+                TrackingStatus::Occluded | TrackingStatus::AutoWeak | TrackingStatus::NeedReview
+            )
+        })
         .take(settings.max_candidates.max(1))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -79,7 +91,7 @@ pub fn restore_frame(
             masked_pixels += 1;
             let tx = x0 + x as i32;
             let ty = y0 + y as i32;
-            let mut samples = Vec::new();
+            let mut samples = Vec::<PixelSample>::new();
             for (candidate, translation) in &aligned_candidates {
                 let cx = tx + translation.dx;
                 let cy = ty + translation.dy;
@@ -88,20 +100,27 @@ pub fn restore_frame(
                 {
                     continue;
                 }
-                samples.push(*candidate.image.get_pixel(cx as u32, cy as u32));
+                samples.push(PixelSample {
+                    pixel: *candidate.image.get_pixel(cx as u32, cy as u32),
+                    alignment_error: translation.error,
+                    frame_distance: candidate.frame.abs_diff(target_tracking.frame),
+                });
             }
             if samples.len() < 2 {
                 continue;
             }
-            let median = median_rgb(&mut samples);
+            // Select an actual candidate pixel from the largest consensus
+            // rather than averaging channels from different frames. This
+            // preserves texture and avoids colored ghost edges on motion.
+            let representative = representative_pixel(&samples);
             let spread = samples
                 .iter()
-                .map(|sample| color_distance(sample, &median))
+                .map(|sample| color_distance(&sample.pixel, &representative))
                 .sum::<f64>()
                 / samples.len() as f64;
             total_spread += spread;
             valid_pixels += 1;
-            updates.push((tx, ty, median, alpha));
+            updates.push((tx, ty, representative, alpha));
         }
     }
 
@@ -181,26 +200,28 @@ fn color_distance(a: &Rgb<u8>, b: &Rgb<u8>) -> f64 {
         / (3.0 * 255.0)
 }
 
-fn median_rgb(samples: &mut [Rgb<u8>]) -> Rgb<u8> {
-    let mut channels = [
-        Vec::with_capacity(samples.len()),
-        Vec::with_capacity(samples.len()),
-        Vec::with_capacity(samples.len()),
-    ];
-    for sample in samples.iter() {
-        channels[0].push(sample[0]);
-        channels[1].push(sample[1]);
-        channels[2].push(sample[2]);
-    }
-    for channel in &mut channels {
-        channel.sort_unstable();
-    }
-    let middle = samples.len() / 2;
-    Rgb([
-        channels[0][middle],
-        channels[1][middle],
-        channels[2][middle],
-    ])
+fn representative_pixel(samples: &[PixelSample]) -> Rgb<u8> {
+    samples
+        .iter()
+        .min_by(|left, right| {
+            let left_score = sample_consensus_score(left, samples);
+            let right_score = sample_consensus_score(right, samples);
+            left_score
+                .partial_cmp(&right_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|sample| sample.pixel)
+        .unwrap_or(Rgb([0, 0, 0]))
+}
+
+fn sample_consensus_score(sample: &PixelSample, samples: &[PixelSample]) -> f64 {
+    let consensus = samples
+        .iter()
+        .map(|other| color_distance(&sample.pixel, &other.pixel))
+        .sum::<f64>();
+    // Alignment quality is the primary tie-breaker. A small distance bias
+    // prefers nearby frames without overriding a stronger pixel consensus.
+    consensus + sample.alignment_error * 0.15 + (sample.frame_distance as f64 / 32.0) * 0.01
 }
 
 fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
@@ -312,5 +333,86 @@ mod tests {
 
         assert!(result.success, "{result:?}");
         assert_eq!(target.get_pixel(8, 8), &Rgb([100, 100, 100]));
+    }
+
+    #[test]
+    fn rejects_unusable_tracking_candidates() {
+        let mut target = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
+        let candidate_a = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
+        let candidate_b = candidate_a.clone();
+        let target_tracking = tracking(
+            1,
+            BoundingBox {
+                x: 6.0,
+                y: 6.0,
+                width: 4.0,
+                height: 4.0,
+            },
+        );
+        let mut tracking_a = tracking(
+            0,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        tracking_a.status = TrackingStatus::NeedReview;
+        let mut tracking_b = tracking_a.clone();
+        tracking_b.frame = 2;
+        tracking_b.status = TrackingStatus::AutoWeak;
+        let mask = GrayImage::from_pixel(4, 4, Luma([255]));
+
+        let result = restore_frame(
+            &mut target,
+            &target_tracking,
+            &mask,
+            6,
+            6,
+            &[
+                CandidateFrame {
+                    frame: 0,
+                    image: &candidate_a,
+                    tracking: &tracking_a,
+                },
+                CandidateFrame {
+                    frame: 2,
+                    image: &candidate_b,
+                    tracking: &tracking_b,
+                },
+            ],
+            super::super::model::TemporalSettings {
+                max_candidates: 2,
+                alignment_radius: 0,
+                roi_padding: 2,
+                artifact_threshold: 0.25,
+            },
+        );
+
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn consensus_selects_an_actual_majority_pixel() {
+        let samples = [
+            super::PixelSample {
+                pixel: Rgb([100, 100, 100]),
+                alignment_error: 0.1,
+                frame_distance: 1,
+            },
+            super::PixelSample {
+                pixel: Rgb([100, 100, 100]),
+                alignment_error: 0.2,
+                frame_distance: 2,
+            },
+            super::PixelSample {
+                pixel: Rgb([220, 220, 220]),
+                alignment_error: 0.0,
+                frame_distance: 1,
+            },
+        ];
+
+        assert_eq!(super::representative_pixel(&samples), Rgb([100, 100, 100]));
     }
 }

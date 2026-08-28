@@ -524,42 +524,174 @@ fn apply_blur(frame: &mut RgbImage, mask: &GrayImage, x0: i32, y0: i32) -> Resul
     Ok(())
 }
 
+struct InpaintGeometry {
+    width: usize,
+    height: usize,
+    x0: i32,
+    y0: i32,
+    frame_width: u32,
+    frame_height: u32,
+}
+
 fn apply_inpaint(frame: &mut RgbImage, mask: &GrayImage, x0: i32, y0: i32) -> Result<(), AppError> {
-    let mut current = frame.clone();
-    for _ in 0..10 {
-        let previous = current.clone();
-        for y in 0..mask.height() {
-            for x in 0..mask.width() {
-                let alpha = f32::from(mask.get_pixel(x, y)[0]) / 255.0;
-                if alpha < 0.05 {
-                    continue;
-                }
-                let dx = x0 + x as i32;
-                let dy = y0 + y as i32;
-                if dx < 1
-                    || dy < 1
-                    || dx as u32 + 1 >= frame.width()
-                    || dy as u32 + 1 >= frame.height()
+    if mask.width() == 0 || mask.height() == 0 {
+        return Ok(());
+    }
+
+    // Propagate colors inward from the known boundary of the mask. The old
+    // fixed ten-pass full-frame blur could not reach the center of a wide
+    // glyph and also repeatedly copied watermark pixels into later passes.
+    // A local breadth-first fill reaches every masked pixel once and keeps the
+    // work proportional to the tracked ROI rather than the whole video frame.
+    let width = mask.width() as usize;
+    let height = mask.height() as usize;
+    let geometry = InpaintGeometry {
+        width,
+        height,
+        x0,
+        y0,
+        frame_width: frame.width(),
+        frame_height: frame.height(),
+    };
+    let mut values = Vec::with_capacity(width * height);
+    let mut known = vec![true; width * height];
+    let mut active = vec![false; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x0 + x as i32;
+            let dy = y0 + y as i32;
+            values.push(
+                if dx >= 0 && dy >= 0 && (dx as u32) < frame.width() && (dy as u32) < frame.height()
                 {
-                    continue;
-                }
-                let neighbors = [
-                    previous.get_pixel(dx as u32 - 1, dy as u32),
-                    previous.get_pixel(dx as u32 + 1, dy as u32),
-                    previous.get_pixel(dx as u32, dy as u32 - 1),
-                    previous.get_pixel(dx as u32, dy as u32 + 1),
-                ];
-                let average = Rgb([
-                    (neighbors.iter().map(|p| p[0] as u32).sum::<u32>() / 4) as u8,
-                    (neighbors.iter().map(|p| p[1] as u32).sum::<u32>() / 4) as u8,
-                    (neighbors.iter().map(|p| p[2] as u32).sum::<u32>() / 4) as u8,
-                ]);
-                blend(current.get_pixel_mut(dx as u32, dy as u32), &average, alpha);
+                    *frame.get_pixel(dx as u32, dy as u32)
+                } else {
+                    Rgb([0, 0, 0])
+                },
+            );
+            active[y * width + x] = mask.get_pixel(x as u32, y as u32)[0] >= 13;
+            known[y * width + x] = !active[y * width + x];
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if active[index] && has_known_neighbor(x, y, &geometry, &known) {
+                queue.push_back(index);
             }
         }
     }
-    *frame = current;
+
+    while let Some(index) = queue.pop_front() {
+        if known[index] {
+            continue;
+        }
+        let x = index % width;
+        let y = index / width;
+        let mut sums = [0u32; 3];
+        let mut count = 0u32;
+        for (nx, ny) in neighbor_coordinates(x, y) {
+            if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
+                let neighbor_index = ny as usize * width + nx as usize;
+                if known[neighbor_index] {
+                    for channel in 0..3 {
+                        sums[channel] += u32::from(values[neighbor_index][channel]);
+                    }
+                    count += 1;
+                }
+            } else {
+                let frame_x = x0 + nx;
+                let frame_y = y0 + ny;
+                if frame_x >= 0
+                    && frame_y >= 0
+                    && (frame_x as u32) < frame.width()
+                    && (frame_y as u32) < frame.height()
+                {
+                    let pixel = frame.get_pixel(frame_x as u32, frame_y as u32);
+                    for channel in 0..3 {
+                        sums[channel] += u32::from(pixel[channel]);
+                    }
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        values[index] = Rgb([
+            (sums[0] / count) as u8,
+            (sums[1] / count) as u8,
+            (sums[2] / count) as u8,
+        ]);
+        known[index] = true;
+        for (nx, ny) in local_neighbors(x, y, width, height) {
+            let neighbor_index = ny * width + nx;
+            if active[neighbor_index] && !known[neighbor_index] {
+                queue.push_back(neighbor_index);
+            }
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = f32::from(mask.get_pixel(x as u32, y as u32)[0]) / 255.0;
+            let dx = x0 + x as i32;
+            let dy = y0 + y as i32;
+            if alpha < 0.05
+                || !known[y * width + x]
+                || dx < 0
+                || dy < 0
+                || (dx as u32) >= frame.width()
+                || (dy as u32) >= frame.height()
+            {
+                continue;
+            }
+            blend(
+                frame.get_pixel_mut(dx as u32, dy as u32),
+                &values[y * width + x],
+                alpha,
+            );
+        }
+    }
     Ok(())
+}
+
+fn local_neighbors(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    [
+        (x.wrapping_sub(1), y),
+        (x + 1, y),
+        (x, y.wrapping_sub(1)),
+        (x, y + 1),
+    ]
+    .into_iter()
+    .filter(move |(nx, ny)| *nx < width && *ny < height)
+}
+
+fn neighbor_coordinates(x: usize, y: usize) -> impl Iterator<Item = (i32, i32)> {
+    let x = x as i32;
+    let y = y as i32;
+    [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].into_iter()
+}
+
+fn has_known_neighbor(x: usize, y: usize, geometry: &InpaintGeometry, known: &[bool]) -> bool {
+    neighbor_coordinates(x, y).any(|(nx, ny)| {
+        if nx >= 0 && ny >= 0 && (nx as usize) < geometry.width && (ny as usize) < geometry.height {
+            known[ny as usize * geometry.width + nx as usize]
+        } else {
+            let frame_x = geometry.x0 + nx;
+            let frame_y = geometry.y0 + ny;
+            frame_x >= 0
+                && frame_y >= 0
+                && (frame_x as u32) < geometry.frame_width
+                && (frame_y as u32) < geometry.frame_height
+        }
+    })
 }
 
 fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
@@ -630,8 +762,9 @@ fn mux_audio(video: &Path, source: &Path, output: &Path) -> Result<(), AppError>
 
 #[cfg(test)]
 mod tests {
-    use super::mask_bounds;
+    use super::{apply_inpaint, mask_bounds};
     use crate::project::model::BoundingBox;
+    use image::{GrayImage, Rgb, RgbImage};
 
     #[test]
     fn mask_bounds_cover_the_full_bbox_and_padding() {
@@ -661,4 +794,18 @@ mod tests {
         assert_eq!(mask_bounds(10, 10, &bbox, 0), Some((0, 0, 9, 9)));
     }
 
+    #[test]
+    fn inpaint_reaches_the_center_of_a_wide_mask() {
+        let mut frame = RgbImage::from_pixel(15, 15, Rgb([220, 180, 140]));
+        for y in 3..12 {
+            for x in 3..12 {
+                frame.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let mask = GrayImage::from_pixel(9, 9, image::Luma([255]));
+
+        apply_inpaint(&mut frame, &mask, 3, 3).expect("inpaint should succeed");
+
+        assert_eq!(frame.get_pixel(7, 7), &Rgb([220, 180, 140]));
+    }
 }
