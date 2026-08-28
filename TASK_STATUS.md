@@ -1,5 +1,11 @@
 # Task status checkpoints
 
+## Conservative AUTO_GOOD validation checkpoint — 2026-08-28
+
+- A frame can now become `AUTO_GOOD` only when gray-template, high-pass, edge, match-margin, optical-flow, motion-smoothness, and forward/backward agreement all pass independent minimums in addition to the aggregate confidence threshold.
+- A one-direction-only match is capped at `AUTO_WEAK`; it remains visible and review-gated because there is no independent reverse trajectory to confirm it.
+- This policy deliberately favors false negatives (more user review) over false positives that would remove pixels at the wrong location.
+
 ## Provisional bbox visibility and confidence correction checkpoint — 2026-08-28
 
 - Visual source-overlay audit confirmed the current tracking is not production-safe: frame `654` is slightly high and clips the watermark baseline, while frames `170`, `235`, `350`, `700`, `710`, and `800` are materially misplaced.

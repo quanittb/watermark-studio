@@ -2,7 +2,7 @@ use crate::project::model::{
     AnchorType, BoundingBox, ManualAnchor, TrackingConfig, TrackingFrame, TrackingScores,
     TrackingSource, TrackingStatus,
 };
-use crate::tracking::confidence::{fuse_scores, status_for};
+use crate::tracking::confidence::{fuse_scores, validated_status};
 
 pub fn initial_anchor(frame: u64, timestamp_seconds: f64, bbox: BoundingBox) -> ManualAnchor {
     ManualAnchor {
@@ -75,7 +75,7 @@ pub fn fuse_tracks(
                     let status = if agreement < 0.35 {
                         TrackingStatus::NeedReview
                     } else {
-                        status_for(confidence, config)
+                        validated_status(&scores, confidence, config)
                     };
                     let bbox = if use_fused {
                         average_bbox(&a.bbox, &b.bbox)
@@ -105,16 +105,25 @@ pub fn fuse_tracks(
                         fps,
                     )
                 }
-                (Some(frame), None) => {
-                    convert_frame(frame, scale_x, scale_y, padding_x, padding_y, fps)
-                }
-                (None, Some(frame)) => {
-                    convert_frame(frame, scale_x, scale_y, padding_x, padding_y, fps)
-                }
+                (Some(frame), None) => downgrade_one_way_match(convert_frame(
+                    frame, scale_x, scale_y, padding_x, padding_y, fps,
+                )),
+                (None, Some(frame)) => downgrade_one_way_match(convert_frame(
+                    frame, scale_x, scale_y, padding_x, padding_y, fps,
+                )),
                 (None, None) => fallback(index as u64, source_width, source_height, fps),
             }
         })
         .collect()
+}
+
+fn downgrade_one_way_match(mut frame: TrackingFrame) -> TrackingFrame {
+    if frame.status == TrackingStatus::AutoGood {
+        // Without an independent reverse track there is no trajectory
+        // agreement. Keep the measured bbox for review but do not certify it.
+        frame.status = TrackingStatus::AutoWeak;
+    }
+    frame
 }
 
 pub fn expand_bbox(bbox: &BoundingBox, padding: f64) -> BoundingBox {
@@ -249,5 +258,48 @@ fn fallback(frame: u64, width: u32, height: u32, fps: f64) -> TrackingFrame {
             motion_smoothness: None,
             match_margin: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downgrade_one_way_match;
+    use crate::project::model::{
+        BoundingBox, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
+    };
+
+    #[test]
+    fn one_way_match_cannot_be_auto_good() {
+        let frame = TrackingFrame {
+            frame: 10,
+            timestamp_seconds: 1.0,
+            bbox: BoundingBox {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            confidence: 0.95,
+            status: TrackingStatus::AutoGood,
+            source: TrackingSource::Forward,
+            locked: false,
+            scores: TrackingScores {
+                template: 0.9,
+                highpass: 0.9,
+                edge: 0.9,
+                motion: 0.9,
+                position: 0.9,
+                size: 1.0,
+                optical_flow: Some(0.9),
+                forward_backward: None,
+                motion_smoothness: Some(0.9),
+                match_margin: Some(0.1),
+            },
+        };
+
+        assert_eq!(
+            downgrade_one_way_match(frame).status,
+            TrackingStatus::AutoWeak
+        );
     }
 }
