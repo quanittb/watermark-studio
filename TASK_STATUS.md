@@ -153,3 +153,9 @@
 - Added an explicit review-queue summary to the inspector so the exact unresolved ranges are visible: `125–128`, `136`, and `139–140`.
 - This is display/navigation-only: it does not modify tracking data, accept frames, interpolate ranges, or bypass the render gate.
 - `npm run build` passes, and the rebuilt runtime visibly loads the saved project with the queue summary and disabled `Render video` action.
+
+## Goal Set 2 blocked checkpoint — 2026-08-28
+
+- All implementation, unit-test, build, render-gate, UI, and runtime work that can be completed without changing unresolved tracking decisions is complete and pushed.
+- The real project remains intentionally unresolved: 7 `NEED_REVIEW` frames in `125–128`, `136`, and `139–140`; rendering and final real-video visual QA remain blocked by the review gate.
+- This is a user-input blocker, not an implementation failure: the user must inspect each range and save a manual correction, re-track result, or explicit occlusion decision before rendering can proceed.
