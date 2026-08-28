@@ -81,9 +81,15 @@ pub async fn get_project(app: AppHandle, project_id: String) -> Result<Project, 
             .app_data_dir()
             .map_err(|error| AppError::Io(error.to_string()))?;
         let mut project = service::load_project(&app_data_dir, &project_id)?;
+        // Older projects may have marked long geometric interpolations as
+        // resolved. Recompute the queue on load so an unverified bbox cannot
+        // silently reach rendering after an app upgrade.
+        if let Some(tracking) = project.tracking.as_mut() {
+            tracking.problem_ranges = tracking::service::group_problem_ranges(&tracking.frames);
+        }
         let normalized_path = normalize_canonical_path(PathBuf::from(&project.source.path));
         let normalized_path = normalized_path.to_string_lossy().to_string();
-        if normalized_path != project.source.path {
+        if normalized_path != project.source.path || project.tracking.is_some() {
             project.source.path = normalized_path;
             let directory = service::project_directory(&app_data_dir, &project.id)?;
             service::save_project_atomic(&directory, &project)?;

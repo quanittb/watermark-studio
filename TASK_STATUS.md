@@ -165,3 +165,13 @@
 - Added accessible direct-jump buttons for each unresolved range in the inspector: `125–128`, `Frame 136`, and `139–140`. Each button only seeks to the range's worst frame and leaves tracking unchanged.
 - `npm run build` passes, and runtime accessibility inspection confirms all three buttons are present while `Render video` remains disabled.
 - The goal remains blocked on the same user-controlled review decision; no unresolved frame was modified.
+
+## Interpolation safety and bbox mismatch checkpoint — 2026-08-28
+
+- Visual QA confirmed the reported focus mismatch is upstream tracking data, not UI source-to-display scaling: frame `235` had an interpolated bbox around `(572.9, 948.6)` while the source watermark is around `(370, 850)`.
+- Re-tracking the affected section with the current manual anchors correctly refused to force-accept the ambiguous result; the section `151–291` is now `NEED_REVIEW` and rendering is blocked.
+- Interpolated frames are now review-gated in both the persisted review queue and Rust render validator. Their bbox is retained for inspection but confidence is set to `0` because interpolation is not image validation for a moving watermark.
+- On project load, the review queue is recomputed so older projects cannot silently treat stale interpolated bboxes as render-safe.
+- The UI hides provisional boxes for `AUTO_WEAK`, `NEED_REVIEW`, and `INTERPOLATED` frames, prompting the user to draw the actual source-coordinate box before saving a manual correction.
+- Validation passed: Rust tests `40/40`, `cargo fmt --check`, Clippy with `-D warnings`, Rust build, and `npm run build`.
+- Current real project is intentionally review-gated with 12 ranges: `19–21`, `111`, `119`, `141`, `151–291`, `293–479`, `481–529`, `531–549`, `551–599`, `601–629`, `631–652`, and `654–902`. No render was accepted from this state.

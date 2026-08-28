@@ -272,7 +272,12 @@ pub fn group_problem_ranges(frames: &[TrackingFrame]) -> Vec<ProblemRange> {
     for (index, frame) in frames.iter().enumerate() {
         let problem = matches!(
             frame.status,
-            TrackingStatus::NeedReview | TrackingStatus::AutoWeak
+            TrackingStatus::NeedReview
+                | TrackingStatus::AutoWeak
+                // Interpolation is a geometric estimate only. It must remain
+                // review-gated because a moving watermark can follow a curved
+                // path between two anchors.
+                | TrackingStatus::Interpolated
         );
         if problem && start.is_none() {
             start = Some(index);
@@ -323,7 +328,10 @@ pub fn interpolate_between_anchors(
                 width: left.bbox.width + (right.bbox.width - left.bbox.width) * ratio,
                 height: left.bbox.height + (right.bbox.height - left.bbox.height) * ratio,
             };
-            frame.confidence = 0.75;
+            // Do not present an interpolated position as image-validated
+            // confidence. The bbox is retained for inspection, but the frame
+            // must be manually reviewed before it can be rendered.
+            frame.confidence = 0.0;
             frame.status = TrackingStatus::Interpolated;
             frame.source = TrackingSource::Interpolated;
             frame.locked = false;
@@ -655,6 +663,27 @@ mod tests {
                 ranges[1].worst_frame
             ),
             (4, 4, 4)
+        );
+    }
+
+    #[test]
+    fn treats_interpolated_frames_as_review_required() {
+        let frames = vec![
+            frame(0, TrackingStatus::Manual, 1.0),
+            frame(1, TrackingStatus::Interpolated, 0.0),
+            frame(2, TrackingStatus::AutoGood, 0.9),
+        ];
+
+        let ranges = group_problem_ranges(&frames);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            (
+                ranges[0].start_frame,
+                ranges[0].end_frame,
+                ranges[0].worst_frame
+            ),
+            (1, 1, 1)
         );
     }
 

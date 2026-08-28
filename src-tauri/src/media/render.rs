@@ -156,7 +156,7 @@ fn validate_tracking_for_render(
     if frames.iter().any(|frame| {
         matches!(
             frame.status,
-            TrackingStatus::NeedReview | TrackingStatus::AutoWeak
+            TrackingStatus::NeedReview | TrackingStatus::AutoWeak | TrackingStatus::Interpolated
         )
     }) {
         return Err(AppError::InvalidRequest(
@@ -1084,7 +1084,11 @@ mod tests {
 
     #[test]
     fn render_gate_blocks_unresolved_tracking_but_allows_occluded_frames() {
-        for status in [TrackingStatus::AutoWeak, TrackingStatus::NeedReview] {
+        for status in [
+            TrackingStatus::AutoWeak,
+            TrackingStatus::NeedReview,
+            TrackingStatus::Interpolated,
+        ] {
             let error = validate_tracking_for_render(&[tracking_frame(status)], 1)
                 .expect_err("unresolved tracking must block rendering");
             assert!(matches!(
@@ -1098,9 +1102,8 @@ mod tests {
             &[
                 tracking_frame(TrackingStatus::Occluded),
                 tracking_frame(TrackingStatus::Manual),
-                tracking_frame(TrackingStatus::Interpolated),
             ],
-            3,
+            2,
         )
         .expect("occluded frames are safe no-op frames");
     }
