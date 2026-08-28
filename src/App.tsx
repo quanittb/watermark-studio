@@ -82,10 +82,10 @@ export default function App() {
   const videoUrl = project ? convertFileSrc(project.source.path) : null;
   const currentTracking = project?.tracking?.frames.find((frame) => frame.frame === currentFrame) ?? null;
   const trackingNeedsReview = currentTracking && ['AUTO_WEAK', 'NEED_REVIEW', 'INTERPOLATED'].includes(currentTracking.status);
-  // A provisional bbox can be far from the real watermark. Do not draw it as
-  // if it were confirmed; the reviewer starts from a clean surface and draws
-  // the source-coordinate box explicitly.
-  const displaySelection = selection ?? (trackingNeedsReview ? null : currentTracking?.bbox ?? project?.watermark.anchor?.bbox ?? null);
+  // Keep provisional coordinates visible for diagnosis, but style them as
+  // unverified and require a fresh user-drawn selection before saving.
+  const displaySelection = selection ?? currentTracking?.bbox ?? project?.watermark.anchor?.bbox ?? null;
+  const displayIsProvisional = Boolean(!selection && trackingNeedsReview);
   const unresolvedCount = project?.tracking?.problemRanges.length ?? 0;
   const problemRangeSummary = project?.tracking?.problemRanges
     .map((range) => range.startFrame === range.endFrame ? `${range.startFrame}` : `${range.startFrame}–${range.endFrame}`)
@@ -271,14 +271,15 @@ export default function App() {
   };
 
   const saveAnchor = async () => {
-    if (!project || !displaySelection || isBusy) return;
+    const bboxToSave = project?.tracking ? selection : displaySelection;
+    if (!project || !bboxToSave || isBusy) return;
     setError(null);
     setLoadingTask('saving');
     setMessage(project.tracking ? 'Saving manual correction…' : 'Saving anchor and extracting templates…');
     try {
       const updatedProject = project.tracking
-        ? await saveManualAnchor(project.id, currentFrame, currentTime, displaySelection)
-        : await saveWatermarkAnchor(project.id, currentFrame, currentTime, displaySelection, label);
+        ? await saveManualAnchor(project.id, currentFrame, currentTime, bboxToSave)
+        : await saveWatermarkAnchor(project.id, currentFrame, currentTime, bboxToSave, label);
       setProject(updatedProject);
       setSelection(project.tracking ? null : updatedProject.watermark.anchor?.bbox ?? null);
       setSelectionMode(false);
@@ -434,7 +435,7 @@ export default function App() {
                 <div className="video-frame" ref={videoFrameRef} style={{ aspectRatio: `${project.video.width}/${project.video.height}` }}>
                   <video ref={videoRef} key={videoUrl} src={videoUrl} controls={false} playsInline onLoadedMetadata={onVideoLoadedMetadata} onTimeUpdate={onVideoTimeUpdate} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />
                   {contentRect && <div ref={selectionSurfaceRef} className={`selection-surface${selectionMode ? ' editable' : ''}`} style={{ left: contentRect.left, top: contentRect.top, width: contentRect.width, height: contentRect.height }} onPointerDown={onSelectionPointerDown} onPointerMove={onSelectionPointerMove} onPointerUp={onSelectionPointerUp}>
-                    {displaySelection && <div className="watermark-box" style={{ left: `${sourceToPercent(displaySelection.x, project.video.width)}%`, top: `${sourceToPercent(displaySelection.y, project.video.height)}%`, width: `${sourceToPercent(displaySelection.width, project.video.width)}%`, height: `${sourceToPercent(displaySelection.height, project.video.height)}%` }}><span>{project.watermark.label ?? label}</span><i className="handle h1" /><i className="handle h2" /><i className="handle h3" /><i className="handle h4" /></div>}
+                    {displaySelection && <div className={`watermark-box${displayIsProvisional ? ' provisional' : ''}`} style={{ left: `${sourceToPercent(displaySelection.x, project.video.width)}%`, top: `${sourceToPercent(displaySelection.y, project.video.height)}%`, width: `${sourceToPercent(displaySelection.width, project.video.width)}%`, height: `${sourceToPercent(displaySelection.height, project.video.height)}%` }}><span>{displayIsProvisional ? `PROVISIONAL · ${currentTracking?.status}` : project.watermark.label ?? label}</span>{!displayIsProvisional && <><i className="handle h1" /><i className="handle h2" /><i className="handle h3" /><i className="handle h4" /></>}</div>}
                   </div>}
                 </div>
               ) : <button className="dropzone" onClick={() => void chooseAndOpenVideo()} disabled={isBusy}><span className="drop-icon">＋</span><strong>Drop a video here</strong><span>or click to choose a file</span><small>MP4, MOV, MKV, WEBM, M4V</small></button>}
@@ -455,7 +456,7 @@ export default function App() {
             {(removal.mode === 'TEMPORAL_RESTORE' || removal.mode === 'AUTO_BEST') && <div className="advanced-card"><span className="eyebrow">RESTORATION SETTINGS</span><div className="field-row"><label className="field"><span>Before</span><input type="number" min="1" max="32" value={removal.temporalWindowBefore} onChange={(event) => setRemoval((current) => ({ ...current, temporalWindowBefore: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>After</span><input type="number" min="1" max="32" value={removal.temporalWindowAfter} onChange={(event) => setRemoval((current) => ({ ...current, temporalWindowAfter: Number(event.target.value) }))} disabled={isBusy} /></label></div><div className="field-row"><label className="field"><span>Max candidates</span><input type="number" min="2" max="16" value={removal.maxTemporalCandidates} onChange={(event) => setRemoval((current) => ({ ...current, maxTemporalCandidates: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>ROI padding</span><input type="number" min="8" max="96" value={removal.restorationRoiPadding} onChange={(event) => setRemoval((current) => ({ ...current, restorationRoiPadding: Number(event.target.value) }))} disabled={isBusy} /></label></div><label className="field"><span>Artifact limit</span><input type="number" min="0.05" max="0.95" step="0.05" value={removal.artifactThreshold} onChange={(event) => setRemoval((current) => ({ ...current, artifactThreshold: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>Fallback</span><select value={removal.fallbackPolicy} onChange={(event) => setRemoval((current) => ({ ...current, fallbackPolicy: event.target.value as RemovalConfig['fallbackPolicy'] }))} disabled={isBusy}><option value="TEMPORAL_INPAINT_BLUR">Inpaint → Blur</option><option value="BLUR_ONLY">Blur only</option></select></label></div>}
             <div className="confidence-card"><div><span>{project?.tracking ? 'Current tracking' : 'Phase 1 status'}</span><strong>{currentTracking?.status ?? (project?.watermark.templates ? 'Ready' : project?.watermark.anchor ? 'Anchor saved' : 'Manual anchor')}</strong></div><div className="confidence-bar"><i style={{ width: `${project?.tracking ? (currentTracking?.confidence ?? 0) * 100 : project?.watermark.templates ? 100 : project?.watermark.anchor ? 65 : 8}%` }} /></div><small>{project?.tracking ? (trackingNeedsReview ? 'This bbox is provisional. Click Select watermark, draw the actual watermark, then save the manual correction.' : `${unresolvedCount} problem range(s); weak/review frames are blocked from rendering. Occluded frames are preserved unchanged.`) : project?.watermark.templates ? 'Templates and mask persisted in the project workspace.' : 'Select a source-coordinate box to begin.'}</small>{project?.tracking && unresolvedCount > 0 && <small className="review-queue">Review frames: {problemRangeSummary}</small>}</div>
             {project?.tracking && unresolvedCount > 0 && <div className="review-range-actions" aria-label="Review queue"><span>Jump to range</span><div>{project.tracking.problemRanges.map((range) => <button key={`${range.startFrame}-${range.endFrame}`} onClick={() => { setVideoFrame(range.worstFrame); setMessage(`Review frame ${range.worstFrame} (${range.startFrame}–${range.endFrame}).`); }} disabled={isBusy}>{range.startFrame === range.endFrame ? `Frame ${range.startFrame}` : `${range.startFrame}–${range.endFrame}`}</button>)}</div></div>}
-            <button className="button secondary full" onClick={() => void saveAnchor()} disabled={!project || !displaySelection || isBusy}>{loadingTask === 'saving' ? 'Saving…' : project?.tracking ? 'Save manual correction' : 'Save anchor & templates'}</button>
+            <button className="button secondary full" onClick={() => void saveAnchor()} disabled={!project || (project.tracking ? !selection : !displaySelection) || isBusy}>{loadingTask === 'saving' ? 'Saving…' : project?.tracking ? 'Save manual correction' : 'Save anchor & templates'}</button>
             {project?.tracking && currentTracking && <><button className="button secondary full" onClick={() => void acceptCurrentFrame()} disabled={isBusy || currentTracking.status === 'MANUAL'}>Accept current frame</button><button className="button secondary full" onClick={() => void markCurrentRangeOccluded()} disabled={isBusy || !project.tracking.problemRanges.some((item) => currentFrame >= item.startFrame && currentFrame <= item.endFrame)}>Mark current range occluded (no-op)</button><button className="button secondary full" onClick={() => void runRetrack()} disabled={isBusy}>Re-track section</button><button className="button secondary full" onClick={() => void interpolateCurrentRange()} disabled={isBusy || !project.tracking.problemRanges.length}>Interpolate current range</button></>}
             <button className="button primary full" onClick={() => void render()} disabled={!project?.tracking || isBusy || unresolvedCount > 0}>{loadingTask === 'rendering' ? 'Rendering…' : 'Render video'}</button>
             {isBusy && (loadingTask === 'tracking' || loadingTask === 'rendering') && <button className="button secondary full" onClick={cancelBusy}>Cancel operation</button>}

@@ -58,6 +58,8 @@ h2 { font-size:14px; margin:3px 0 0; }
 .selection-surface.editable { pointer-events:auto; cursor:crosshair; }
 .watermark-box { position:absolute; border:1.5px solid #f4f5f7; box-shadow:0 0 0 1px #000; pointer-events:none; min-width:4px; min-height:4px; }
 .watermark-box span { position:absolute; top:-20px; left:-1px; background:#f4f5f7; color:#101114; font-size:9px; font-weight:800; padding:3px 5px; border-radius:3px; }
+.watermark-box.provisional { border:2px dashed #ff8a3d; box-shadow:0 0 0 1px #260d00,0 0 12px #ff6a0038; }
+.watermark-box.provisional span { background:#ff8a3d; color:#1a0900; white-space:nowrap; }
 .handle { position:absolute; width:6px; height:6px; background:#fff; border:1px solid #111; }
 .h1{left:-4px;top:-4px}.h2{right:-4px;top:-4px}.h3{left:-4px;bottom:-4px}.h4{right:-4px;bottom:-4px}
 .transport { height:51px; display:flex; align-items:center; justify-content:center; gap:5px; border-top:1px solid #282b30; position:relative; }

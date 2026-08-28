@@ -3,7 +3,7 @@ use crate::media::{ffmpeg, ffprobe};
 use crate::media::{mask, render};
 use crate::project::model::{
     AnchorFrame, AnchorType, BoundingBox, FrameResult, ManualAnchor, Project, RemovalConfig,
-    TemplatePaths, TrackingStatus, WatermarkConfig,
+    TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
 };
 use crate::project::service;
 use crate::tracking;
@@ -85,6 +85,7 @@ pub async fn get_project(app: AppHandle, project_id: String) -> Result<Project, 
         // resolved. Recompute the queue on load so an unverified bbox cannot
         // silently reach rendering after an app upgrade.
         if let Some(tracking) = project.tracking.as_mut() {
+            normalize_interpolated_confidence(&mut tracking.frames);
             tracking.problem_ranges = tracking::service::group_problem_ranges(&tracking.frames);
         }
         let normalized_path = normalize_canonical_path(PathBuf::from(&project.source.path));
@@ -782,6 +783,16 @@ fn normalize_canonical_path(path: PathBuf) -> PathBuf {
     path
 }
 
+fn normalize_interpolated_confidence(frames: &mut [TrackingFrame]) {
+    for frame in frames {
+        if frame.status == TrackingStatus::Interpolated {
+            // Interpolation contains no image observation, so persisted values
+            // from older builds must never be presented as measured confidence.
+            frame.confidence = 0.0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +853,40 @@ mod tests {
     fn normalizes_windows_extended_length_paths() {
         let normalized = normalize_canonical_path(PathBuf::from(r"\\?\C:\videos\test.mp4"));
         assert_eq!(normalized, PathBuf::from(r"C:\videos\test.mp4"));
+    }
+
+    #[test]
+    fn clears_legacy_confidence_from_interpolated_frames() {
+        let mut frames = vec![TrackingFrame {
+            frame: 1,
+            timestamp_seconds: 1.0 / 30.0,
+            bbox: BoundingBox {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 12.0,
+            },
+            confidence: 0.75,
+            status: TrackingStatus::Interpolated,
+            source: crate::project::model::TrackingSource::Interpolated,
+            locked: false,
+            scores: crate::project::model::TrackingScores {
+                template: 0.0,
+                highpass: 0.0,
+                edge: 0.0,
+                motion: 0.0,
+                position: 0.0,
+                size: 1.0,
+                optical_flow: None,
+                forward_backward: None,
+                motion_smoothness: Some(1.0),
+                match_margin: None,
+            },
+        }];
+
+        normalize_interpolated_confidence(&mut frames);
+
+        assert_eq!(frames[0].confidence, 0.0);
+        assert_eq!(frames[0].status, TrackingStatus::Interpolated);
     }
 }

@@ -1,5 +1,12 @@
 # Task status checkpoints
 
+## Provisional bbox visibility and confidence correction checkpoint — 2026-08-28
+
+- Visual source-overlay audit confirmed the current tracking is not production-safe: frame `654` is slightly high and clips the watermark baseline, while frames `170`, `235`, `350`, `700`, `710`, and `800` are materially misplaced.
+- Provisional `AUTO_WEAK`, `NEED_REVIEW`, and `INTERPOLATED` bboxes remain visible as dashed orange overlays labeled with their status, so a wrong stored focus can be diagnosed instead of silently disappearing.
+- Saving a manual correction now requires a fresh user-drawn selection; the visible provisional bbox cannot be saved accidentally. The separate explicit accept action remains available.
+- On project load, legacy `INTERPOLATED` confidence is normalized to `0` because linear geometry is not image evidence. Review and Rust render gates remain unchanged.
+
 ## Progress lifecycle checkpoint — 2026-08-28
 
 - Cleared stale operation progress when tracking, interpolation, manual correction, occlusion marking, or rendering finishes or fails, so a canceled/failed operation cannot appear to keep running.
