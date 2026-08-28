@@ -1,0 +1,140 @@
+export interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface VideoMetadata {
+  width: number;
+  height: number;
+  durationSeconds: number;
+  fps: number;
+  frameCount: number;
+  codec: string | null;
+  pixelFormat: string | null;
+}
+
+export interface WatermarkAnchor {
+  frame: number;
+  timestampSeconds: number;
+  bbox: BoundingBox;
+}
+
+export interface TemplatePaths {
+  original: string;
+  grayscale: string;
+  highContrast: string;
+  mask: string | null;
+}
+
+export interface WatermarkConfig {
+  label: string | null;
+  anchor: WatermarkAnchor | null;
+  templates: TemplatePaths | null;
+  templatePadding: number;
+}
+
+export type AnchorType = 'INITIAL' | 'MANUAL';
+
+export interface ManualAnchor {
+  frame: number;
+  timestampSeconds: number;
+  bbox: BoundingBox;
+  anchorType: AnchorType;
+  locked: boolean;
+}
+
+export interface WatermarkProject {
+  version: number;
+  id: string;
+  source: { path: string; fileName: string };
+  video: VideoMetadata;
+  watermark: WatermarkConfig;
+  anchors: ManualAnchor[];
+  tracking: TrackingData | null;
+  removal: RemovalConfig | null;
+}
+
+export type TrackingStatus = 'AUTO_GOOD' | 'AUTO_WEAK' | 'NEED_REVIEW' | 'MANUAL' | 'INTERPOLATED' | 'OCCLUDED';
+export type TrackingSource = 'FORWARD' | 'BACKWARD' | 'FUSED' | 'MANUAL' | 'INTERPOLATED' | 'OCCLUDED';
+
+export interface TrackingScores {
+  template: number;
+  highpass: number;
+  edge: number;
+  motion: number;
+  position: number;
+  size: number;
+  opticalFlow: number | null;
+  forwardBackward: number | null;
+  motionSmoothness: number | null;
+  matchMargin: number | null;
+}
+
+export interface TrackingFrame {
+  frame: number;
+  timestampSeconds: number;
+  bbox: BoundingBox;
+  confidence: number;
+  status: TrackingStatus;
+  source: TrackingSource;
+  locked: boolean;
+  scores: TrackingScores;
+}
+
+export interface ProblemRange {
+  startFrame: number;
+  endFrame: number;
+  worstFrame: number;
+  minConfidence: number;
+}
+
+export interface TrackingData {
+  config: {
+    analysisLongEdge: number;
+    localSearchRadius: number;
+    acceptThreshold: number;
+    weakThreshold: number;
+    globalSearchThreshold: number;
+    opticalFlowRadius: number;
+    smoothingAlpha: number;
+    maxFrameDisplacement: number;
+  };
+  frames: TrackingFrame[];
+  problemRanges: ProblemRange[];
+  analyzedAt: string | null;
+}
+
+export type RemovalMode = 'REPLACEMENT' | 'BLUR' | 'INPAINT' | 'TEMPORAL_RESTORE' | 'AUTO_BEST';
+export type FallbackPolicy = 'TEMPORAL_INPAINT_BLUR' | 'INPAINT_BLUR' | 'BLUR_ONLY';
+export type InpaintVariant = 'ITERATIVE';
+
+export interface RemovalConfig {
+  mode: RemovalMode;
+  maskPadding: number;
+  featherRadius: number;
+  replacementPath: string | null;
+  replacementScale: number;
+  replacementOpacity: number;
+  replacementOffsetX: number;
+  replacementOffsetY: number;
+  temporalWindowBefore: number;
+  temporalWindowAfter: number;
+  maxTemporalCandidates: number;
+  restorationRoiPadding: number;
+  artifactThreshold: number;
+  fallbackPolicy: FallbackPolicy;
+  inpaintVariant: InpaintVariant;
+}
+
+export interface FrameResult {
+  frame: number;
+  timestampSeconds: number;
+  path: string;
+}
+
+export interface AppError {
+  code: string;
+  message: string;
+}

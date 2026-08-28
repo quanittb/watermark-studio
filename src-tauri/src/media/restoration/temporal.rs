@@ -1,0 +1,316 @@
+use super::alignment::estimate_translation;
+use super::artifact::{
+    accept_temporal_patch, artifact_score, spatial_artifact_score, temporal_consistency,
+};
+use super::model::{RestorationResult, RestorationStrategy, TemporalSettings};
+use crate::project::model::{BoundingBox, TrackingFrame, TrackingStatus};
+use image::{GrayImage, Rgb, RgbImage};
+
+pub struct CandidateFrame<'a> {
+    pub frame: u64,
+    pub image: &'a RgbImage,
+    pub tracking: &'a TrackingFrame,
+}
+
+/// Reconstructs the tracked mask from nearby clean frames. Candidate pixels
+/// are aligned locally, rejected if still inside a candidate watermark box,
+/// and combined with a per-pixel median to resist ghosting.
+pub fn restore_frame(
+    target: &mut RgbImage,
+    target_tracking: &TrackingFrame,
+    mask: &GrayImage,
+    x0: i32,
+    y0: i32,
+    candidates: &[CandidateFrame<'_>],
+    settings: TemporalSettings,
+) -> RestorationResult {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.tracking.status != TrackingStatus::Occluded)
+        .take(settings.max_candidates.max(1))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return RestorationResult::failed(RestorationStrategy::TemporalRestore);
+    }
+
+    let mut aligned_candidates = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let bounds = bbox_bounds(&target_tracking.bbox, settings.roi_padding);
+        let translation = estimate_translation(
+            target,
+            candidate.image,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+            settings.alignment_radius,
+        );
+        aligned_candidates.push((candidate, translation));
+    }
+    let best_alignment_error = aligned_candidates
+        .iter()
+        .map(|(_, translation)| translation.error)
+        .fold(f64::INFINITY, f64::min);
+    // A locally incorrect alignment can still have a low pixel spread when
+    // the scene is repetitive. Reject those outliers before reconstruction.
+    let aligned_candidates = aligned_candidates
+        .into_iter()
+        .filter(|(_, translation)| translation.error <= (best_alignment_error + 0.08).min(0.24))
+        .collect::<Vec<_>>();
+    if aligned_candidates.len() < 2 {
+        return RestorationResult::failed(RestorationStrategy::TemporalRestore);
+    }
+    let alignment_error = aligned_candidates
+        .iter()
+        .map(|(_, translation)| translation.error)
+        .sum::<f64>()
+        / aligned_candidates.len() as f64;
+
+    let mut updates = Vec::new();
+    let mut masked_pixels = 0usize;
+    let mut valid_pixels = 0usize;
+    let mut total_spread = 0.0;
+    for y in 0..mask.height() {
+        for x in 0..mask.width() {
+            let alpha = f64::from(mask.get_pixel(x, y)[0]) / 255.0;
+            if alpha < 0.05 {
+                continue;
+            }
+            masked_pixels += 1;
+            let tx = x0 + x as i32;
+            let ty = y0 + y as i32;
+            let mut samples = Vec::new();
+            for (candidate, translation) in &aligned_candidates {
+                let cx = tx + translation.dx;
+                let cy = ty + translation.dy;
+                if !in_bounds(candidate.image, cx, cy)
+                    || inside_bbox(cx, cy, &candidate.tracking.bbox, 3.0)
+                {
+                    continue;
+                }
+                samples.push(*candidate.image.get_pixel(cx as u32, cy as u32));
+            }
+            if samples.len() < 2 {
+                continue;
+            }
+            let median = median_rgb(&mut samples);
+            let spread = samples
+                .iter()
+                .map(|sample| color_distance(sample, &median))
+                .sum::<f64>()
+                / samples.len() as f64;
+            total_spread += spread;
+            valid_pixels += 1;
+            updates.push((tx, ty, median, alpha));
+        }
+    }
+
+    let valid_ratio = if masked_pixels == 0 {
+        0.0
+    } else {
+        valid_pixels as f64 / masked_pixels as f64
+    };
+    let spread = if valid_pixels == 0 {
+        1.0
+    } else {
+        (total_spread / valid_pixels as f64).clamp(0.0, 1.0)
+    };
+    let provisional_artifact = artifact_score(alignment_error, spread);
+    let original = target.clone();
+    let provisional_success = accept_temporal_patch(
+        valid_ratio,
+        provisional_artifact,
+        settings.artifact_threshold,
+    );
+    if provisional_success {
+        for (x, y, pixel, alpha) in updates {
+            if in_bounds(target, x, y) {
+                blend(
+                    target.get_pixel_mut(x as u32, y as u32),
+                    &pixel,
+                    alpha as f32,
+                );
+            }
+        }
+    }
+    let residual_artifact = if provisional_success {
+        spatial_artifact_score(&original, target, mask, x0, y0)
+    } else {
+        1.0
+    };
+    let artifact = provisional_artifact.max(residual_artifact);
+    let success = provisional_success
+        && accept_temporal_patch(valid_ratio, artifact, settings.artifact_threshold);
+    if !success {
+        *target = original;
+    }
+    RestorationResult {
+        strategy: RestorationStrategy::TemporalRestore,
+        success,
+        artifact_score: artifact,
+        temporal_consistency_score: temporal_consistency(valid_ratio, artifact),
+        valid_pixel_ratio: valid_ratio,
+        fallback_used: false,
+    }
+}
+
+fn bbox_bounds(bbox: &BoundingBox, margin: i32) -> (i32, i32, u32, u32) {
+    (
+        (bbox.x.floor() as i32 - margin).max(0),
+        (bbox.y.floor() as i32 - margin).max(0),
+        (bbox.width.ceil() as u32).saturating_add((margin * 2) as u32),
+        (bbox.height.ceil() as u32).saturating_add((margin * 2) as u32),
+    )
+}
+
+fn inside_bbox(x: i32, y: i32, bbox: &BoundingBox, padding: f64) -> bool {
+    x as f64 >= bbox.x - padding
+        && x as f64 <= bbox.x + bbox.width + padding
+        && y as f64 >= bbox.y - padding
+        && y as f64 <= bbox.y + bbox.height + padding
+}
+
+fn in_bounds(image: &RgbImage, x: i32, y: i32) -> bool {
+    x >= 0 && y >= 0 && (x as u32) < image.width() && (y as u32) < image.height()
+}
+
+fn color_distance(a: &Rgb<u8>, b: &Rgb<u8>) -> f64 {
+    (f64::from(a[0].abs_diff(b[0]))
+        + f64::from(a[1].abs_diff(b[1]))
+        + f64::from(a[2].abs_diff(b[2])))
+        / (3.0 * 255.0)
+}
+
+fn median_rgb(samples: &mut [Rgb<u8>]) -> Rgb<u8> {
+    let mut channels = [
+        Vec::with_capacity(samples.len()),
+        Vec::with_capacity(samples.len()),
+        Vec::with_capacity(samples.len()),
+    ];
+    for sample in samples.iter() {
+        channels[0].push(sample[0]);
+        channels[1].push(sample[1]);
+        channels[2].push(sample[2]);
+    }
+    for channel in &mut channels {
+        channel.sort_unstable();
+    }
+    let middle = samples.len() / 2;
+    Rgb([
+        channels[0][middle],
+        channels[1][middle],
+        channels[2][middle],
+    ])
+}
+
+fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
+    for channel in 0..3 {
+        destination[channel] = (f32::from(destination[channel]) * (1.0 - alpha)
+            + f32::from(source[channel]) * alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_frame, CandidateFrame};
+    use crate::project::model::{
+        BoundingBox, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
+    };
+    use image::{GrayImage, Luma, Rgb, RgbImage};
+
+    fn tracking(frame: u64, bbox: BoundingBox) -> TrackingFrame {
+        TrackingFrame {
+            frame,
+            timestamp_seconds: frame as f64,
+            bbox,
+            confidence: 1.0,
+            status: TrackingStatus::Interpolated,
+            source: TrackingSource::Interpolated,
+            locked: false,
+            scores: TrackingScores {
+                template: 1.0,
+                highpass: 1.0,
+                edge: 1.0,
+                motion: 1.0,
+                position: 1.0,
+                size: 1.0,
+                optical_flow: Some(1.0),
+                forward_backward: Some(1.0),
+                motion_smoothness: Some(1.0),
+                match_margin: Some(1.0),
+            },
+        }
+    }
+
+    #[test]
+    fn reconstructs_masked_pixels_from_a_clean_neighbor() {
+        let mut target = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
+        for y in 6..10 {
+            for x in 6..10 {
+                target.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let candidate = RgbImage::from_pixel(16, 16, Rgb([100, 100, 100]));
+        let target_tracking = tracking(
+            1,
+            BoundingBox {
+                x: 6.0,
+                y: 6.0,
+                width: 4.0,
+                height: 4.0,
+            },
+        );
+        let candidate_tracking = tracking(
+            0,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let candidate_tracking_2 = tracking(
+            2,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let mut mask = GrayImage::new(4, 4);
+        for pixel in mask.pixels_mut() {
+            *pixel = Luma([255]);
+        }
+        let result = restore_frame(
+            &mut target,
+            &target_tracking,
+            &mask,
+            6,
+            6,
+            &[
+                CandidateFrame {
+                    frame: 0,
+                    image: &candidate,
+                    tracking: &candidate_tracking,
+                },
+                CandidateFrame {
+                    frame: 2,
+                    image: &candidate,
+                    tracking: &candidate_tracking_2,
+                },
+            ],
+            super::super::model::TemporalSettings {
+                max_candidates: 2,
+                alignment_radius: 0,
+                roi_padding: 2,
+                artifact_threshold: 0.25,
+            },
+        );
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(target.get_pixel(8, 8), &Rgb([100, 100, 100]));
+    }
+}
