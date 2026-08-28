@@ -472,6 +472,102 @@ mod tests {
     }
 
     #[test]
+    fn reconstructs_a_moving_watermark_over_a_synthetic_gradient() {
+        let mut clean = RgbImage::new(48, 48);
+        for y in 0..48 {
+            for x in 0..48 {
+                let base = 35_u8.saturating_add(((x * 5 + y * 3) % 160) as u8);
+                clean.put_pixel(
+                    x,
+                    y,
+                    Rgb([base, base.saturating_add(12), base.saturating_add(24)]),
+                );
+            }
+        }
+
+        let target_bbox = BoundingBox {
+            x: 18.0,
+            y: 16.0,
+            width: 12.0,
+            height: 8.0,
+        };
+        let mut target = clean.clone();
+        for y in 16..24 {
+            for x in 18..30 {
+                let pixel = clean.get_pixel(x, y);
+                target.put_pixel(x, y, Rgb([pixel[0] / 2, pixel[1] / 2, pixel[2] / 2]));
+            }
+        }
+
+        let mut candidate_before = clean.clone();
+        for y in 0..4 {
+            for x in 0..8 {
+                let pixel = clean.get_pixel(x, y);
+                candidate_before.put_pixel(x, y, Rgb([pixel[0] / 2, pixel[1] / 2, pixel[2] / 2]));
+            }
+        }
+        let mut candidate_after = clean.clone();
+        for y in 36..40 {
+            for x in 36..44 {
+                let pixel = clean.get_pixel(x, y);
+                candidate_after.put_pixel(x, y, Rgb([pixel[0] / 2, pixel[1] / 2, pixel[2] / 2]));
+            }
+        }
+
+        let target_tracking = tracking(10, target_bbox);
+        let candidate_before_tracking = tracking(
+            9,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 4.0,
+            },
+        );
+        let candidate_after_tracking = tracking(
+            11,
+            BoundingBox {
+                x: 36.0,
+                y: 36.0,
+                width: 8.0,
+                height: 4.0,
+            },
+        );
+        let mask = GrayImage::from_pixel(12, 8, Luma([255]));
+        let outside_before = *target.get_pixel(0, 0);
+
+        let result = restore_frame(
+            &mut target,
+            &target_tracking,
+            &mask,
+            18,
+            16,
+            &[
+                CandidateFrame {
+                    frame: 9,
+                    image: &candidate_before,
+                    tracking: &candidate_before_tracking,
+                },
+                CandidateFrame {
+                    frame: 11,
+                    image: &candidate_after,
+                    tracking: &candidate_after_tracking,
+                },
+            ],
+            super::super::model::TemporalSettings {
+                max_candidates: 2,
+                alignment_radius: 0,
+                roi_padding: 4,
+                artifact_threshold: 0.25,
+            },
+        );
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(target.get_pixel(24, 20), clean.get_pixel(24, 20));
+        assert_eq!(*target.get_pixel(0, 0), outside_before);
+    }
+
+    #[test]
     fn temporal_artifact_scoring_mask_includes_only_an_inactive_context_ring() {
         let mask = GrayImage::from_pixel(4, 3, Luma([255]));
         let (expanded, x0, y0) = mask_with_context(&mask, 8, 9, 2);

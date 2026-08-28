@@ -128,3 +128,9 @@
 - Re-ran the required checks on the current source after the review-gated changes: `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml` (37 passed), `cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo build --manifest-path src-tauri/Cargo.toml`, and `npm run build`.
 - All commands passed with no warnings/errors requiring action.
 - No tracking data was changed by this validation. The project remains intentionally blocked from rendering until the user reviews `125–128`, `136`, and `139–140`.
+
+## Synthetic temporal acceptance checkpoint — 2026-08-28
+
+- Added a deterministic synthetic restoration test with a moving semi-transparent watermark over a textured gradient. It verifies that clean neighboring candidates reconstruct the target ROI while pixels outside the ROI remain unchanged.
+- The full Rust suite now passes `38/38`; formatting was normalized and `cargo fmt --check` passes.
+- This strengthens the engine-level temporal acceptance evidence, but does not replace visual QA on the real 904-frame project. That QA remains pending until the user resolves the three review ranges.
