@@ -4,6 +4,7 @@
 
 - Cleared stale operation progress when tracking, interpolation, manual correction, occlusion marking, or rendering finishes or fails, so a canceled/failed operation cannot appear to keep running.
 - TypeScript/Vite production build passes after the UI change; tracking data remains untouched and review gating is unchanged.
+- Rebuilt and restarted the Tauri executable; one responsive window remains and the saved review-gated project reloads successfully.
 
 ## Review-safe UI verification checkpoint — 2026-08-28
 
