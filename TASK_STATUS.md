@@ -1,15 +1,28 @@
 # Task status checkpoints
 
+## Review-safe UI verification checkpoint — 2026-08-28
+
+- Restarted the debug app after the previous unresponsive instance; only one responsive `watermark-studio` process/window remains.
+- The saved project reloads with frame `125` visibly labeled `NEED_REVIEW`, `3 problem range(s)`, and the Render action disabled until review is complete.
+- An accidental full tracking run was canceled during verification; the project file timestamp and tracking totals remained unchanged: `INTERPOLATED=745`, `MANUAL=10`, `OCCLUDED=142`, `NEED_REVIEW=7`.
+
+## Review-safe tracking policy checkpoint — 2026-08-28
+
+- The real project state is intentionally left unresolved for user review: `NEED_REVIEW=7`, `problemRanges=3` (`125–128`, `136`, `139–140`); no frame in these ranges is force-accepted as `MANUAL` or silently converted to `INTERPOLATED`.
+- Confirmed tracking totals remain `OCCLUDED=142`, `MANUAL=10`, `INTERPOLATED=745`, `NEED_REVIEW=7` across all 904 frames.
+- Render safety is preserved: both the UI and Rust renderer refuse to render while `NEED_REVIEW`/`AUTO_WEAK` frames remain, while good/locked/interpolated frames retain their existing bbox data.
+- The user will review the three unresolved ranges manually before any new restoration render is accepted as a quality result.
+
 ## Safety note — current local sample state (2026-08-28, supersedes earlier note)
 
 - Project `7d4d4da4-8b57-42d1-a786-62b80fcaa758` was backed up before tracking interpolation at `project.json.pre-interpolation-20260828.bak`.
-- Current tracking state is `OCCLUDED=150`, `MANUAL=5`, `INTERPOLATED=749`, `NEED_REVIEW=0`, `AUTO_WEAK=0`, with `problemRanges=0`.
-- No frame was force-accepted as `MANUAL`; manual anchors remain locked and interpolated ranges retain their existing status semantics.
-- The renders below were produced after this clean tracking state was confirmed.
+- The latest real project state is intentionally review-gated: `OCCLUDED=142`, `MANUAL=10`, `INTERPOLATED=745`, `NEED_REVIEW=7`, with `problemRanges=3`.
+- No unresolved frame is force-accepted as `MANUAL`; existing manual anchors remain locked and existing good/interpolated frame data is preserved.
+- Older renders below were produced under an earlier clean checkpoint and must not be treated as validation for the current review-gated state.
 
 ## Goal Set 1 — Tracking and manual enrollment
 
-- Tracking: `COMPLETE` — project case covers 904 frames; unresolved problem ranges remain 0.
+- Tracking: `PARTIAL / REVIEW-GATED` — project case covers 904 frames; three unresolved ranges remain intentionally available for user review.
 - Manual correction: `COMPLETE` — manual anchors are preserved and locked.
 - Masking: `COMPLETE` — persisted template/mask and render-time derived mask remain available.
 - Existing render modes: `COMPLETE` — Blur, Replacement, and Inpaint paths remain selectable.
@@ -82,3 +95,13 @@
 - The context-ring scorer and its unit test pass, but fresh frame QA shows frame `170` still has a dark patch at the interpolated ROI while the source watermark is elsewhere. The current interpolated bbox is approximately `(x=436.55, y=449.12)` and does not cover the visible source watermark; this confirms the remaining failure is an upstream tracking mismatch, not a reason to expand the render mask or force-accept the frame.
 - Re-rendered explicit `Blur mask` and `Replacement PNG` through the UI; both completed successfully and passed the same metadata/decode audit. Together with the current `Spatial inpaint`, `Temporal Restore`, and `AutoBest` renders, all five selectable modes are operational.
 - Current code gates: `cargo fmt --all -- --check`, `cargo test` (33 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`, and `npm run build` all pass. H, I, J, K, and M remain `PARTIAL` because the real sample still contains tracking-mismatch residue and a Temporal artifact case.
+
+## Render-mask refinement checkpoint — 2026-08-28
+
+- Replaced the restoration renderer's full-bbox fill with the existing solidified/dilated glyph mask. Temporal Restore and Spatial Inpaint now modify only the detected glyph coverage plus its feathered boundary; persisted tracking coordinates and the stored mask are unchanged.
+- Rebuilt and opened the updated executable in an isolated temporary target, confirmed the saved project loads with `0 problem range(s)`, and rendered Temporal Restore through the UI without cancellation. The UI reported `Render complete` for `output-temporal.mp4`.
+- Re-rendered explicit Spatial Inpaint through the UI after the user selected that mode. The UI reported `Render complete` for `output-inpaint.mp4`.
+- Both fresh outputs passed ffprobe/decode checks: H.264 `1080×1920`, `904` frames, `7232/241` FPS, `30.125s`, and AAC 48 kHz stereo audio preserved.
+- Visual QA on frames `170, 292, 350, 530, 710` confirms the large dark patch caused by the prior full-bbox restoration at frame 170 is no longer present in Temporal Restore or Spatial Inpaint. Frame 292 retains faint residue on textured hair and frame 530 retains the watermark outside the interpolated bbox; these remain upstream tracking/mask limitations and were not hidden by expanding the render area.
+- The redundant old application window was closed after verifying its executable path; one updated watermark-studio window remains open.
+- Post-change gates pass: `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml` (33 passed), `cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo build --manifest-path src-tauri/Cargo.toml`, and `npm run build`.

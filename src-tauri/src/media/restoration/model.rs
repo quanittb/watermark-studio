@@ -6,6 +6,7 @@ pub enum RestorationStrategy {
     Replacement,
     InpaintSpatial,
     TemporalRestore,
+    AutoBest,
 }
 
 impl RestorationStrategy {
@@ -14,7 +15,8 @@ impl RestorationStrategy {
             RemovalMode::Blur => Self::Blur,
             RemovalMode::Replacement => Self::Replacement,
             RemovalMode::Inpaint => Self::InpaintSpatial,
-            RemovalMode::TemporalRestore | RemovalMode::AutoBest => Self::TemporalRestore,
+            RemovalMode::TemporalRestore => Self::TemporalRestore,
+            RemovalMode::AutoBest => Self::AutoBest,
         }
     }
 }
@@ -72,6 +74,10 @@ mod tests {
         assert_eq!(
             RestorationStrategy::from_mode(RemovalMode::TemporalRestore),
             RestorationStrategy::TemporalRestore
+        );
+        assert_eq!(
+            RestorationStrategy::from_mode(RemovalMode::AutoBest),
+            RestorationStrategy::AutoBest
         );
     }
 }

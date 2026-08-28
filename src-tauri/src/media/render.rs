@@ -7,7 +7,7 @@ use crate::media::restoration::{artifact, fallback, selector, temporal};
 use crate::project::model::{
     BoundingBox, Project, RemovalConfig, RemovalMode, TrackingFrame, TrackingStatus,
 };
-use image::{imageops, GrayImage, Luma, Rgb, RgbImage};
+use image::{imageops, GrayImage, Rgb, RgbImage};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,7 +21,7 @@ pub fn render_project<F>(
     mut on_progress: F,
 ) -> Result<PathBuf, AppError>
 where
-    F: FnMut(u64, u64),
+    F: FnMut(&str, u64, u64),
 {
     let tracking = project.tracking.as_ref().ok_or_else(|| {
         AppError::InvalidRequest("Analyze the track before rendering.".to_string())
@@ -63,10 +63,11 @@ where
     // feather/dilation. This remains a render-time derived mask and does not
     // alter the persisted template or tracking coordinates.
     let mask = dilate_mask(&solidify_mask(&load_mask(&mask_path)?, 64, 2), 3);
-    // Restoration modes must cover glyph interiors even when the persisted
-    // edge-derived mask has open strokes. Keep the stronger coverage mask
-    // render-time only and bounded by each tracked bbox.
-    let restoration_mask = full_coverage_mask(&mask);
+    // The solidified/dilated mask already covers glyph interiors while
+    // retaining the glyph shape. Reuse it for restoration so only watermark
+    // pixels and their feathered boundary are modified; a full bbox fill can
+    // create visible patches when an interpolated bbox is imperfect.
+    let restoration_mask = mask.clone();
     let replacement = if matches!(config.mode, RemovalMode::Replacement) {
         Some(load_replacement(config)?)
     } else {
@@ -97,6 +98,7 @@ where
     });
     let _ = std::fs::remove_file(&raw_video);
     let _ = std::fs::remove_file(&final_temp);
+    on_progress("prepare", 0, project.video.frame_count);
     let mut decoder = ffmpeg::open_raw_decoder(
         Path::new(&project.source.path),
         project.video.width,
@@ -132,10 +134,15 @@ where
             )?;
         }
         encoder.write_frame(frame.as_raw())?;
-        on_progress(index + 1, project.video.frame_count);
+        on_progress("rendering", index + 1, project.video.frame_count);
     }
     decoder.finish()?;
     encoder.finish()?;
+    on_progress(
+        "mux_audio",
+        project.video.frame_count,
+        project.video.frame_count,
+    );
     mux_audio(&raw_video, Path::new(&project.source.path), &final_temp)?;
     std::fs::rename(&final_temp, &output).or_else(|_| {
         if output.exists() {
@@ -161,7 +168,7 @@ fn render_temporal_project<F>(
     mut on_progress: F,
 ) -> Result<PathBuf, AppError>
 where
-    F: FnMut(u64, u64),
+    F: FnMut(&str, u64, u64),
 {
     let _requested_strategy =
         crate::media::restoration::model::RestorationStrategy::from_mode(config.mode);
@@ -199,8 +206,11 @@ where
     let mut inpaint_fallbacks = 0u64;
     let mut blur_fallbacks = 0u64;
     let mut previous_auto_mode = None;
+    let mut previous_processed: Option<(BufferedFrame, TrackingFrame)> = None;
+    let mut auto_segments: Vec<(RemovalMode, u64, u64)> = Vec::new();
     let mut next_frame = 0u64;
     let mut current = 0u64;
+    on_progress("prepare", 0, project.video.frame_count);
     fill_temporal_buffer(
         &mut decoder,
         &mut buffer,
@@ -255,7 +265,7 @@ where
                     .as_ref()
                     .expect("validated tracking above")
                     .frames;
-                let mut candidate_frames = history
+                let candidate_frames = history
                     .iter()
                     .chain(buffer.iter().skip(1))
                     .map(|item| CandidateFrame {
@@ -264,7 +274,6 @@ where
                         tracking: &tracking_frames[item.index as usize],
                     })
                     .collect::<Vec<_>>();
-                candidate_frames.sort_by_key(|item| item.frame.abs_diff(current));
                 let source_frame = frame.clone();
                 let mut temporal_frame = source_frame.clone();
                 let temporal_result = temporal::restore_frame(
@@ -284,6 +293,7 @@ where
                     temporal_result.valid_pixel_ratio,
                     temporal_result.fallback_used,
                 );
+                let mut selected_temporal = false;
                 if config.mode == RemovalMode::AutoBest {
                     let mut evaluated = Vec::new();
                     if temporal_result.success {
@@ -349,6 +359,8 @@ where
                                 )
                             })?;
                     previous_auto_mode = Some(selected_mode);
+                    selected_temporal = selected_mode == RemovalMode::TemporalRestore;
+                    record_strategy_segment(&mut auto_segments, selected_mode, current);
                     frame = evaluated
                         .into_iter()
                         .find(|(candidate, _)| candidate.mode == selected_mode)
@@ -368,6 +380,7 @@ where
                     frame = temporal_frame;
                     if temporal_result.success {
                         temporal_successes += 1;
+                        selected_temporal = true;
                     } else {
                         temporal_fallbacks += 1;
                         for fallback_mode in fallback::fallback_modes(config.fallback_policy) {
@@ -403,6 +416,24 @@ where
                         }
                     }
                 }
+                if selected_temporal {
+                    if let Some((previous, previous_tracking)) = previous_processed
+                        .as_ref()
+                        .filter(|(_, tracking)| tracking.status != TrackingStatus::Occluded)
+                    {
+                        let _ = temporal::stabilize_frame(temporal::StabilizationInput {
+                            restored: &mut frame,
+                            source: &source_frame,
+                            previous_processed: &previous.image,
+                            target_bbox: &tracking_frame.bbox,
+                            previous_bbox: &previous_tracking.bbox,
+                            mask: &restoration_mask_region,
+                            x0,
+                            y0,
+                            settings,
+                        });
+                    }
+                }
                 // Keep untouched source frames for the configured look-behind window.
                 history.push_back(BufferedFrame {
                     index: current,
@@ -414,19 +445,32 @@ where
             }
         }
         encoder.write_frame(frame.as_raw())?;
-        on_progress(current + 1, project.video.frame_count);
+        previous_processed = Some((
+            BufferedFrame {
+                index: current,
+                image: frame.clone(),
+            },
+            tracking_frame.clone(),
+        ));
+        on_progress("temporal_restore", current + 1, project.video.frame_count);
         buffer.pop_front();
         current += 1;
     }
     decoder.finish()?;
     encoder.finish()?;
     eprintln!(
-        "[restoration] mode={:?} temporal_successes={} temporal_fallbacks={} inpaint_fallbacks={} blur_fallbacks={}",
+        "[restoration] mode={:?} temporal_successes={} temporal_fallbacks={} inpaint_fallbacks={} blur_fallbacks={} auto_segments={:?}",
         config.mode,
         temporal_successes,
         temporal_fallbacks,
         inpaint_fallbacks,
-        blur_fallbacks
+        blur_fallbacks,
+        auto_segments
+    );
+    on_progress(
+        "mux_audio",
+        project.video.frame_count,
+        project.video.frame_count,
     );
     mux_audio(&raw_video, Path::new(&project.source.path), &final_temp)?;
     std::fs::rename(&final_temp, &output).or_else(|_| {
@@ -436,6 +480,20 @@ where
         std::fs::rename(&final_temp, &output)
     })?;
     Ok(output)
+}
+
+fn record_strategy_segment(
+    segments: &mut Vec<(RemovalMode, u64, u64)>,
+    mode: RemovalMode,
+    frame: u64,
+) {
+    if let Some((last_mode, _, last_frame)) = segments.last_mut() {
+        if *last_mode == mode && *last_frame + 1 == frame {
+            *last_frame = frame;
+            return;
+        }
+    }
+    segments.push((mode, frame, frame));
 }
 
 fn fill_temporal_buffer(
@@ -459,10 +517,6 @@ fn fill_temporal_buffer(
         *next_frame += 1;
     }
     Ok(())
-}
-
-fn full_coverage_mask(mask: &GrayImage) -> GrayImage {
-    GrayImage::from_pixel(mask.width(), mask.height(), Luma([u8::MAX]))
 }
 
 fn prepare_mask_region(
@@ -693,6 +747,12 @@ fn apply_inpaint(frame: &mut RgbImage, mask: &GrayImage, x0: i32, y0: i32) -> Re
         }
     }
 
+    // Use the nearest known samples on both axes as a deterministic
+    // edge-aware prefill. It preserves broad luminance/color gradients much
+    // better than repeatedly averaging already-filled pixels. The BFS below
+    // remains the fallback for unusual masks with no axis samples.
+    let axis_prefill = axis_interpolate(&values, &known, &geometry, frame);
+
     let mut queue = VecDeque::new();
     for y in 0..height {
         for x in 0..width {
@@ -767,14 +827,108 @@ fn apply_inpaint(frame: &mut RgbImage, mask: &GrayImage, x0: i32, y0: i32) -> Re
             {
                 continue;
             }
-            blend(
-                frame.get_pixel_mut(dx as u32, dy as u32),
-                &values[y * width + x],
-                alpha,
-            );
+            let pixel = axis_prefill[y * width + x].unwrap_or(values[y * width + x]);
+            blend(frame.get_pixel_mut(dx as u32, dy as u32), &pixel, alpha);
         }
     }
     Ok(())
+}
+
+fn axis_interpolate(
+    values: &[Rgb<u8>],
+    known: &[bool],
+    geometry: &InpaintGeometry,
+    frame: &RgbImage,
+) -> Vec<Option<Rgb<u8>>> {
+    let count = geometry.width * geometry.height;
+    let mut left = vec![None; count];
+    let mut right = vec![None; count];
+    let mut top = vec![None; count];
+    let mut bottom = vec![None; count];
+
+    for y in 0..geometry.height {
+        let mut previous =
+            frame_pixel(frame, geometry.x0 - 1, geometry.y0 + y as i32).map(|pixel| (pixel, 0));
+        for x in 0..geometry.width {
+            let index = y * geometry.width + x;
+            if known[index] {
+                previous = Some((values[index], 0));
+            } else if let Some((pixel, distance)) = previous {
+                left[index] = Some((pixel, distance + 1));
+            }
+        }
+        let mut next = frame_pixel(
+            frame,
+            geometry.x0 + geometry.width as i32,
+            geometry.y0 + y as i32,
+        )
+        .map(|pixel| (pixel, 0));
+        for x in (0..geometry.width).rev() {
+            let index = y * geometry.width + x;
+            if known[index] {
+                next = Some((values[index], 0));
+            } else if let Some((pixel, distance)) = next {
+                right[index] = Some((pixel, distance + 1));
+            }
+        }
+    }
+
+    for x in 0..geometry.width {
+        let mut previous =
+            frame_pixel(frame, geometry.x0 + x as i32, geometry.y0 - 1).map(|pixel| (pixel, 0));
+        for y in 0..geometry.height {
+            let index = y * geometry.width + x;
+            if known[index] {
+                previous = Some((values[index], 0));
+            } else if let Some((pixel, distance)) = previous {
+                top[index] = Some((pixel, distance + 1));
+            }
+        }
+        let mut next = frame_pixel(
+            frame,
+            geometry.x0 + x as i32,
+            geometry.y0 + geometry.height as i32,
+        )
+        .map(|pixel| (pixel, 0));
+        for y in (0..geometry.height).rev() {
+            let index = y * geometry.width + x;
+            if known[index] {
+                next = Some((values[index], 0));
+            } else if let Some((pixel, distance)) = next {
+                bottom[index] = Some((pixel, distance + 1));
+            }
+        }
+    }
+
+    let mut output = vec![None; count];
+    for index in 0..count {
+        if known[index] {
+            continue;
+        }
+        let samples = [left[index], right[index], top[index], bottom[index]];
+        let mut sums = [0.0f32; 3];
+        let mut total_weight = 0.0f32;
+        for (pixel, distance) in samples.into_iter().flatten() {
+            let weight = 1.0 / distance.max(1) as f32;
+            for channel in 0..3 {
+                sums[channel] += f32::from(pixel[channel]) * weight;
+            }
+            total_weight += weight;
+        }
+        if total_weight > 0.0 {
+            output[index] = Some(Rgb([
+                (sums[0] / total_weight).round().clamp(0.0, 255.0) as u8,
+                (sums[1] / total_weight).round().clamp(0.0, 255.0) as u8,
+                (sums[2] / total_weight).round().clamp(0.0, 255.0) as u8,
+            ]));
+        }
+    }
+    output
+}
+
+fn frame_pixel(frame: &RgbImage, x: i32, y: i32) -> Option<Rgb<u8>> {
+    (x >= 0 && y >= 0 && (x as u32) < frame.width() && (y as u32) < frame.height())
+        .then(|| *frame.get_pixel(x as u32, y as u32))
 }
 
 fn local_neighbors(
@@ -882,8 +1036,8 @@ fn mux_audio(video: &Path, source: &Path, output: &Path) -> Result<(), AppError>
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_inpaint, mask_bounds};
-    use crate::project::model::BoundingBox;
+    use super::{apply_inpaint, mask_bounds, record_strategy_segment};
+    use crate::project::model::{BoundingBox, RemovalMode};
     use image::{GrayImage, Rgb, RgbImage};
 
     #[test]
@@ -927,5 +1081,41 @@ mod tests {
         apply_inpaint(&mut frame, &mask, 3, 3).expect("inpaint should succeed");
 
         assert_eq!(frame.get_pixel(7, 7), &Rgb([220, 180, 140]));
+    }
+
+    #[test]
+    fn inpaint_prefill_preserves_a_linear_gradient() {
+        let mut frame = RgbImage::from_fn(15, 15, |x, y| Rgb([x as u8 * 10, y as u8 * 10, 80]));
+        for y in 3..12 {
+            for x in 3..12 {
+                frame.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let mask = GrayImage::from_pixel(9, 9, image::Luma([255]));
+
+        apply_inpaint(&mut frame, &mask, 3, 3).expect("inpaint should succeed");
+
+        // The center should follow the surrounding x/y gradient instead of
+        // collapsing to a flat average of the filled region.
+        let center = frame.get_pixel(7, 7);
+        assert!((i32::from(center[0]) - 70).abs() <= 2);
+        assert!((i32::from(center[1]) - 70).abs() <= 2);
+        assert_eq!(center[2], 80);
+    }
+
+    #[test]
+    fn auto_best_segments_are_compacted_deterministically() {
+        let mut segments = Vec::new();
+        record_strategy_segment(&mut segments, RemovalMode::TemporalRestore, 2);
+        record_strategy_segment(&mut segments, RemovalMode::TemporalRestore, 3);
+        record_strategy_segment(&mut segments, RemovalMode::Inpaint, 4);
+        record_strategy_segment(&mut segments, RemovalMode::Inpaint, 5);
+        assert_eq!(
+            segments,
+            vec![
+                (RemovalMode::TemporalRestore, 2, 3),
+                (RemovalMode::Inpaint, 4, 5)
+            ]
+        );
     }
 }

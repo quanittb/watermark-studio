@@ -21,6 +21,7 @@ pub fn run() {
             commands::project::interpolate_tracking_range,
             commands::project::save_manual_anchor,
             commands::project::accept_tracking_frame,
+            commands::project::mark_occluded_range,
             commands::project::save_removal_config,
             commands::project::render_video,
             commands::project::cancel_render,

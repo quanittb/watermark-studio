@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { acceptTrackingFrame, analyzeTrack, cancelRender, cancelTracking, chooseReplacementPath, chooseVideoPath, getErrorMessage, getProject, interpolateTrackingRange, openVideo, renderVideo, retrackTrack, saveManualAnchor, saveRemovalConfig, saveWatermarkAnchor } from './services/projectApi';
+import { acceptTrackingFrame, analyzeTrack, cancelRender, cancelTracking, chooseReplacementPath, chooseVideoPath, getErrorMessage, getProject, interpolateTrackingRange, markOccludedRange, openVideo, renderVideo, retrackTrack, saveManualAnchor, saveRemovalConfig, saveWatermarkAnchor } from './services/projectApi';
 import type { BoundingBox, RemovalConfig, TrackingFrame, WatermarkProject } from './types/project';
 import './styles.css';
 
@@ -106,7 +106,7 @@ export default function App() {
       .then((savedProject) => {
         if (disposed) return;
         setProject(savedProject);
-        setSelection(savedProject.watermark.anchor?.bbox ?? null);
+        setSelection(savedProject.tracking ? null : savedProject.watermark.anchor?.bbox ?? null);
         setCurrentFrame(savedProject.watermark.anchor?.frame ?? 0);
         setCurrentTime(savedProject.watermark.anchor?.timestampSeconds ?? 0);
         setLabel(savedProject.watermark.label ?? 'Learna AI');
@@ -153,6 +153,7 @@ export default function App() {
     const nextFrame = clamp(Math.round(frame), 0, lastFrame);
     const nextTime = nextFrame / project.video.fps;
     videoRef.current.currentTime = nextTime;
+    setSelection(null);
     setCurrentFrame(nextFrame);
     setCurrentTime(nextTime);
   };
@@ -161,6 +162,7 @@ export default function App() {
     if (!project || !videoRef.current || !Number.isFinite(time)) return;
     const nextTime = clamp(time, 0, project.video.durationSeconds);
     videoRef.current.currentTime = nextTime;
+    setSelection(null);
     setCurrentTime(nextTime);
     setCurrentFrame(clamp(Math.round(nextTime * project.video.fps), 0, Math.max(0, project.video.frameCount - 1)));
   };
@@ -180,6 +182,7 @@ export default function App() {
     const time = videoRef.current.currentTime;
     setCurrentTime(time);
     setCurrentFrame(clamp(Math.round(time * project.video.fps), 0, Math.max(0, project.video.frameCount - 1)));
+    if (!selectionMode) setSelection(null);
   };
 
   const chooseAndOpenVideo = async () => {
@@ -270,7 +273,7 @@ export default function App() {
         ? await saveManualAnchor(project.id, currentFrame, currentTime, displaySelection)
         : await saveWatermarkAnchor(project.id, currentFrame, currentTime, displaySelection, label);
       setProject(updatedProject);
-      setSelection(updatedProject.watermark.anchor?.bbox ?? null);
+      setSelection(project.tracking ? null : updatedProject.watermark.anchor?.bbox ?? null);
       setSelectionMode(false);
       setMessage(project.tracking ? 'Manual frame saved and locked. Click Re-track section.' : 'Anchor saved. Templates and mask are ready.');
     } catch (saveError) {
@@ -287,6 +290,7 @@ export default function App() {
     try {
       const updatedProject = await analyzeTrack(project.id);
       setProject(updatedProject);
+      setSelection(null);
       setMessage(`Tracking complete. ${updatedProject.tracking?.problemRanges.length ?? 0} problem range(s) need review.`);
     } catch (trackingError) { setError(getErrorMessage(trackingError)); setMessage('Tracking failed'); }
     finally { setLoadingTask(null); }
@@ -298,6 +302,7 @@ export default function App() {
     try {
       const updatedProject = await retrackTrack(project.id, currentFrame);
       setProject(updatedProject);
+      setSelection(null);
       setMessage(`Section re-tracked. ${updatedProject.tracking?.problemRanges.length ?? 0} problem range(s) remain.`);
     } catch (trackingError) { setError(getErrorMessage(trackingError)); setMessage('Re-track failed'); }
     finally { setLoadingTask(null); }
@@ -320,7 +325,7 @@ export default function App() {
     const range = project.tracking.problemRanges.find((item) => currentFrame >= item.startFrame && currentFrame <= item.endFrame) ?? project.tracking.problemRanges[0];
     if (!range) return;
     setLoadingTask('saving'); setError(null); setMessage(`Interpolating frames ${range.startFrame}–${range.endFrame} between locked anchors…`);
-    try { setProject(await interpolateTrackingRange(project.id, range.startFrame, range.endFrame)); setMessage('Range interpolated and marked explicitly as INTERPOLATED.'); }
+    try { setProject(await interpolateTrackingRange(project.id, range.startFrame, range.endFrame)); setSelection(null); setMessage('Range interpolated and marked explicitly as INTERPOLATED.'); }
     catch (interpolationError) { setError(getErrorMessage(interpolationError)); }
     finally { setLoadingTask(null); }
   };
@@ -330,6 +335,19 @@ export default function App() {
     setLoadingTask('saving'); setError(null);
     try { setProject(await acceptTrackingFrame(project.id, currentFrame)); setMessage(`Frame ${currentFrame} accepted and locked.`); }
     catch (acceptError) { setError(getErrorMessage(acceptError)); }
+    finally { setLoadingTask(null); }
+  };
+
+  const markCurrentRangeOccluded = async () => {
+    if (!project?.tracking || isBusy) return;
+    const range = project.tracking.problemRanges.find((item) => currentFrame >= item.startFrame && currentFrame <= item.endFrame);
+    if (!range) return;
+    setLoadingTask('saving'); setError(null);
+    try {
+      setProject(await markOccludedRange(project.id, range.startFrame, range.endFrame));
+      setSelection(null);
+      setMessage(`Frames ${range.startFrame}–${range.endFrame} marked occluded; rendering is a no-op for this range.`);
+    } catch (occludedError) { setError(getErrorMessage(occludedError)); }
     finally { setLoadingTask(null); }
   };
 
@@ -419,7 +437,7 @@ export default function App() {
             {(removal.mode === 'TEMPORAL_RESTORE' || removal.mode === 'AUTO_BEST') && <div className="advanced-card"><span className="eyebrow">RESTORATION SETTINGS</span><div className="field-row"><label className="field"><span>Before</span><input type="number" min="1" max="32" value={removal.temporalWindowBefore} onChange={(event) => setRemoval((current) => ({ ...current, temporalWindowBefore: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>After</span><input type="number" min="1" max="32" value={removal.temporalWindowAfter} onChange={(event) => setRemoval((current) => ({ ...current, temporalWindowAfter: Number(event.target.value) }))} disabled={isBusy} /></label></div><div className="field-row"><label className="field"><span>Max candidates</span><input type="number" min="2" max="16" value={removal.maxTemporalCandidates} onChange={(event) => setRemoval((current) => ({ ...current, maxTemporalCandidates: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>ROI padding</span><input type="number" min="8" max="96" value={removal.restorationRoiPadding} onChange={(event) => setRemoval((current) => ({ ...current, restorationRoiPadding: Number(event.target.value) }))} disabled={isBusy} /></label></div><label className="field"><span>Artifact limit</span><input type="number" min="0.05" max="0.95" step="0.05" value={removal.artifactThreshold} onChange={(event) => setRemoval((current) => ({ ...current, artifactThreshold: Number(event.target.value) }))} disabled={isBusy} /></label><label className="field"><span>Fallback</span><select value={removal.fallbackPolicy} onChange={(event) => setRemoval((current) => ({ ...current, fallbackPolicy: event.target.value as RemovalConfig['fallbackPolicy'] }))} disabled={isBusy}><option value="TEMPORAL_INPAINT_BLUR">Inpaint → Blur</option><option value="BLUR_ONLY">Blur only</option></select></label></div>}
             <div className="confidence-card"><div><span>{project?.tracking ? 'Current tracking' : 'Phase 1 status'}</span><strong>{currentTracking?.status ?? (project?.watermark.templates ? 'Ready' : project?.watermark.anchor ? 'Anchor saved' : 'Manual anchor')}</strong></div><div className="confidence-bar"><i style={{ width: `${project?.tracking ? (currentTracking?.confidence ?? 0) * 100 : project?.watermark.templates ? 100 : project?.watermark.anchor ? 65 : 8}%` }} /></div><small>{project?.tracking ? `${unresolvedCount} problem range(s); weak/review frames are blocked from rendering. Occluded frames are preserved unchanged.` : project?.watermark.templates ? 'Templates and mask persisted in the project workspace.' : 'Select a source-coordinate box to begin.'}</small></div>
             <button className="button secondary full" onClick={() => void saveAnchor()} disabled={!project || !displaySelection || isBusy}>{loadingTask === 'saving' ? 'Saving…' : project?.tracking ? 'Save manual correction' : 'Save anchor & templates'}</button>
-            {project?.tracking && currentTracking && <><button className="button secondary full" onClick={() => void acceptCurrentFrame()} disabled={isBusy || currentTracking.status === 'MANUAL'}>Accept current frame</button><button className="button secondary full" onClick={() => void runRetrack()} disabled={isBusy}>Re-track section</button><button className="button secondary full" onClick={() => void interpolateCurrentRange()} disabled={isBusy || !project.tracking.problemRanges.length}>Interpolate current range</button></>}
+            {project?.tracking && currentTracking && <><button className="button secondary full" onClick={() => void acceptCurrentFrame()} disabled={isBusy || currentTracking.status === 'MANUAL'}>Accept current frame</button><button className="button secondary full" onClick={() => void markCurrentRangeOccluded()} disabled={isBusy || !project.tracking.problemRanges.some((item) => currentFrame >= item.startFrame && currentFrame <= item.endFrame)}>Mark current range occluded (no-op)</button><button className="button secondary full" onClick={() => void runRetrack()} disabled={isBusy}>Re-track section</button><button className="button secondary full" onClick={() => void interpolateCurrentRange()} disabled={isBusy || !project.tracking.problemRanges.length}>Interpolate current range</button></>}
             <button className="button primary full" onClick={() => void render()} disabled={!project?.tracking || isBusy || unresolvedCount > 0}>{loadingTask === 'rendering' ? 'Rendering…' : 'Render video'}</button>
             {isBusy && (loadingTask === 'tracking' || loadingTask === 'rendering') && <button className="button secondary full" onClick={cancelBusy}>Cancel operation</button>}
           </aside>

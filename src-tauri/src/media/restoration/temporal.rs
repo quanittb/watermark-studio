@@ -1,4 +1,4 @@
-use super::alignment::estimate_translation;
+use super::alignment::{estimate_translation, AlignmentRegion};
 use super::artifact::{
     accept_temporal_patch, artifact_score, spatial_artifact_score, temporal_consistency,
 };
@@ -10,6 +10,46 @@ pub struct CandidateFrame<'a> {
     pub frame: u64,
     pub image: &'a RgbImage,
     pub tracking: &'a TrackingFrame,
+}
+
+pub struct StabilizationInput<'a> {
+    pub restored: &'a mut RgbImage,
+    pub source: &'a RgbImage,
+    pub previous_processed: &'a RgbImage,
+    pub target_bbox: &'a BoundingBox,
+    pub previous_bbox: &'a BoundingBox,
+    pub mask: &'a GrayImage,
+    pub x0: i32,
+    pub y0: i32,
+    pub settings: TemporalSettings,
+}
+
+/// Selects usable neighboring frames in deterministic distance order. The
+/// caller supplies only the configured before/after window; this layer owns
+/// the safety filtering and candidate budget so every restoration entry point
+/// applies the same rules.
+pub fn select_candidate_frames<'a>(
+    target_frame: u64,
+    candidates: &[CandidateFrame<'a>],
+    settings: TemporalSettings,
+) -> Vec<CandidateFrame<'a>> {
+    let mut selected = candidates
+        .iter()
+        .filter(|candidate| {
+            !matches!(
+                candidate.tracking.status,
+                TrackingStatus::Occluded | TrackingStatus::AutoWeak | TrackingStatus::NeedReview
+            )
+        })
+        .map(|candidate| CandidateFrame {
+            frame: candidate.frame,
+            image: candidate.image,
+            tracking: candidate.tracking,
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|candidate| candidate.frame.abs_diff(target_frame));
+    selected.truncate(settings.max_candidates.max(1));
+    selected
 }
 
 #[derive(Clone, Copy)]
@@ -31,16 +71,7 @@ pub fn restore_frame(
     candidates: &[CandidateFrame<'_>],
     settings: TemporalSettings,
 ) -> RestorationResult {
-    let candidates = candidates
-        .iter()
-        .filter(|candidate| {
-            !matches!(
-                candidate.tracking.status,
-                TrackingStatus::Occluded | TrackingStatus::AutoWeak | TrackingStatus::NeedReview
-            )
-        })
-        .take(settings.max_candidates.max(1))
-        .collect::<Vec<_>>();
+    let candidates = select_candidate_frames(target_tracking.frame, candidates, settings);
     if candidates.is_empty() {
         return RestorationResult::failed(RestorationStrategy::TemporalRestore);
     }
@@ -51,11 +82,15 @@ pub fn restore_frame(
         let translation = estimate_translation(
             target,
             candidate.image,
-            bounds.0,
-            bounds.1,
-            bounds.2,
-            bounds.3,
-            settings.alignment_radius,
+            AlignmentRegion {
+                target_bbox: &target_tracking.bbox,
+                candidate_bbox: &candidate.tracking.bbox,
+                x0: bounds.0,
+                y0: bounds.1,
+                width: bounds.2,
+                height: bounds.3,
+                radius: settings.alignment_radius,
+            },
         );
         aligned_candidates.push((candidate, translation));
     }
@@ -122,6 +157,12 @@ pub fn restore_frame(
                 .map(|sample| color_distance(&sample.pixel, &representative))
                 .sum::<f64>()
                 / samples.len() as f64;
+            // Do not synthesize a pixel from candidates that disagree too
+            // strongly. A missing consensus is safer than a ghosted blend;
+            // the caller can then use its configured spatial fallback.
+            if spread > 0.30 {
+                continue;
+            }
             total_spread += spread;
             valid_pixels += 1;
             updates.push((tx, ty, representative, alpha));
@@ -180,6 +221,72 @@ pub fn restore_frame(
         valid_pixel_ratio: valid_ratio,
         fallback_used: false,
     }
+}
+
+/// Applies a conservative patch-only temporal stabilizer using the previous
+/// processed frame. It is deliberately gated by local alignment and color
+/// agreement so ordinary scene motion is not smoothed across the whole frame.
+/// Only pixels covered by the current restoration mask can change.
+pub fn stabilize_frame(input: StabilizationInput<'_>) -> bool {
+    if input.mask.width() == 0 || input.mask.height() == 0 {
+        return false;
+    }
+    let bounds = bbox_bounds(input.target_bbox, input.settings.roi_padding.max(12));
+    let translation = estimate_translation(
+        input.source,
+        input.previous_processed,
+        AlignmentRegion {
+            target_bbox: input.target_bbox,
+            candidate_bbox: input.previous_bbox,
+            x0: bounds.0,
+            y0: bounds.1,
+            width: bounds.2,
+            height: bounds.3,
+            radius: input.settings.alignment_radius,
+        },
+    );
+    const MAX_ALIGNMENT_ERROR: f64 = 0.18;
+    if translation.error > MAX_ALIGNMENT_ERROR {
+        return false;
+    }
+    let weight = (0.18 * (1.0 - translation.error / MAX_ALIGNMENT_ERROR)).clamp(0.04, 0.18);
+    let mut changed = false;
+    for y in 0..input.mask.height() {
+        for x in 0..input.mask.width() {
+            let alpha = f32::from(input.mask.get_pixel(x, y)[0]) / 255.0;
+            if alpha < 0.35 {
+                continue;
+            }
+            let current_x = input.x0 + x as i32;
+            let current_y = input.y0 + y as i32;
+            let previous_x = current_x + translation.dx;
+            let previous_y = current_y + translation.dy;
+            if !in_bounds(input.restored, current_x, current_y)
+                || !in_bounds(input.source, current_x, current_y)
+                || !in_bounds(input.previous_processed, previous_x, previous_y)
+            {
+                continue;
+            }
+            let previous_pixel = input
+                .previous_processed
+                .get_pixel(previous_x as u32, previous_y as u32);
+            let source_pixel = input.source.get_pixel(current_x as u32, current_y as u32);
+            // A large disagreement usually means a cut, occlusion, or an
+            // incorrect local alignment. Keep the current restoration then.
+            if color_distance(previous_pixel, source_pixel) > 0.35 {
+                continue;
+            }
+            blend(
+                input
+                    .restored
+                    .get_pixel_mut(current_x as u32, current_y as u32),
+                previous_pixel,
+                weight as f32 * alpha,
+            );
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn mask_with_context(mask: &GrayImage, x0: i32, y0: i32, margin: u32) -> (GrayImage, i32, i32) {
@@ -261,7 +368,10 @@ fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_with_context, restore_frame, CandidateFrame};
+    use super::{
+        mask_with_context, restore_frame, select_candidate_frames, stabilize_frame, CandidateFrame,
+        StabilizationInput,
+    };
     use crate::project::model::{
         BoundingBox, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
     };
@@ -452,5 +562,119 @@ mod tests {
         ];
 
         assert_eq!(super::representative_pixel(&samples), Rgb([100, 100, 100]));
+    }
+
+    #[test]
+    fn candidate_selection_is_sorted_bounded_and_safe() {
+        let image = RgbImage::from_pixel(8, 8, Rgb([1, 1, 1]));
+        let mut weak = tracking(
+            3,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        weak.status = TrackingStatus::AutoWeak;
+        let good8 = tracking(
+            8,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let good6 = tracking(
+            6,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let good5 = tracking(
+            5,
+            BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let candidates = [
+            CandidateFrame {
+                frame: 8,
+                image: &image,
+                tracking: &good8,
+            },
+            CandidateFrame {
+                frame: 3,
+                image: &image,
+                tracking: &weak,
+            },
+            CandidateFrame {
+                frame: 6,
+                image: &image,
+                tracking: &good6,
+            },
+            CandidateFrame {
+                frame: 5,
+                image: &image,
+                tracking: &good5,
+            },
+        ];
+        let selected = select_candidate_frames(
+            5,
+            &candidates,
+            super::super::model::TemporalSettings {
+                max_candidates: 2,
+                alignment_radius: 0,
+                roi_padding: 2,
+                artifact_threshold: 0.25,
+            },
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.frame)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
+
+    #[test]
+    fn stabilization_changes_only_the_masked_patch() {
+        let mut restored = RgbImage::from_pixel(24, 24, Rgb([100, 100, 100]));
+        let source = restored.clone();
+        let previous = RgbImage::from_pixel(24, 24, Rgb([140, 140, 140]));
+        let mask = GrayImage::from_pixel(4, 4, Luma([255]));
+        let bbox = BoundingBox {
+            x: 10.0,
+            y: 10.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        let changed = stabilize_frame(StabilizationInput {
+            restored: &mut restored,
+            source: &source,
+            previous_processed: &previous,
+            target_bbox: &bbox,
+            previous_bbox: &bbox,
+            mask: &mask,
+            x0: 10,
+            y0: 10,
+            settings: super::super::model::TemporalSettings {
+                max_candidates: 2,
+                alignment_radius: 0,
+                roi_padding: 2,
+                artifact_threshold: 0.25,
+            },
+        });
+        assert!(changed);
+        assert!(restored.get_pixel(11, 11)[0] > 100);
+        assert_eq!(restored.get_pixel(0, 0), &Rgb([100, 100, 100]));
     }
 }

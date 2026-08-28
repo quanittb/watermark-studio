@@ -1,5 +1,7 @@
 use image::RgbImage;
 
+use crate::project::model::BoundingBox;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Translation {
     pub dx: i32,
@@ -7,18 +9,25 @@ pub struct Translation {
     pub error: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AlignmentRegion<'a> {
+    pub target_bbox: &'a BoundingBox,
+    pub candidate_bbox: &'a BoundingBox,
+    pub x0: i32,
+    pub y0: i32,
+    pub width: u32,
+    pub height: u32,
+    pub radius: i32,
+}
+
 /// Estimates a small local translation using scene pixels around the tracked
 /// region. The watermark rectangle itself is excluded from the comparison.
 pub fn estimate_translation(
     target: &RgbImage,
     candidate: &RgbImage,
-    x0: i32,
-    y0: i32,
-    width: u32,
-    height: u32,
-    radius: i32,
+    region: AlignmentRegion<'_>,
 ) -> Translation {
-    let radius = radius.clamp(0, 12);
+    let radius = region.radius.clamp(0, 12);
     let mut best = Translation {
         dx: 0,
         dy: 0,
@@ -28,9 +37,11 @@ pub fn estimate_translation(
         for dx in -radius..=radius {
             let mut total = 0.0;
             let mut count = 0u64;
-            for y in (y0 - 12..y0 + height as i32 + 12).step_by(4) {
-                for x in (x0 - 12..x0 + width as i32 + 12).step_by(4) {
-                    if x >= x0 && x < x0 + width as i32 && y >= y0 && y < y0 + height as i32 {
+            for y in (region.y0 - 12..region.y0 + region.height as i32 + 12).step_by(4) {
+                for x in (region.x0 - 12..region.x0 + region.width as i32 + 12).step_by(4) {
+                    if inside_bbox(x, y, region.target_bbox, 4.0)
+                        || inside_bbox(x + dx, y + dy, region.candidate_bbox, 8.0)
+                    {
                         continue;
                     }
                     let cx = x + dx;
@@ -63,6 +74,13 @@ pub fn estimate_translation(
     } else {
         best
     }
+}
+
+fn inside_bbox(x: i32, y: i32, bbox: &BoundingBox, padding: f64) -> bool {
+    x as f64 >= bbox.x - padding
+        && x as f64 <= bbox.x + bbox.width + padding
+        && y as f64 >= bbox.y - padding
+        && y as f64 <= bbox.y + bbox.height + padding
 }
 
 fn in_bounds(image: &RgbImage, x: i32, y: i32) -> bool {

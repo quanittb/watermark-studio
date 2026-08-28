@@ -541,6 +541,48 @@ pub async fn accept_tracking_frame(
 }
 
 #[tauri::command]
+pub async fn mark_occluded_range(
+    app: AppHandle,
+    project_id: String,
+    start_frame: u64,
+    end_frame: u64,
+) -> Result<Project, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let mut project = service::load_project(&app_data_dir, &project_id)?;
+        {
+            let tracking = project.tracking.as_mut().ok_or_else(|| {
+                AppError::InvalidRequest(
+                    "Analyze the track before marking occluded frames.".to_string(),
+                )
+            })?;
+            if start_frame > end_frame || end_frame >= tracking.frames.len() as u64 {
+                return Err(AppError::InvalidRequest(
+                    "Invalid occluded frame range.".to_string(),
+                ));
+            }
+            for frame in &mut tracking.frames[start_frame as usize..=end_frame as usize] {
+                frame.status = TrackingStatus::Occluded;
+                frame.source = crate::project::model::TrackingSource::Occluded;
+                frame.confidence = 0.0;
+                frame.locked = false;
+                frame.scores.motion_smoothness = Some(0.0);
+            }
+            tracking.problem_ranges = tracking::service::group_problem_ranges(&tracking.frames);
+        }
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        service::save_project_atomic(&directory, &project)?;
+        Ok::<Project, AppError>(project)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Marking occluded range failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn save_removal_config(
     app: AppHandle,
     project_id: String,
@@ -582,10 +624,14 @@ pub async fn render_video(
             .unwrap_or_default();
         let directory = service::project_directory(&app_data_dir, &project.id)?;
         ffmpeg::ensure_tools_available()?;
-        let output =
-            render::render_project(&directory, &project, &config, &cancel, |current, total| {
+        let output = render::render_project(
+            &directory,
+            &project,
+            &config,
+            &cancel,
+            |phase, current, total| {
                 let progress = OperationProgress {
-                    phase: "rendering".to_string(),
+                    phase: phase.to_string(),
                     current_frame: current,
                     total_frames: total,
                     progress: if total == 0 {
@@ -595,7 +641,8 @@ pub async fn render_video(
                     },
                 };
                 let _ = app.emit("operation-progress", progress);
-            })?;
+            },
+        )?;
         Ok::<RenderVideoResult, AppError>(RenderVideoResult {
             output_path: output.to_string_lossy().to_string(),
             mode: config.mode,

@@ -49,6 +49,10 @@ export function acceptTrackingFrame(projectId: string, frame: number): Promise<W
   return invoke<WatermarkProject>('accept_tracking_frame', { projectId, frame });
 }
 
+export function markOccludedRange(projectId: string, startFrame: number, endFrame: number): Promise<WatermarkProject> {
+  return invoke<WatermarkProject>('mark_occluded_range', { projectId, startFrame, endFrame });
+}
+
 export function saveRemovalConfig(projectId: string, config: RemovalConfig): Promise<WatermarkProject> {
   return invoke<WatermarkProject>('save_removal_config', { projectId, config });
 }
