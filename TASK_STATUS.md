@@ -1,5 +1,13 @@
 # Task status checkpoints
 
+## Real-video conservative tracker audit and project recovery checkpoint — 2026-08-28
+
+- Ran the updated tracker on an isolated copy of the 904-frame real project. Result: `AUTO_GOOD=0`, `AUTO_WEAK=34`, `NEED_REVIEW=784`, `MANUAL=20`, `OCCLUDED=66`, across 13 unresolved ranges.
+- Every reported bad sample (`170`, `235`, `350`, `654`, `700`, `710`, `800`, `902`) remained `NEED_REVIEW`; no misplaced bbox was certified for rendering.
+- The result confirms the conservative validator prevents false-positive acceptance, but the underlying detector still cannot image-validate enough frames to be considered production-quality.
+- During a debug restart, the Windows remove-then-rename compatibility path exposed an interruption window that could leave `project.json` missing. The real project was reconstructed from its persisted pre-interpolation snapshot plus all 20 reviewed manual anchors and validated back to `INTERPOLATED=604`, `MANUAL=20`, `NEED_REVIEW=145`, `OCCLUDED=135` with the same 10 ranges.
+- Project persistence now writes a `project.json.last-good.bak` snapshot before the Windows replacement window and automatically restores it when the primary file is missing or unreadable.
+
 ## Conservative AUTO_GOOD validation checkpoint — 2026-08-28
 
 - A frame can now become `AUTO_GOOD` only when gray-template, high-pass, edge, match-margin, optical-flow, motion-smoothness, and forward/backward agreement all pass independent minimums in addition to the aggregate confidence threshold.

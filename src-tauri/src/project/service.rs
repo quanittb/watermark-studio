@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const PROJECTS_DIRECTORY: &str = "projects";
+const PROJECT_BACKUP_FILE: &str = "project.json.last-good.bak";
 
 pub fn projects_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir
@@ -38,11 +39,23 @@ pub fn create_project_workspace(
 pub fn load_project(app_data_dir: &Path, project_id: &str) -> Result<Project, AppError> {
     let directory = project_directory(app_data_dir, project_id)?;
     let project_path = directory.join("project.json");
-    if !project_path.is_file() {
-        return Err(AppError::ProjectNotFound);
+    let backup_path = directory.join(PROJECT_BACKUP_FILE);
+    match read_project(&project_path) {
+        Ok(project) => Ok(project),
+        Err(_) if backup_path.is_file() => {
+            let project = read_project(&backup_path)?;
+            // Restore the last complete snapshot so the next load does not
+            // depend on the recovery sidecar.
+            fs::copy(&backup_path, &project_path)?;
+            Ok(project)
+        }
+        Err(_) if !project_path.is_file() => Err(AppError::ProjectNotFound),
+        Err(primary_error) => Err(primary_error),
     }
+}
 
-    let contents = fs::read_to_string(project_path)?;
+fn read_project(path: &Path) -> Result<Project, AppError> {
+    let contents = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&contents)?)
 }
 
@@ -52,6 +65,13 @@ pub fn save_project_atomic(project_directory: &Path, project: &Project) -> Resul
     let temporary_path = project_directory.join("project.json.tmp");
     let json = serde_json::to_string_pretty(project)?;
     fs::write(&temporary_path, format!("{json}\n"))?;
+
+    if project_path.is_file() {
+        // Windows rename cannot replace an existing destination. Preserve a
+        // complete prior snapshot before entering the remove/rename window so
+        // an interrupted process restart cannot erase the project.
+        fs::copy(&project_path, project_directory.join(PROJECT_BACKUP_FILE))?;
+    }
 
     match fs::rename(&temporary_path, &project_path) {
         Ok(()) => Ok(()),
@@ -126,5 +146,23 @@ mod tests {
         save_project_atomic(&directory, &sample_project()).expect("project should save");
         assert!(directory.join("project.json").is_file());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn load_recovers_last_good_snapshot_when_primary_is_missing() {
+        let app_data =
+            std::env::temp_dir().join(format!("watermark-studio-test-{}", uuid::Uuid::new_v4()));
+        let directory = project_directory(&app_data, "test-project").unwrap();
+        let mut original = sample_project();
+        save_project_atomic(&directory, &original).expect("first project save should work");
+        original.watermark.label = Some("Learna AI".to_string());
+        save_project_atomic(&directory, &original).expect("second project save should work");
+        fs::remove_file(directory.join("project.json")).expect("simulate interrupted replace");
+
+        let recovered = load_project(&app_data, "test-project").expect("backup should recover");
+
+        assert!(directory.join("project.json").is_file());
+        assert_eq!(recovered.watermark.label.as_deref(), None);
+        let _ = fs::remove_dir_all(app_data);
     }
 }
