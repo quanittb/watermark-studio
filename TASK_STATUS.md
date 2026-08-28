@@ -159,3 +159,9 @@
 - All implementation, unit-test, build, render-gate, UI, and runtime work that can be completed without changing unresolved tracking decisions is complete and pushed.
 - The real project remains intentionally unresolved: 7 `NEED_REVIEW` frames in `125–128`, `136`, and `139–140`; rendering and final real-video visual QA remain blocked by the review gate.
 - This is a user-input blocker, not an implementation failure: the user must inspect each range and save a manual correction, re-track result, or explicit occlusion decision before rendering can proceed.
+
+## Direct review navigation checkpoint — 2026-08-28
+
+- Added accessible direct-jump buttons for each unresolved range in the inspector: `125–128`, `Frame 136`, and `139–140`. Each button only seeks to the range's worst frame and leaves tracking unchanged.
+- `npm run build` passes, and runtime accessibility inspection confirms all three buttons are present while `Render video` remains disabled.
+- The goal remains blocked on the same user-controlled review decision; no unresolved frame was modified.
