@@ -1,5 +1,14 @@
 # Task status checkpoints
 
+## Anchor-local real-video tracking checkpoint — 2026-08-28
+
+- Replaced the single frame-480 template dependency inside tracking with templates cropped from each manual anchor's actual analysis frame. Forward and backward passes for every bounded segment now start from their own endpoint appearance without changing the project schema or manual-anchor contract.
+- Removed the redundant full-video baseline pass; only the leading one-way range, anchor-bounded bidirectional ranges, and an optional trailing one-way range are analyzed.
+- Locally coherent weak matches may advance only the internal trajectory; persisted `AUTO_GOOD` still requires bidirectional validation. A second strong-image-consensus path handles fast motion only when gray, high-pass, and edge channels are all strong and endpoint tracks agree.
+- Isolated 904-frame audit result: `AUTO_GOOD=19`, `NEED_REVIEW=799`, `MANUAL=20`, `OCCLUDED=66`, `AUTO_WEAK=0`, `INTERPOLATED=0`, with 12 review ranges.
+- All 19 `AUTO_GOOD` frames are the bounded segment `531–549`. Source overlays were inspected at frames `531`, `534`, `535`, `536`, `537`, `538`, `541`, `544`, `547`, `548`, and `549`; every reviewed bbox covers the visible watermark. Reported bad frames `170`, `235`, `350`, `654`, `700`, `710`, `800`, and `902` remain `NEED_REVIEW`.
+- Added an ignored environment-configured real-project audit test so the full 904-frame measurement can be repeated on an isolated project copy without mutating user data.
+
 ## Real-video conservative tracker audit and project recovery checkpoint — 2026-08-28
 
 - Ran the updated tracker on an isolated copy of the 904-frame real project. Result: `AUTO_GOOD=0`, `AUTO_WEAK=34`, `NEED_REVIEW=784`, `MANUAL=20`, `OCCLUDED=66`, across 13 unresolved ranges.

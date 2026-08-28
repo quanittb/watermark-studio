@@ -29,7 +29,7 @@ where
             .unwrap_or_default(),
     );
     let directory = service::project_directory(app_data_dir, project_id)?;
-    let (frames, bank, analysis_width, analysis_height) = prepare(&project, &directory, &config)?;
+    let (frames, analysis_width, analysis_height) = prepare(&project, &config)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(AppError::OperationCancelled);
     }
@@ -37,79 +37,51 @@ where
     let initial = anchors
         .first()
         .expect("normalized_anchors always returns one anchor");
-    let initial_seed = make_seed(
-        initial,
-        project.video.width,
-        project.video.height,
-        analysis_width,
-        analysis_height,
-        project.watermark.template_padding,
-    );
-    // Always keep a complete forward/backward baseline so agreement is available
-    // outside manually constrained segments as well.
-    let baseline_forward = track_direction(
-        &frames,
-        &bank,
-        &initial_seed,
-        (frames.len() - 1) as u64,
-        1,
-        &config,
-        project.video.fps,
-        |current| {
-            progress("tracking_forward", current, frames.len() as u64)
-                && !cancel.load(Ordering::Relaxed)
-        },
-    );
-    let baseline_backward = track_direction(
-        &frames,
-        &bank,
-        &initial_seed,
-        0,
-        -1,
-        &config,
-        project.video.fps,
-        |current| {
-            progress("tracking_backward", current, frames.len() as u64)
-                && !cancel.load(Ordering::Relaxed)
-        },
-    );
-    let baseline = fuse_tracks(
-        &baseline_forward,
-        &baseline_backward,
-        project.video.width,
-        project.video.height,
-        analysis_width,
-        analysis_height,
-        project.video.fps,
-        project.watermark.template_padding,
-        &config,
-    );
-    let mut tracked = baseline.into_iter().map(Some).collect::<Vec<_>>();
+    let (initial_seed, initial_bank) =
+        anchor_seed_and_bank(&frames, initial, &project, analysis_width, analysis_height)?;
+    let mut tracked = vec![None; frames.len()];
+    if initial.frame > 0 {
+        let backward = track_direction(
+            &frames,
+            &initial_bank,
+            &initial_seed,
+            0,
+            -1,
+            &config,
+            project.video.fps,
+            |current| {
+                progress("tracking_backward", current, frames.len() as u64)
+                    && !cancel.load(Ordering::Relaxed)
+            },
+        );
+        let fused = fuse_tracks(
+            &[],
+            &backward,
+            project.video.width,
+            project.video.height,
+            analysis_width,
+            analysis_height,
+            project.video.fps,
+            project.watermark.template_padding,
+            &config,
+        );
+        merge_range(&mut tracked, &fused, 0, initial.frame);
+    } else {
+        tracked[initial.frame as usize] = Some(initial_seed.clone());
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err(AppError::OperationCancelled);
     }
     for pair in anchors.windows(2) {
         let left = &pair[0];
         let right = &pair[1];
-        let left_seed = make_seed(
-            left,
-            project.video.width,
-            project.video.height,
-            analysis_width,
-            analysis_height,
-            project.watermark.template_padding,
-        );
-        let right_seed = make_seed(
-            right,
-            project.video.width,
-            project.video.height,
-            analysis_width,
-            analysis_height,
-            project.watermark.template_padding,
-        );
+        let (left_seed, left_bank) =
+            anchor_seed_and_bank(&frames, left, &project, analysis_width, analysis_height)?;
+        let (right_seed, right_bank) =
+            anchor_seed_and_bank(&frames, right, &project, analysis_width, analysis_height)?;
         let forward = track_direction(
             &frames,
-            &bank,
+            &left_bank,
             &left_seed,
             right.frame,
             1,
@@ -122,7 +94,7 @@ where
         );
         let backward = track_direction(
             &frames,
-            &bank,
+            &right_bank,
             &right_seed,
             left.frame,
             -1,
@@ -148,6 +120,44 @@ where
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::OperationCancelled);
         }
+    }
+    let final_anchor = anchors
+        .last()
+        .expect("normalized_anchors always returns one anchor");
+    let final_frame = frames.len().saturating_sub(1) as u64;
+    if final_anchor.frame < final_frame {
+        let (final_seed, final_bank) = anchor_seed_and_bank(
+            &frames,
+            final_anchor,
+            &project,
+            analysis_width,
+            analysis_height,
+        )?;
+        let forward = track_direction(
+            &frames,
+            &final_bank,
+            &final_seed,
+            final_frame,
+            1,
+            &config,
+            project.video.fps,
+            |current| {
+                progress("tracking_forward", current, frames.len() as u64)
+                    && !cancel.load(Ordering::Relaxed)
+            },
+        );
+        let fused = fuse_tracks(
+            &forward,
+            &[],
+            project.video.width,
+            project.video.height,
+            analysis_width,
+            analysis_height,
+            project.video.fps,
+            project.watermark.template_padding,
+            &config,
+        );
+        merge_range(&mut tracked, &fused, final_anchor.frame, final_frame);
     }
 
     let mut output = tracked
@@ -189,24 +199,18 @@ where
             .unwrap_or_default(),
     );
     let directory = service::project_directory(app_data_dir, project_id)?;
-    let (frames, bank, analysis_width, analysis_height) = prepare(&project, &directory, &config)?;
+    let (frames, analysis_width, analysis_height) = prepare(&project, &config)?;
     let anchors = normalized_anchors(&project)?;
     let (left, right) = tracking_segment_for_frame(&anchors, frame);
     let end_frame = right
         .as_ref()
         .map(|anchor| anchor.frame)
         .unwrap_or((frames.len() - 1) as u64);
-    let left_seed = make_seed(
-        &left,
-        project.video.width,
-        project.video.height,
-        analysis_width,
-        analysis_height,
-        project.watermark.template_padding,
-    );
+    let (left_seed, left_bank) =
+        anchor_seed_and_bank(&frames, &left, &project, analysis_width, analysis_height)?;
     let forward = track_direction(
         &frames,
-        &bank,
+        &left_bank,
         &left_seed,
         end_frame,
         1,
@@ -217,16 +221,10 @@ where
                 && !cancel.load(Ordering::Relaxed)
         },
     );
-    let backward = right.as_ref().map(|anchor| {
-        let seed = make_seed(
-            anchor,
-            project.video.width,
-            project.video.height,
-            analysis_width,
-            analysis_height,
-            project.watermark.template_padding,
-        );
-        track_direction(
+    let backward = if let Some(anchor) = right.as_ref() {
+        let (seed, bank) =
+            anchor_seed_and_bank(&frames, anchor, &project, analysis_width, analysis_height)?;
+        Some(track_direction(
             &frames,
             &bank,
             &seed,
@@ -238,8 +236,10 @@ where
                 progress("tracking_backward", current, frames.len() as u64)
                     && !cancel.load(Ordering::Relaxed)
             },
-        )
-    });
+        ))
+    } else {
+        None
+    };
     if cancel.load(Ordering::Relaxed) {
         return Err(AppError::OperationCancelled);
     }
@@ -343,9 +343,8 @@ pub fn interpolate_between_anchors(
 
 fn prepare(
     project: &Project,
-    directory: &Path,
     config: &TrackingConfig,
-) -> Result<(Vec<crate::media::ffmpeg::GrayFrame>, TemplateBank, u32, u32), AppError> {
+) -> Result<(Vec<crate::media::ffmpeg::GrayFrame>, u32, u32), AppError> {
     let (analysis_width, analysis_height) = ffmpeg::analysis_dimensions(
         project.video.width,
         project.video.height,
@@ -364,35 +363,35 @@ fn prepare(
             project.video.frame_count
         )));
     }
-    let anchor = project.watermark.anchor.as_ref().ok_or_else(|| {
+    project.watermark.anchor.as_ref().ok_or_else(|| {
         AppError::InvalidRequest("Save a watermark anchor before tracking.".to_string())
     })?;
-    let padded = crate::tracking::bidirectional::expand_bbox(
-        &anchor.bbox,
-        f64::from(project.watermark.template_padding),
+    project.watermark.templates.as_ref().ok_or_else(|| {
+        AppError::InvalidRequest("Save a watermark anchor before tracking.".to_string())
+    })?;
+    Ok((frames, analysis_width, analysis_height))
+}
+
+fn anchor_seed_and_bank(
+    frames: &[crate::media::ffmpeg::GrayFrame],
+    anchor: &ManualAnchor,
+    project: &Project,
+    analysis_width: u32,
+    analysis_height: u32,
+) -> Result<(TrackingFrame, TemplateBank), AppError> {
+    let seed = make_seed(
+        anchor,
+        project.video.width,
+        project.video.height,
+        analysis_width,
+        analysis_height,
+        project.watermark.template_padding,
     );
-    let template_width = (padded.width * f64::from(analysis_width) / f64::from(project.video.width))
-        .round()
-        .max(8.0) as u32;
-    let template_height = (padded.height * f64::from(analysis_height)
-        / f64::from(project.video.height))
-    .round()
-    .max(8.0) as u32;
-    let template_rel = project
-        .watermark
-        .templates
-        .as_ref()
-        .ok_or_else(|| {
-            AppError::InvalidRequest("Save a watermark anchor before tracking.".to_string())
-        })?
-        .original
-        .clone();
-    let bank = TemplateBank::from_path(
-        &directory.join(template_rel),
-        template_width,
-        template_height,
-    )?;
-    Ok((frames, bank, analysis_width, analysis_height))
+    let source_frame = frames.get(anchor.frame as usize).ok_or_else(|| {
+        AppError::InvalidRequest("Manual anchor is outside the decoded video.".to_string())
+    })?;
+    let bank = TemplateBank::from_frame(source_frame, &seed.bbox)?;
+    Ok((seed, bank))
 }
 
 fn normalized_config(mut config: TrackingConfig) -> TrackingConfig {
@@ -788,5 +787,52 @@ mod tests {
                 .frame,
             20
         );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated real-project copy configured by environment"]
+    fn audits_configured_real_project_tracking() {
+        let app_data = std::env::var("WATERMARK_STUDIO_AUDIT_APP_DATA")
+            .expect("WATERMARK_STUDIO_AUDIT_APP_DATA is required");
+        let project_id = std::env::var("WATERMARK_STUDIO_AUDIT_PROJECT_ID")
+            .expect("WATERMARK_STUDIO_AUDIT_PROJECT_ID is required");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let project = super::analyze_project(
+            std::path::Path::new(&app_data),
+            &project_id,
+            &cancel,
+            |_phase, _current, _total| true,
+        )
+        .expect("isolated real-project analysis should complete");
+        let tracking = project.tracking.expect("tracking should be produced");
+        for status in [
+            TrackingStatus::AutoGood,
+            TrackingStatus::AutoWeak,
+            TrackingStatus::NeedReview,
+            TrackingStatus::Manual,
+            TrackingStatus::Interpolated,
+            TrackingStatus::Occluded,
+        ] {
+            let count = tracking
+                .frames
+                .iter()
+                .filter(|frame| frame.status == status)
+                .count();
+            eprintln!("AUDIT_STATUS {status:?} {count}");
+        }
+        eprintln!("AUDIT_RANGES {}", tracking.problem_ranges.len());
+        for frame_number in [170_u64, 235, 350, 654, 700, 710, 800, 902] {
+            let frame = &tracking.frames[frame_number as usize];
+            eprintln!(
+                "AUDIT_FRAME {} {:?} {:.4} {:.1} {:.1} {:.1} {:.1}",
+                frame.frame,
+                frame.status,
+                frame.confidence,
+                frame.bbox.x,
+                frame.bbox.y,
+                frame.bbox.width,
+                frame.bbox.height
+            );
+        }
     }
 }

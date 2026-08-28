@@ -1,7 +1,5 @@
 use crate::media::ffmpeg::GrayFrame;
 use crate::project::model::{BoundingBox, TrackingScores};
-use image::imageops::{self, FilterType};
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct FeatureImage {
@@ -21,18 +19,35 @@ pub struct TemplateBank {
 }
 
 impl TemplateBank {
-    pub fn from_path(path: &Path, width: u32, height: u32) -> Result<Self, crate::error::AppError> {
-        let source = image::open(path)
-            .map_err(|error| {
-                crate::error::AppError::Io(format!("Unable to read template: {error}"))
-            })?
-            .to_luma8();
-        let resized = imageops::resize(&source, width.max(8), height.max(8), FilterType::Lanczos3);
-        let gray = FeatureImage {
-            width: resized.width(),
-            height: resized.height(),
-            pixels: resized.into_raw(),
-        };
+    pub fn from_frame(
+        frame: &GrayFrame,
+        bbox: &BoundingBox,
+    ) -> Result<Self, crate::error::AppError> {
+        let left = bbox.x.floor().max(0.0) as u32;
+        let top = bbox.y.floor().max(0.0) as u32;
+        let right = (bbox.x + bbox.width).ceil().min(f64::from(frame.width)) as u32;
+        let bottom = (bbox.y + bbox.height).ceil().min(f64::from(frame.height)) as u32;
+        if right.saturating_sub(left) < 8 || bottom.saturating_sub(top) < 8 {
+            return Err(crate::error::AppError::InvalidRequest(
+                "Anchor template is outside the analysis frame.".to_string(),
+            ));
+        }
+        let width = right - left;
+        let height = bottom - top;
+        let mut pixels = Vec::with_capacity((width * height) as usize);
+        for y in top..bottom {
+            let start = (y * frame.width + left) as usize;
+            let end = start + width as usize;
+            pixels.extend_from_slice(&frame.pixels[start..end]);
+        }
+        Self::from_gray(FeatureImage {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    fn from_gray(gray: FeatureImage) -> Result<Self, crate::error::AppError> {
         let highpass = highpass(&gray);
         let edge = edge(&gray);
         let sample_points = sample_points(gray.width, gray.height);

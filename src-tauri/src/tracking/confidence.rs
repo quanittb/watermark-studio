@@ -39,15 +39,23 @@ pub fn validated_status(
     confidence: f64,
     config: &crate::project::model::TrackingConfig,
 ) -> TrackingStatus {
-    let independently_supported = scores.template >= 0.60
+    let motion_supported = scores.template >= 0.60
         && scores.highpass >= 0.58
         && scores.edge >= 0.52
         && scores.match_margin.unwrap_or(0.0) >= 0.03
         && scores.optical_flow.unwrap_or(0.0) >= 0.40
         && scores.motion_smoothness.unwrap_or(0.0) >= 0.50
         && scores.forward_backward.unwrap_or(0.0) >= 0.70;
+    // Optical flow and per-step smoothness can be noisy during fast but valid
+    // motion. Permit a second path only when all three independent image
+    // channels are very strong and the two endpoint tracks still agree.
+    let high_image_consensus = confidence >= 0.75
+        && scores.template >= 0.70
+        && scores.highpass >= 0.78
+        && scores.edge >= 0.79
+        && scores.forward_backward.unwrap_or(0.0) >= 0.55;
 
-    if independently_supported && confidence >= config.accept_threshold {
+    if (motion_supported || high_image_consensus) && confidence >= config.accept_threshold {
         TrackingStatus::AutoGood
     } else if confidence >= config.weak_threshold {
         TrackingStatus::AutoWeak
@@ -95,6 +103,22 @@ mod tests {
         disagreed.forward_backward = Some(0.4);
         assert_eq!(
             validated_status(&disagreed, 0.9, &config),
+            TrackingStatus::AutoWeak
+        );
+
+        let mut fast_motion = scores();
+        fast_motion.optical_flow = Some(0.2);
+        fast_motion.motion_smoothness = Some(0.1);
+        fast_motion.forward_backward = Some(0.6);
+        fast_motion.edge = 0.85;
+        assert_eq!(
+            validated_status(&fast_motion, 0.8, &config),
+            TrackingStatus::AutoGood
+        );
+
+        fast_motion.edge = 0.6;
+        assert_eq!(
+            validated_status(&fast_motion, 0.8, &config),
             TrackingStatus::AutoWeak
         );
     }

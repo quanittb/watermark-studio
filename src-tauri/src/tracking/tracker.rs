@@ -124,12 +124,11 @@ where
         });
         if let Some(frame) = next {
             // Only AUTO_GOOD frames are allowed to update the state used for the
-            // next prediction. AUTO_WEAK/NEED_REVIEW remain visible for manual
-            // correction without poisoning the subsequent trajectory.
-            if matches!(
-                frame.status,
-                crate::project::model::TrackingStatus::AutoGood
-            ) {
+            // final output without independent reverse-track validation. A
+            // locally coherent image match may still advance the internal
+            // trajectory; bidirectional fusion decides whether it is safe to
+            // certify or must remain review-gated.
+            if can_advance_trajectory(&frame, config) {
                 previous = frame.clone();
             }
             results[next_number as usize] = Some(frame);
@@ -140,4 +139,62 @@ where
         frame_number = next_number;
     }
     results
+}
+
+fn can_advance_trajectory(frame: &TrackingFrame, config: &TrackingConfig) -> bool {
+    let image_score =
+        frame.scores.template * 0.35 + frame.scores.highpass * 0.40 + frame.scores.edge * 0.25;
+    image_score >= config.weak_threshold
+        && frame.scores.match_margin.unwrap_or(0.0) >= 0.03
+        && frame.scores.optical_flow.unwrap_or(0.0) >= 0.35
+        && frame.scores.motion_smoothness.unwrap_or(0.0) >= 0.45
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_advance_trajectory;
+    use crate::project::model::{
+        BoundingBox, TrackingConfig, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
+    };
+
+    fn frame() -> TrackingFrame {
+        TrackingFrame {
+            frame: 1,
+            timestamp_seconds: 0.0,
+            bbox: BoundingBox {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            confidence: 0.58,
+            status: TrackingStatus::AutoWeak,
+            source: TrackingSource::Forward,
+            locked: false,
+            scores: TrackingScores {
+                template: 0.7,
+                highpass: 0.7,
+                edge: 0.7,
+                motion: 0.8,
+                position: 0.8,
+                size: 1.0,
+                optical_flow: Some(0.8),
+                forward_backward: None,
+                motion_smoothness: Some(0.8),
+                match_margin: Some(0.08),
+            },
+        }
+    }
+
+    #[test]
+    fn coherent_weak_match_can_advance_internal_trajectory() {
+        assert!(can_advance_trajectory(&frame(), &TrackingConfig::default()));
+
+        let mut ambiguous = frame();
+        ambiguous.scores.match_margin = Some(0.01);
+        assert!(!can_advance_trajectory(
+            &ambiguous,
+            &TrackingConfig::default()
+        ));
+    }
 }
