@@ -112,3 +112,13 @@
 - Visual QA on frames `170, 292, 350, 530, 710` confirms the large dark patch caused by the prior full-bbox restoration at frame 170 is no longer present in Temporal Restore or Spatial Inpaint. Frame 292 retains faint residue on textured hair and frame 530 retains the watermark outside the interpolated bbox; these remain upstream tracking/mask limitations and were not hidden by expanding the render area.
 - The redundant old application window was closed after verifying its executable path; one updated watermark-studio window remains open.
 - Post-change gates pass: `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml` (33 passed), `cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo build --manifest-path src-tauri/Cargo.toml`, and `npm run build`.
+
+## Current review-gated verification checkpoint — 2026-08-28
+
+- Rebuilt application is running with exactly one responsive `watermark-studio` window.
+- The UI exposes `Review` for an existing track and `Re-analyze track` as the explicit full-analysis action; `Render video` remains disabled while unresolved ranges exist.
+- Current saved project state is unchanged and review-safe across all 904 frames: `INTERPOLATED=745`, `MANUAL=10`, `OCCLUDED=142`, `NEED_REVIEW=7`.
+- The seven unresolved frames remain in three user-controlled ranges: `125–128`, `136`, and `139–140`; no weak frame was auto-accepted, interpolated, or marked occluded.
+- Tracker policy confirmed: only `AUTO_GOOD` advances the prediction trajectory; `AUTO_WEAK` and `NEED_REVIEW` remain visible for manual review. Rust and UI render gates reject unresolved weak/review frames.
+- Repository verification: working tree clean and `HEAD` matches `origin/main` at `8ac9876` (`make tracking review action explicit`).
+- Goal Set 2 remains active and not complete until the user reviews the three ranges and fresh rendered outputs pass visual quality validation.
