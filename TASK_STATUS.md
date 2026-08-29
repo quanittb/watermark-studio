@@ -1,5 +1,14 @@
 # Task status checkpoints
 
+## Production-quality periodic watermark removal checkpoint — 2026-08-29
+
+- Reverse-engineered the verified deterministic `Learna AI` trajectory across the 904-frame source, generated a clean glyph-only mask, and preserved the source video unchanged.
+- The local Temporal/AutoBest renderer was improved to reject candidate glyph pixels rather than an entire bounding box, honor a larger requested candidate budget, and retain a temporal result once its coverage, consensus, alignment, and seam gates pass. This removes the previous rectangular fallback artifacts from the highest-confidence temporal frames.
+- The remaining hard crossings (face, subtitles, car reflections, robot and phone UI) were rendered with FP32 ProPainter at `288x512`, split into 15 chunks with 8-frame temporal context on each side. Only the feathered glyph mask was composited back into the original `1080x1920` frames, preserving the untouched source pixels and original AAC audio outside the removal area.
+- Final output: `C:\Users\quant\Dropbox\PC\Downloads\output\clip_test_watermark_removed_best.mp4`.
+- Final validation: H.264 `1080x1920`, `904` frames, `7232/241` FPS; AAC stereo `48 kHz`; duration `30.144s`; full FFmpeg decode succeeds. SHA-256: `F223F5BC8988C8C8B6B3D224AED69E20D624810E6E7970B0C27E4EB064882758`.
+- Visual acceptance: source-vs-final crop review at 35 points spanning frames `48–903` confirms no readable `Learna AI` residue and no rectangular/black restoration patches in the tested face, subtitle, vehicle, robot, or phone-interface crossings.
+
 ## Anchor-local real-video tracking checkpoint — 2026-08-28
 
 - Replaced the single frame-480 template dependency inside tracking with templates cropped from each manual anchor's actual analysis frame. Forward and backward passes for every bounded segment now start from their own endpoint appearance without changing the project schema or manual-anchor contract.

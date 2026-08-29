@@ -200,7 +200,10 @@ where
     )?;
     let before = config.temporal_window_before.clamp(1, 32) as u64;
     let after = config.temporal_window_after.clamp(1, 32) as u64;
-    let max_candidates = config.max_temporal_candidates.clamp(2, 16) as usize;
+    // Quality-oriented renders may use every frame in a +/- 16 window.  The
+    // previous cap of 16 silently discarded useful clean glyph samples even
+    // when the project explicitly requested a larger temporal budget.
+    let max_candidates = config.max_temporal_candidates.clamp(2, 32) as usize;
     let settings = TemporalSettings {
         max_candidates,
         alignment_radius: 6,
@@ -297,92 +300,98 @@ where
                 // telemetry, even when the selected output is a fallback.
                 let _temporal_quality_snapshot = (
                     temporal_result.strategy,
+                    temporal_result.artifact_score,
                     temporal_result.temporal_consistency_score,
                     temporal_result.valid_pixel_ratio,
                     temporal_result.fallback_used,
                 );
                 let mut selected_temporal = false;
                 if config.mode == RemovalMode::AutoBest {
-                    let mut evaluated = Vec::new();
+                    // A temporal result has already passed coverage,
+                    // consensus, alignment, and seam checks. Keep its real
+                    // scene texture instead of comparing its score against a
+                    // spatial score with different semantics; spatial modes
+                    // are fallbacks only when temporal validation fails.
                     if temporal_result.success {
-                        evaluated.push((
-                            selector::StrategyCandidate {
-                                mode: RemovalMode::TemporalRestore,
-                                score: temporal_result.artifact_score,
-                                success: true,
-                            },
-                            temporal_frame,
-                        ));
+                        frame = temporal_frame;
+                        selected_temporal = true;
+                        previous_auto_mode = Some(RemovalMode::TemporalRestore);
+                        record_strategy_segment(
+                            &mut auto_segments,
+                            RemovalMode::TemporalRestore,
+                            current,
+                        );
+                        temporal_successes += 1;
                     } else {
                         temporal_fallbacks += 1;
-                    }
-                    for fallback_mode in fallback::fallback_modes(config.fallback_policy) {
-                        let mut fallback_frame = source_frame.clone();
-                        let score = match fallback_mode {
-                            RemovalMode::Inpaint => {
-                                apply_inpaint(
-                                    &mut fallback_frame,
-                                    &restoration_mask_region,
-                                    x0,
-                                    y0,
-                                )?;
-                                artifact::spatial_artifact_score(
-                                    &source_frame,
-                                    &fallback_frame,
-                                    &restoration_mask_region,
-                                    x0,
-                                    y0,
-                                )
-                            }
-                            RemovalMode::Blur => {
-                                apply_blur(&mut fallback_frame, &spatial_mask_region, x0, y0)?;
-                                artifact::spatial_artifact_score(
-                                    &source_frame,
-                                    &fallback_frame,
-                                    &spatial_mask_region,
-                                    x0,
-                                    y0,
-                                )
-                            }
-                            _ => continue,
-                        };
-                        evaluated.push((
-                            selector::StrategyCandidate {
-                                mode: fallback_mode,
-                                score,
-                                success: true,
-                            },
-                            fallback_frame,
-                        ));
-                    }
-                    let choices = evaluated
-                        .iter()
-                        .map(|(candidate, _)| *candidate)
-                        .collect::<Vec<_>>();
-                    let selected_mode =
-                        selector::select_best_with_preference(&choices, previous_auto_mode)
+                        let mut evaluated = Vec::new();
+                        for fallback_mode in fallback::fallback_modes(config.fallback_policy) {
+                            let mut fallback_frame = source_frame.clone();
+                            let score = match fallback_mode {
+                                RemovalMode::Inpaint => {
+                                    apply_inpaint(
+                                        &mut fallback_frame,
+                                        &restoration_mask_region,
+                                        x0,
+                                        y0,
+                                    )?;
+                                    artifact::spatial_artifact_score(
+                                        &source_frame,
+                                        &fallback_frame,
+                                        &restoration_mask_region,
+                                        x0,
+                                        y0,
+                                    )
+                                }
+                                RemovalMode::Blur => {
+                                    apply_blur(&mut fallback_frame, &spatial_mask_region, x0, y0)?;
+                                    artifact::spatial_artifact_score(
+                                        &source_frame,
+                                        &fallback_frame,
+                                        &spatial_mask_region,
+                                        x0,
+                                        y0,
+                                    )
+                                }
+                                _ => continue,
+                            };
+                            evaluated.push((
+                                selector::StrategyCandidate {
+                                    mode: fallback_mode,
+                                    score,
+                                    success: true,
+                                },
+                                fallback_frame,
+                            ));
+                        }
+                        let choices = evaluated
+                            .iter()
+                            .map(|(candidate, _)| *candidate)
+                            .collect::<Vec<_>>();
+                        let selected_mode =
+                            selector::select_best_with_preference(&choices, previous_auto_mode)
+                                .ok_or_else(|| {
+                                    AppError::InvalidRequest(
+                                        "No restoration strategy produced a valid frame."
+                                            .to_string(),
+                                    )
+                                })?;
+                        previous_auto_mode = Some(selected_mode);
+                        record_strategy_segment(&mut auto_segments, selected_mode, current);
+                        frame = evaluated
+                            .into_iter()
+                            .find(|(candidate, _)| candidate.mode == selected_mode)
+                            .map(|(_, image)| image)
                             .ok_or_else(|| {
                                 AppError::InvalidRequest(
-                                    "No restoration strategy produced a valid frame.".to_string(),
+                                    "Selected restoration strategy was not evaluated.".to_string(),
                                 )
                             })?;
-                    previous_auto_mode = Some(selected_mode);
-                    selected_temporal = selected_mode == RemovalMode::TemporalRestore;
-                    record_strategy_segment(&mut auto_segments, selected_mode, current);
-                    frame = evaluated
-                        .into_iter()
-                        .find(|(candidate, _)| candidate.mode == selected_mode)
-                        .map(|(_, image)| image)
-                        .ok_or_else(|| {
-                            AppError::InvalidRequest(
-                                "Selected restoration strategy was not evaluated.".to_string(),
-                            )
-                        })?;
-                    match selected_mode {
-                        RemovalMode::TemporalRestore => temporal_successes += 1,
-                        RemovalMode::Inpaint => inpaint_fallbacks += 1,
-                        RemovalMode::Blur => blur_fallbacks += 1,
-                        _ => {}
+                        match selected_mode {
+                            RemovalMode::Inpaint => inpaint_fallbacks += 1,
+                            RemovalMode::Blur => blur_fallbacks += 1,
+                            _ => {}
+                        }
                     }
                 } else {
                     frame = temporal_frame;
@@ -1045,13 +1054,17 @@ fn mux_audio(video: &Path, source: &Path, output: &Path) -> Result<(), AppError>
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inpaint, mask_bounds, record_strategy_segment, validate_tracking_for_render,
+        apply_inpaint, mask_bounds, record_strategy_segment, render_project,
+        validate_tracking_for_render,
     };
     use crate::error::AppError;
     use crate::project::model::{
-        BoundingBox, RemovalMode, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
+        BoundingBox, Project, RemovalMode, TrackingFrame, TrackingScores, TrackingSource,
+        TrackingStatus,
     };
     use image::{GrayImage, Rgb, RgbImage};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
 
     fn tracking_frame(status: TrackingStatus) -> TrackingFrame {
         TrackingFrame {
@@ -1185,5 +1198,36 @@ mod tests {
                 (RemovalMode::Inpaint, 4, 5)
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires WATERMARK_STUDIO_RENDER_PROJECT_DIR and the real source video"]
+    fn renders_configured_real_project() {
+        let directory = PathBuf::from(
+            std::env::var("WATERMARK_STUDIO_RENDER_PROJECT_DIR")
+                .expect("WATERMARK_STUDIO_RENDER_PROJECT_DIR is required"),
+        );
+        let project_json = std::fs::read_to_string(directory.join("project.json"))
+            .expect("configured project.json should be readable");
+        let project: Project =
+            serde_json::from_str(&project_json).expect("configured project should be valid");
+        let config = project
+            .removal
+            .clone()
+            .expect("configured project should contain removal settings");
+        let cancel = AtomicBool::new(false);
+        let output = render_project(
+            &directory,
+            &project,
+            &config,
+            &cancel,
+            |stage, current, total| {
+                if current % 100 == 0 || current == total {
+                    eprintln!("{stage}: {current}/{total}");
+                }
+            },
+        )
+        .expect("configured project should render");
+        eprintln!("rendered output: {}", output.display());
     }
 }

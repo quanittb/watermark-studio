@@ -117,6 +117,8 @@ pub fn restore_frame(
     let mut masked_pixels = 0usize;
     let mut valid_pixels = 0usize;
     let mut total_spread = 0.0;
+    let mask_padding_x = (target_tracking.bbox.x.floor() as i32 - x0).max(0);
+    let mask_padding_y = (target_tracking.bbox.y.floor() as i32 - y0).max(0);
     for y in 0..mask.height() {
         for x in 0..mask.width() {
             let alpha = f64::from(mask.get_pixel(x, y)[0]) / 255.0;
@@ -131,11 +133,18 @@ pub fn restore_frame(
                 let cx = tx + translation.dx;
                 let cy = ty + translation.dy;
                 if !in_bounds(candidate.image, cx, cy)
-                    // Keep a conservative margin around the candidate bbox:
-                    // antialiased watermark pixels can extend a few pixels
-                    // past the tracked rectangle and would otherwise leak
-                    // back into the reconstruction.
-                    || inside_bbox(cx, cy, &candidate.tracking.bbox, 8.0)
+                    // Reject only pixels covered by the candidate's glyph
+                    // mask. Rejecting its full bbox discards clean pixels in
+                    // the whitespace between letters and leaves too little
+                    // temporal coverage for a wide moving watermark.
+                    || inside_candidate_mask(
+                        cx,
+                        cy,
+                        &candidate.tracking.bbox,
+                        mask,
+                        mask_padding_x,
+                        mask_padding_y,
+                    )
                 {
                     continue;
                 }
@@ -322,6 +331,46 @@ fn inside_bbox(x: i32, y: i32, bbox: &BoundingBox, padding: f64) -> bool {
         && y as f64 <= bbox.y + bbox.height + padding
 }
 
+fn inside_candidate_mask(
+    x: i32,
+    y: i32,
+    bbox: &BoundingBox,
+    mask: &GrayImage,
+    padding_x: i32,
+    padding_y: i32,
+) -> bool {
+    if mask.width() == 0
+        || mask.height() == 0
+        || !inside_bbox(x, y, bbox, f64::from(padding_x.max(padding_y)))
+    {
+        return false;
+    }
+    let left = bbox.x.floor() as i32 - padding_x;
+    let top = bbox.y.floor() as i32 - padding_y;
+    let right = (bbox.x + bbox.width).ceil() as i32 + padding_x;
+    let bottom = (bbox.y + bbox.height).ceil() as i32 + padding_y;
+    if x < left || x > right || y < top || y > bottom {
+        return false;
+    }
+    let region_width = (right - left + 1).max(1) as u32;
+    let region_height = (bottom - top + 1).max(1) as u32;
+    let mask_x = if region_width <= 1 {
+        0
+    } else {
+        (((x - left) as f64 / f64::from(region_width - 1))
+            * f64::from(mask.width().saturating_sub(1)))
+        .round() as u32
+    };
+    let mask_y = if region_height <= 1 {
+        0
+    } else {
+        (((y - top) as f64 / f64::from(region_height - 1))
+            * f64::from(mask.height().saturating_sub(1)))
+        .round() as u32
+    };
+    mask.get_pixel(mask_x.min(mask.width() - 1), mask_y.min(mask.height() - 1))[0] >= 13
+}
+
 fn in_bounds(image: &RgbImage, x: i32, y: i32) -> bool {
     x >= 0 && y >= 0 && (x as u32) < image.width() && (y as u32) < image.height()
 }
@@ -369,8 +418,8 @@ fn blend(destination: &mut Rgb<u8>, source: &Rgb<u8>, alpha: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        mask_with_context, restore_frame, select_candidate_frames, stabilize_frame, CandidateFrame,
-        StabilizationInput,
+        inside_candidate_mask, mask_with_context, restore_frame, select_candidate_frames,
+        stabilize_frame, CandidateFrame, StabilizationInput,
     };
     use crate::project::model::{
         BoundingBox, TrackingFrame, TrackingScores, TrackingSource, TrackingStatus,
@@ -739,6 +788,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 6]
         );
+    }
+
+    #[test]
+    fn candidate_eligibility_rejects_glyphs_not_the_full_bbox() {
+        let mut mask = GrayImage::new(12, 8);
+        mask.put_pixel(5, 3, Luma([255]));
+        let bbox = BoundingBox {
+            x: 10.0,
+            y: 20.0,
+            width: 8.0,
+            height: 4.0,
+        };
+
+        assert!(inside_candidate_mask(13, 21, &bbox, &mask, 2, 2));
+        assert!(!inside_candidate_mask(11, 21, &bbox, &mask, 2, 2));
+        assert!(!inside_candidate_mask(30, 30, &bbox, &mask, 2, 2));
     }
 
     #[test]
