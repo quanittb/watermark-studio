@@ -130,6 +130,30 @@ pub fn generate_template_variant(
     ])
 }
 
+/// Decodes all selected streams to the null muxer. This catches an output
+/// that has a valid-looking container but broken H.264/AAC payload before it
+/// is presented as a completed best-quality render.
+pub fn verify_video_decode(video_path: &Path) -> Result<(), AppError> {
+    run_ffmpeg([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-v",
+        "error",
+        "-i",
+        video_path
+            .to_str()
+            .ok_or_else(|| AppError::InvalidRequest("Invalid video path.".to_string()))?,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-f",
+        "null",
+        "-",
+    ])
+}
+
 pub fn read_analysis_frames(
     video_path: &Path,
     source_width: u32,

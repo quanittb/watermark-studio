@@ -1,8 +1,8 @@
 [package]
 name = "watermark-studio"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Best-quality moving watermark removal studio"
+authors = ["QuanPH"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -22,7 +22,11 @@ tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

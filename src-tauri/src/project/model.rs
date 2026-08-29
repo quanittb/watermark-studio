@@ -8,12 +8,84 @@ pub struct Project {
     pub source: SourceVideo,
     pub video: VideoMetadata,
     pub watermark: WatermarkConfig,
+    /// Versioned calibration used by the Best-quality pipeline. Legacy
+    /// anchors/tracking remain available for backwards compatibility.
+    #[serde(default)]
+    pub calibration: Option<CalibrationProfile>,
     #[serde(default)]
     pub anchors: Vec<ManualAnchor>,
     #[serde(default)]
     pub tracking: Option<TrackingData>,
     #[serde(default)]
     pub removal: Option<RemovalConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationProfile {
+    pub version: u32,
+    pub preset: CalibrationPreset,
+    #[serde(default)]
+    pub detector_version: Option<String>,
+    #[serde(default)]
+    pub source_fingerprint: Option<SourceFingerprint>,
+    pub profile_path: String,
+    pub mask_path: String,
+    #[serde(default)]
+    pub canonical_mask_path: Option<String>,
+    #[serde(default)]
+    pub auto_mask_path: Option<String>,
+    #[serde(default)]
+    pub blend_mask_path: Option<String>,
+    #[serde(default)]
+    pub brush_delta_path: Option<String>,
+    #[serde(default)]
+    pub mask_hash: String,
+    pub profile_hash: String,
+    pub sample_frame: u64,
+    pub frame_count: u64,
+    pub quality: CalibrationQuality,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFingerprint {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub frame_count: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CalibrationPreset {
+    LearnaAiPeriodic,
+    GeneralMoving,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationQuality {
+    pub status: CalibrationStatus,
+    pub reliable_frames: u64,
+    pub low_confidence_frames: u64,
+    pub mask_pixels: u64,
+    #[serde(default)]
+    pub glyph_coverage: f64,
+    #[serde(default)]
+    pub contamination: f64,
+    #[serde(default)]
+    pub large_holes: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CalibrationStatus {
+    Ready,
+    Stale,
+    NeedsReview,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

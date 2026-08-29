@@ -26,6 +26,8 @@ pub enum AppError {
     InvalidRequest(String),
     #[error("Operation cancelled.")]
     OperationCancelled,
+    #[error("Quality review is required: {0}")]
+    QualityNeedsReview(String),
 }
 
 impl From<io::Error> for AppError {
@@ -61,6 +63,7 @@ impl From<AppError> for AppErrorDto {
             AppError::Json(_) => "JSON_ERROR",
             AppError::InvalidRequest(_) => "INVALID_REQUEST",
             AppError::OperationCancelled => "OPERATION_CANCELLED",
+            AppError::QualityNeedsReview(_) => "QUALITY_NEEDS_REVIEW",
         };
 
         Self {

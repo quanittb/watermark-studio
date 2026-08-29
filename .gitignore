@@ -25,9 +25,13 @@ dist-ssr
 
 # Local Rust build output
 src-tauri/target/
+src-tauri/target-codex/
 
 # Temporary visual QA captures
 qa/*check-*.png
 qa/exact-*.png
 qa/final-*.png
 qa/contact/
+
+# Python bytecode created by the local AI-pipeline validation scripts
+tools/__pycache__/

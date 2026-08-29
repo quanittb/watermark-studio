@@ -24,6 +24,16 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("project_json", type=Path)
     prepare.add_argument("audit_json", type=Path)
     prepare.add_argument("workspace", type=Path)
+    prepare.add_argument(
+        "--anchor-mode",
+        action="store_true",
+        help="Use the saved manual anchor as the periodic-path calibration instead of an audit JSON.",
+    )
+    prepare.add_argument(
+        "--profile",
+        type=Path,
+        help="Full-video calibration profile. Final renders must use this instead of anchor-mode.",
+    )
     prepare.add_argument("--start-frame", type=int, default=48)
     prepare.add_argument("--end-frame", type=int, default=903)
     prepare.add_argument("--full-frame", action="store_true")
@@ -34,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     composite.add_argument("inpaint_frames", type=Path)
     composite.add_argument("output", type=Path)
     composite.add_argument("--crf", type=int, default=14)
+    composite.add_argument("--replacement-kind", choices=["text", "image"])
+    composite.add_argument("--replacement-text", default="")
+    composite.add_argument("--replacement-image", type=Path)
+    composite.add_argument("--replacement-placement", choices=["follow", "fixed"], default="follow")
+    composite.add_argument("--replacement-fixed-x", type=float, default=0.0)
+    composite.add_argument("--replacement-fixed-y", type=float, default=0.0)
+    composite.add_argument("--replacement-scale", type=float, default=1.0)
+    composite.add_argument("--replacement-opacity", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -48,10 +66,22 @@ def crop_origin(x: float, y: float, frame_width: int, frame_height: int) -> tupl
 
 def prepare(args: argparse.Namespace) -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
-    audit_rows = json.loads(args.audit_json.read_text(encoding="utf-8"))
     video_path = Path(project["source"]["path"])
     project_dir = args.project_json.parent
-    mask_path = project_dir / project["watermark"]["templates"]["mask"]
+    profile = None
+    if args.profile is not None:
+        profile = json.loads(args.profile.read_text(encoding="utf-8"))
+        if (
+            profile.get("version") != 3
+            or profile.get("status") != "READY"
+            or profile.get("preset") != "LEARNA_AI_PERIODIC"
+            or profile.get("qualityGate", {}).get("status") != "PASSED"
+        ):
+            raise RuntimeError("Unsupported or incomplete Best-quality calibration profile")
+        if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
+            raise RuntimeError("Calibration profile frame count does not match the source video")
+    mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]
+    mask_path = project_dir / mask_reference
     glyph_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if glyph_mask is None:
         raise RuntimeError(f"Unable to read glyph mask: {mask_path}")
@@ -64,7 +94,32 @@ def prepare(args: argparse.Namespace) -> None:
     frames_dir.mkdir(parents=True)
     masks_dir.mkdir(parents=True)
 
-    offsets_x, offsets_y = aligned_positions(audit_rows)
+    if profile is not None:
+        frame_data = profile.get("frameData", [])
+        if len(frame_data) != int(project["video"]["frameCount"]):
+            raise RuntimeError("Calibration profile frame data does not cover the full source video")
+    elif args.anchor_mode:
+        anchor = project.get("watermark", {}).get("anchor")
+        if not anchor:
+            raise RuntimeError("Best-quality preparation requires a saved watermark anchor")
+        anchor_frame = int(anchor["frame"])
+        anchor_bbox = anchor["bbox"]
+        periodic_x, periodic_y = periodic_position(anchor_frame)
+        offset_x = float(anchor_bbox["x"]) - periodic_x
+        offset_y = float(anchor_bbox["y"]) - periodic_y
+        # A broad range here would make a different watermark look like a
+        # supported Learna AI trajectory. Refuse it rather than masking an
+        # unrelated screen region throughout the full video.
+        if abs(offset_x) > 80 or abs(offset_y) > 80:
+            raise RuntimeError(
+                "The saved anchor does not match the supported periodic watermark path"
+            )
+        offset_count = args.end_frame + 1
+        offsets_x = np.full(offset_count, offset_x, dtype=np.float64)
+        offsets_y = np.full(offset_count, offset_y, dtype=np.float64)
+    else:
+        audit_rows = json.loads(args.audit_json.read_text(encoding="utf-8"))
+        offsets_x, offsets_y = aligned_positions(audit_rows)
     capture = cv2.VideoCapture(str(video_path))
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -75,9 +130,17 @@ def prepare(args: argparse.Namespace) -> None:
             ok, frame = capture.read()
             if not ok:
                 raise RuntimeError(f"Unable to decode source frame {frame_number}")
-            periodic_x, periodic_y = periodic_position(frame_number)
-            x = periodic_x + offsets_x[frame_number]
-            y = periodic_y + offsets_y[frame_number]
+            if profile is not None:
+                frame_profile = frame_data[frame_number]
+                bbox = frame_profile["bbox"]
+                x = float(bbox["x"])
+                y = float(bbox["y"])
+                visible = bool(frame_profile.get("visibility", False)) and not bool(frame_profile.get("occlusion", False))
+            else:
+                periodic_x, periodic_y = periodic_position(frame_number)
+                x = periodic_x + offsets_x[frame_number]
+                y = periodic_y + offsets_y[frame_number]
+                visible = True
             if args.full_frame:
                 left, top = 0, 0
                 crop_width, crop_height = frame_width, frame_height
@@ -96,10 +159,11 @@ def prepare(args: argparse.Namespace) -> None:
             )
             local_x = box_x0 - left
             local_y = box_y0 - top
-            local_mask[
-                local_y : local_y + resized_mask.shape[0],
-                local_x : local_x + resized_mask.shape[1],
-            ] = resized_mask
+            if visible:
+                local_mask[
+                    local_y : local_y + resized_mask.shape[0],
+                    local_x : local_x + resized_mask.shape[1],
+                ] = resized_mask
             name = f"{frame_number - args.start_frame:04d}.png"
             cv2.imwrite(str(frames_dir / name), crop)
             cv2.imwrite(str(masks_dir / name), local_mask)
@@ -145,10 +209,63 @@ def probe_frame_rate(video_path: Path) -> str:
     return result.stdout.strip()
 
 
+def replacement_overlay(args: argparse.Namespace, frame: np.ndarray, row: dict[str, int] | None, reference: dict[str, int]) -> None:
+    if not args.replacement_kind:
+        return
+    if args.replacement_placement == "follow":
+        if row is None:
+            return
+        origin_x = int(row["left"] + row["boxX"])
+        origin_y = int(row["top"] + row["boxY"])
+        base_width = int(row["boxWidth"])
+    else:
+        origin_x = int(args.replacement_fixed_x)
+        origin_y = int(args.replacement_fixed_y)
+        base_width = int(reference["boxWidth"])
+    target_width = max(1, int(base_width * args.replacement_scale))
+    opacity = float(np.clip(args.replacement_opacity, 0.0, 1.0))
+
+    if args.replacement_kind == "image":
+        if args.replacement_image is None:
+            raise RuntimeError("Replacement image path is required")
+        image = cv2.imread(str(args.replacement_image), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise RuntimeError(f"Unable to read replacement image: {args.replacement_image}")
+        height = max(1, int(image.shape[0] * target_width / image.shape[1]))
+        image = cv2.resize(image, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
+        if image.ndim == 2:
+            pixels, alpha = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), np.ones(image.shape, dtype=np.float32)
+        elif image.shape[2] == 4:
+            pixels, alpha = image[:, :, :3], image[:, :, 3].astype(np.float32) / 255.0
+        else:
+            pixels, alpha = image[:, :, :3], np.ones(image.shape[:2], dtype=np.float32)
+    else:
+        font_scale = max(0.25, target_width / 160.0)
+        thickness = max(1, int(round(font_scale * 2)))
+        (width, height), baseline = cv2.getTextSize(args.replacement_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        pixels = np.zeros((height + baseline + 8, width + 8, 3), dtype=np.uint8)
+        cv2.putText(pixels, args.replacement_text, (4, height + 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        alpha = np.any(pixels > 0, axis=2).astype(np.float32)
+
+    height, width = pixels.shape[:2]
+    x0, y0 = max(0, origin_x), max(0, origin_y)
+    x1, y1 = min(frame.shape[1], origin_x + width), min(frame.shape[0], origin_y + height)
+    if x1 <= x0 or y1 <= y0:
+        return
+    source_x, source_y = x0 - origin_x, y0 - origin_y
+    overlay = pixels[source_y : source_y + (y1 - y0), source_x : source_x + (x1 - x0)]
+    local_alpha = alpha[source_y : source_y + (y1 - y0), source_x : source_x + (x1 - x0)]
+    local_alpha = (local_alpha * opacity)[:, :, None]
+    base = frame[y0:y1, x0:x1].astype(np.float32)
+    frame[y0:y1, x0:x1] = np.clip(overlay.astype(np.float32) * local_alpha + base * (1.0 - local_alpha), 0, 255).astype(np.uint8)
+
+
 def composite(args: argparse.Namespace) -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
     video_path = Path(project["source"]["path"])
     manifest = json.loads((args.workspace / "manifest.json").read_text(encoding="utf-8"))
+    if not manifest:
+        raise RuntimeError("Best-quality workspace manifest is empty")
     by_frame = {int(row["frame"]): row for row in manifest}
     capture = cv2.VideoCapture(str(video_path))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -219,10 +336,7 @@ def composite(args: argparse.Namespace) -> None:
                     mask = cv2.resize(
                         mask, (crop_width, crop_height), interpolation=cv2.INTER_NEAREST
                     )
-                blend_mask = cv2.dilate(
-                    mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                )
-                alpha = cv2.GaussianBlur(blend_mask, (0, 0), 1.5).astype(np.float32)
+                alpha = cv2.GaussianBlur(mask, (0, 0), 1.75).astype(np.float32)
                 alpha = alpha[:, :, None] / 255.0
                 left, top = int(row["left"]), int(row["top"])
                 source_crop = frame[top : top + crop_height, left : left + crop_width]
@@ -232,6 +346,7 @@ def composite(args: argparse.Namespace) -> None:
                     0,
                     255,
                 ).astype(np.uint8)
+            replacement_overlay(args, frame, row, manifest[0])
             process.stdin.write(frame.tobytes())
             frame_number += 1
     finally:

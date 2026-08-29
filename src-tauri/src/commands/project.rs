@@ -1,5 +1,6 @@
 use crate::error::{AppError, AppErrorDto};
-use crate::media::{ffmpeg, ffprobe};
+use crate::jobs::{self, JobRecord, JobStatus};
+use crate::media::{best_quality, ffmpeg, ffprobe};
 use crate::media::{mask, render};
 use crate::project::model::{
     AnchorFrame, AnchorType, BoundingBox, FrameResult, ManualAnchor, Project, RemovalConfig,
@@ -10,7 +11,7 @@ use crate::tracking;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -21,6 +22,22 @@ const DEFAULT_TEMPLATE_PADDING: u32 = 4;
 pub struct AppState {
     pub tracking_cancel: Arc<AtomicBool>,
     pub render_cancel: Arc<AtomicBool>,
+    /// ProPainter uses all available VRAM on the target GTX 1650. Every
+    /// project has an isolated workspace, but GPU jobs must be serialized.
+    pub best_quality_gpu_lock: Arc<Mutex<()>>,
+    pub job_worker_running: Arc<Mutex<bool>>,
+    /// Serializes read-modify-write operations on the queue store so a
+    /// cancel/regen cannot be overwritten by a worker progress update.
+    pub job_store_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueBestQualityRequest {
+    pub project_id: String,
+    pub output_root: Option<String>,
+    pub output_name: Option<String>,
+    pub replacement: Option<BestQualityReplacement>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -53,6 +70,84 @@ pub struct RenderVideoRequest {
 pub struct RenderVideoResult {
     pub output_path: String,
     pub mode: crate::project::model::RemovalMode,
+    pub qa_report_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BestQualityRenderRequest {
+    pub project_id: String,
+    pub replacement: Option<BestQualityReplacement>,
+    pub output_root: Option<String>,
+    pub output_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BestQualityReplacement {
+    pub kind: String,
+    pub text: Option<String>,
+    pub image_path: Option<String>,
+    pub placement: String,
+    pub fixed_x: f64,
+    pub fixed_y: f64,
+    pub scale: f64,
+    pub opacity: f64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BestQualitySamplesRequest {
+    pub project_id: String,
+    #[serde(default)]
+    pub scan_round: u32,
+    #[serde(default)]
+    pub exclude_frames: Vec<u64>,
+    #[serde(default)]
+    pub exclude_scene_signatures: Vec<String>,
+    #[serde(default)]
+    pub roi: Option<BoundingBox>,
+    #[serde(default)]
+    pub anchor_frame: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCalibrationRequest {
+    pub project_id: String,
+    pub sample: best_quality::BestQualitySample,
+    pub edited_mask_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveCalibrationMaskRequest {
+    pub project_id: String,
+    pub png_bytes: Vec<u8>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadProjectAssetRequest {
+    pub project_id: String,
+    pub asset: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusPreviewRequest {
+    pub project_id: String,
+    pub frame: u64,
+    pub bbox: BoundingBox,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusPreviewResult {
+    pub frame: u64,
+    pub timestamp_seconds: f64,
+    pub path: String,
+    pub crop: BoundingBox,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -103,6 +198,58 @@ pub async fn get_project(app: AppHandle, project_id: String) -> Result<Project, 
 }
 
 #[tauri::command]
+pub async fn list_projects(app: AppHandle) -> Result<Vec<Project>, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        service::list_projects(&app_data_dir)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Listing projects failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn remove_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), AppErrorDto> {
+    let store_lock = Arc::clone(&state.job_store_lock);
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let _store_guard = store_lock
+            .lock()
+            .map_err(|_| AppError::Io("Job queue is unavailable.".to_string()))?;
+        let jobs = jobs::load(&app_data_dir)?;
+        if jobs.iter().any(|job| {
+            job.project_id == project_id
+                && matches!(
+                    job.status,
+                    JobStatus::Queued
+                        | JobStatus::Preparing
+                        | JobStatus::Inferencing
+                        | JobStatus::Encoding
+                        | JobStatus::Verifying
+                )
+        }) {
+            return Err(AppError::InvalidRequest(
+                "Cannot remove a project with a queued or running job.".to_string(),
+            ));
+        }
+        service::remove_project_workspace(&app_data_dir, &project_id)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Removing project failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn extract_preview_frame(
     app: AppHandle,
     project_id: String,
@@ -143,6 +290,54 @@ pub async fn extract_preview_frame(
 }
 
 #[tauri::command]
+pub async fn extract_focus_preview(
+    app: AppHandle,
+    request: FocusPreviewRequest,
+) -> Result<FocusPreviewResult, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let project = service::load_project(&app_data_dir, &request.project_id)?;
+        if request.frame >= project.video.frame_count {
+            return Err(AppError::InvalidRequest(
+                "Focus frame is outside the video.".to_string(),
+            ));
+        }
+        validate_bbox(&request.bbox, project.video.width, project.video.height)?;
+        let crop = focus_crop(&request.bbox, project.video.width, project.video.height);
+        let timestamp_seconds = frame_to_timestamp(request.frame, project.video.fps);
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        let output_path = directory.join("cache").join(format!(
+            "focus-{}-{}-{}.png",
+            request.frame,
+            crop.x.round(),
+            crop.y.round()
+        ));
+        fs::create_dir_all(output_path.parent().ok_or_else(|| {
+            AppError::InvalidRequest("Invalid focus-preview output path.".to_string())
+        })?)?;
+        ffmpeg::ensure_tools_available()?;
+        ffmpeg::crop_image_from_video(
+            Path::new(&project.source.path),
+            timestamp_seconds,
+            &crop,
+            &output_path,
+        )?;
+        Ok::<FocusPreviewResult, AppError>(FocusPreviewResult {
+            frame: request.frame,
+            timestamp_seconds,
+            path: output_path.to_string_lossy().to_string(),
+            crop,
+        })
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Focus preview task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn save_watermark_anchor(
     app: AppHandle,
     request: SaveWatermarkAnchorRequest,
@@ -151,6 +346,88 @@ pub async fn save_watermark_anchor(
         .await
         .map_err(|error| AppError::Io(format!("Saving anchor task failed: {error}")))?
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn create_calibration_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CreateCalibrationRequest,
+) -> Result<Project, AppErrorDto> {
+    let cancel = Arc::clone(&state.render_cancel);
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let mut project = service::load_project(&app_data_dir, &request.project_id)?;
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        let edited_mask = request.edited_mask_path.as_deref().map(Path::new);
+        let calibration = best_quality::create_calibration_profile(
+            &directory,
+            &project,
+            &request.sample,
+            edited_mask,
+            &cancel,
+        )?;
+        project.watermark.label = Some("Learna AI".to_string());
+        project.watermark.anchor = Some(AnchorFrame {
+            frame: request.sample.frame,
+            timestamp_seconds: request.sample.timestamp_seconds,
+            bbox: request.sample.bbox.clone(),
+        });
+        project.calibration = Some(calibration.clone());
+        if let Some(templates) = project.watermark.templates.as_mut() {
+            templates.mask = Some(calibration.mask_path.clone());
+        }
+        service::save_project_atomic(&directory, &project)?;
+        Ok::<Project, AppError>(project)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Calibration task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn save_calibration_mask_edit(
+    app: AppHandle,
+    request: SaveCalibrationMaskRequest,
+) -> Result<String, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if request.png_bytes.len() > 2_000_000 {
+            return Err(AppError::InvalidRequest(
+                "Edited mask is unexpectedly large.".to_string(),
+            ));
+        }
+        let decoded = image::load_from_memory(&request.png_bytes).map_err(|error| {
+            AppError::InvalidRequest(format!("Edited mask is not a valid PNG: {error}"))
+        })?;
+        if decoded.width() < 32 || decoded.height() < 16 {
+            return Err(AppError::InvalidRequest(
+                "Edited mask dimensions are invalid.".to_string(),
+            ));
+        }
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let directory = service::project_directory(&app_data_dir, &request.project_id)?;
+        let output = directory.join("calibration").join("edited_mask.png");
+        fs::create_dir_all(
+            output
+                .parent()
+                .ok_or_else(|| AppError::Io("Invalid calibration directory.".to_string()))?,
+        )?;
+        decoded
+            .to_luma8()
+            .save(&output)
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        Ok::<String, AppError>(output.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Saving mask edit failed: {error}")))?
+    .map_err(Into::into)
 }
 
 fn open_video_sync(app: &AppHandle, path: &str) -> Result<Project, AppError> {
@@ -182,6 +459,7 @@ fn open_video_sync(app: &AppHandle, path: &str) -> Result<Project, AppError> {
             template_padding: DEFAULT_TEMPLATE_PADDING,
             ..Default::default()
         },
+        calibration: None,
         anchors: Vec::new(),
         tracking: None,
         removal: None,
@@ -252,6 +530,9 @@ fn save_watermark_anchor_sync(
     mask::generate_template_mask(&template_path, &mask_path)?;
 
     project.watermark.label = request.label.filter(|label| !label.trim().is_empty());
+    // A new sample invalidates the previous full-video calibration. It will
+    // be rebuilt on the next Best-quality render.
+    project.calibration = None;
     project.watermark.anchor = Some(AnchorFrame {
         frame: request.frame,
         timestamp_seconds: request.timestamp_seconds,
@@ -653,11 +934,489 @@ pub async fn render_video(
         Ok::<RenderVideoResult, AppError>(RenderVideoResult {
             output_path: output.to_string_lossy().to_string(),
             mode: config.mode,
+            qa_report_path: None,
         })
     })
     .await
     .map_err(|error| AppError::Io(format!("Render task failed: {error}")))?
     .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn render_best_quality_video(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: BestQualityRenderRequest,
+) -> Result<RenderVideoResult, AppErrorDto> {
+    let cancel = Arc::clone(&state.render_cancel);
+    let gpu_lock = Arc::clone(&state.best_quality_gpu_lock);
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gpu_job = gpu_lock
+            .lock()
+            .map_err(|_| AppError::Io("Best-quality GPU queue is unavailable.".to_string()))?;
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let project = service::load_project(&app_data_dir, &request.project_id)?;
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        ffmpeg::ensure_tools_available()?;
+        let output = best_quality::render_best_quality(
+            &directory,
+            &project,
+            request.replacement.as_ref(),
+            request.output_root.as_deref(),
+            request.output_name.as_deref(),
+            &cancel,
+            |phase, current, total| {
+                let progress = OperationProgress {
+                    phase: phase.to_string(),
+                    current_frame: current,
+                    total_frames: total,
+                    progress: if total == 0 {
+                        0.0
+                    } else {
+                        current as f64 / total as f64
+                    },
+                };
+                let _ = app.emit("operation-progress", progress);
+            },
+        )?;
+        // Persist the exact profile used for this render so reopening the
+        // project never falls back to the legacy anchor mask.
+        let mut persisted_project = project.clone();
+        if let Ok(calibration) = best_quality::calibration_metadata(&directory, &persisted_project)
+        {
+            persisted_project.calibration = Some(calibration.clone());
+            if let Some(templates) = persisted_project.watermark.templates.as_mut() {
+                templates.mask = Some(calibration.mask_path);
+            }
+            service::save_project_atomic(&directory, &persisted_project)?;
+        }
+        Ok::<RenderVideoResult, AppError>(RenderVideoResult {
+            qa_report_path: Some(
+                best_quality::qa_report_path(&output)
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            output_path: output.to_string_lossy().to_string(),
+            mode: crate::project::model::RemovalMode::AutoBest,
+        })
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Best-quality render task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_jobs(app: AppHandle) -> Result<Vec<JobRecord>, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        // Startup recovery is performed once by `jobs::open_database`.  This
+        // command is polled by the UI every few seconds, so mutating active
+        // jobs here would incorrectly mark a healthy render as INTERRUPTED.
+        let records = jobs::load(&app_data_dir)?;
+        Ok::<Vec<JobRecord>, AppError>(records)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Listing jobs failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn enqueue_best_quality_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: EnqueueBestQualityRequest,
+) -> Result<JobRecord, AppErrorDto> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| AppError::Io(error.to_string()))?;
+    let project =
+        service::load_project(&app_data_dir, &request.project_id).map_err(AppErrorDto::from)?;
+    let project_directory =
+        service::project_directory(&app_data_dir, &project.id).map_err(AppErrorDto::from)?;
+    best_quality::validate_calibration(&project_directory, &project).map_err(AppErrorDto::from)?;
+    let hardware = best_quality::detect_hardware();
+    if !hardware.supported {
+        return Err(AppError::InvalidRequest(
+            "Best-quality final requires at least 4 GB NVIDIA CUDA VRAM.".to_string(),
+        )
+        .into());
+    }
+    let _store_guard = state
+        .job_store_lock
+        .lock()
+        .map_err(|_| AppErrorDto::from(AppError::Io("Job queue is unavailable.".to_string())))?;
+    let mut records = jobs::load(&app_data_dir).map_err(AppErrorDto::from)?;
+    let mut record = jobs::new_record(
+        project.id.clone(),
+        project.source.file_name.clone(),
+        request.output_root,
+        JobStatus::Queued,
+    );
+    record.output_name = request.output_name;
+    record.hardware_profile = Some(format!(
+        "{} · {} · {} MB",
+        hardware.tier, hardware.gpu_name, hardware.vram_mb
+    ));
+    record.replacement_config = request
+        .replacement
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(AppError::from)
+        .map_err(AppErrorDto::from)?;
+    records.push(record.clone());
+    jobs::save(&app_data_dir, &records).map_err(AppErrorDto::from)?;
+    drop(_store_guard);
+    start_job_worker(app, state);
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn cancel_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<(), AppErrorDto> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| AppError::Io(error.to_string()))?;
+    let _store_guard = state
+        .job_store_lock
+        .lock()
+        .map_err(|_| AppErrorDto::from(AppError::Io("Job queue is unavailable.".to_string())))?;
+    let mut records = jobs::load(&app_data_dir).map_err(AppErrorDto::from)?;
+    if let Some(record) = records.iter_mut().find(|record| record.id == job_id) {
+        if matches!(
+            record.status,
+            JobStatus::Preparing
+                | JobStatus::Inferencing
+                | JobStatus::Encoding
+                | JobStatus::Verifying
+        ) {
+            state.render_cancel.store(true, Ordering::Relaxed);
+        } else if matches!(
+            record.status,
+            JobStatus::Queued | JobStatus::AwaitingReview | JobStatus::Scanning
+        ) {
+            record.status = JobStatus::Canceled;
+            record.updated_at = jobs::chrono_like_now();
+            jobs::save(&app_data_dir, &records).map_err(AppErrorDto::from)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn regen_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<JobRecord, AppErrorDto> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| AppError::Io(error.to_string()))?;
+    let _store_guard = state
+        .job_store_lock
+        .lock()
+        .map_err(|_| AppErrorDto::from(AppError::Io("Job queue is unavailable.".to_string())))?;
+    let mut records = jobs::load(&app_data_dir).map_err(AppErrorDto::from)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == job_id)
+        .ok_or_else(|| AppError::InvalidRequest("Job not found.".to_string()))?;
+    if matches!(
+        record.status,
+        JobStatus::Queued
+            | JobStatus::Preparing
+            | JobStatus::Inferencing
+            | JobStatus::Encoding
+            | JobStatus::Verifying
+    ) {
+        return Err(AppError::InvalidRequest(
+            "A queued or running job cannot be regenerated. Cancel it first.".to_string(),
+        )
+        .into());
+    }
+    let project_dir =
+        service::project_directory(&app_data_dir, &record.project_id).map_err(AppErrorDto::from)?;
+    let mut project =
+        service::load_project(&app_data_dir, &record.project_id).map_err(AppErrorDto::from)?;
+    project.calibration = None;
+    if let Some(templates) = project.watermark.templates.as_mut() {
+        templates.mask = Some("templates/mask.png".to_string());
+    }
+    let calibration_dir = project_dir.join("calibration");
+    if calibration_dir.is_dir() {
+        fs::remove_dir_all(calibration_dir).map_err(AppError::from)?;
+    }
+    service::save_project_atomic(&project_dir, &project).map_err(AppErrorDto::from)?;
+    record.status = JobStatus::AwaitingReview;
+    record.stage = "Rescan samples".to_string();
+    record.progress = 0.0;
+    record.error = None;
+    record.updated_at = jobs::chrono_like_now();
+    let result = record.clone();
+    jobs::save(&app_data_dir, &records).map_err(AppErrorDto::from)?;
+    Ok(result)
+}
+
+/// Starts the serialized queue worker during app startup as well as after a
+/// new enqueue.  This lets QUEUED jobs continue after a normal app restart;
+/// `jobs::open_database` has already converted jobs that were mid-stage into
+/// INTERRUPTED before the worker begins.
+pub fn start_pending_job_worker(app: AppHandle, state: State<'_, AppState>) {
+    start_job_worker(app, state);
+}
+
+fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
+    let running = Arc::clone(&state.job_worker_running);
+    let gpu_lock = Arc::clone(&state.best_quality_gpu_lock);
+    let store_lock = Arc::clone(&state.job_store_lock);
+    let render_cancel = Arc::clone(&state.render_cancel);
+    let mut guard = match running.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if *guard {
+        return;
+    }
+    *guard = true;
+    drop(guard);
+    tauri::async_runtime::spawn_blocking(move || {
+        loop {
+            let app_data_dir = match app.path().app_data_dir() {
+                Ok(path) => path,
+                Err(_) => break,
+            };
+            let (records, index) = match store_lock.lock() {
+                Ok(_store_guard) => {
+                    let mut records = match jobs::load(&app_data_dir) {
+                        Ok(records) => records,
+                        Err(_) => break,
+                    };
+                    let Some(index) = records
+                        .iter()
+                        .position(|record| record.status == JobStatus::Queued)
+                    else {
+                        break;
+                    };
+                    records[index].status = JobStatus::Preparing;
+                    records[index].stage = "Preparing calibration".to_string();
+                    records[index].updated_at = jobs::chrono_like_now();
+                    if jobs::save(&app_data_dir, &records).is_err() {
+                        break;
+                    }
+                    (records, index)
+                }
+                Err(_) => break,
+            };
+            let job_id = records[index].id.clone();
+            render_cancel.store(false, Ordering::Relaxed);
+            let result = (|| -> Result<PathBuf, AppError> {
+                let _gpu_job = gpu_lock
+                    .lock()
+                    .map_err(|_| AppError::Io("GPU queue unavailable.".to_string()))?;
+                let project = service::load_project(&app_data_dir, &records[index].project_id)?;
+                let directory = service::project_directory(&app_data_dir, &project.id)?;
+                ffmpeg::ensure_tools_available()?;
+                let replacement = records[index]
+                    .replacement_config
+                    .clone()
+                    .map(serde_json::from_value::<BestQualityReplacement>)
+                    .transpose()?;
+                best_quality::render_best_quality(
+                    &directory,
+                    &project,
+                    replacement.as_ref(),
+                    records[index].output_root.as_deref(),
+                    records[index].output_name.as_deref(),
+                    &render_cancel,
+                    |phase, current, total| {
+                        if let Ok(_store_guard) = store_lock.lock() {
+                            if let Ok(mut latest) = jobs::load(&app_data_dir) {
+                                if let Some(job) = latest.iter_mut().find(|job| job.id == job_id) {
+                                    job.stage = phase.to_string();
+                                    job.status =
+                                        if phase.contains("QA") || phase.contains("Decoding") {
+                                            JobStatus::Verifying
+                                        } else if phase.contains("AI") {
+                                            JobStatus::Inferencing
+                                        } else if phase.contains("Preparing")
+                                            || phase.contains("Validating")
+                                        {
+                                            JobStatus::Preparing
+                                        } else {
+                                            JobStatus::Encoding
+                                        };
+                                    job.progress = if total == 0 {
+                                        0.0
+                                    } else {
+                                        current as f64 / total as f64
+                                    };
+                                    job.current_frame = Some(current);
+                                    job.updated_at = jobs::chrono_like_now();
+                                    let _ = jobs::save(&app_data_dir, &latest);
+                                }
+                            }
+                        }
+                        let _ = app.emit(
+                            "operation-progress",
+                            OperationProgress {
+                                phase: phase.to_string(),
+                                current_frame: current,
+                                total_frames: total,
+                                progress: if total == 0 {
+                                    0.0
+                                } else {
+                                    current as f64 / total as f64
+                                },
+                            },
+                        );
+                    },
+                )
+            })();
+            if let Ok(_store_guard) = store_lock.lock() {
+                let mut latest = jobs::load(&app_data_dir).unwrap_or_default();
+                if let Some(job) = latest.iter_mut().find(|job| job.id == job_id) {
+                    match result {
+                        Ok(output) => {
+                            if let Ok(mut persisted_project) =
+                                service::load_project(&app_data_dir, &job.project_id)
+                            {
+                                if let Ok(directory) =
+                                    service::project_directory(&app_data_dir, &job.project_id)
+                                {
+                                    if let Ok(calibration) = best_quality::calibration_metadata(
+                                        &directory,
+                                        &persisted_project,
+                                    ) {
+                                        persisted_project.calibration = Some(calibration.clone());
+                                        if let Some(templates) =
+                                            persisted_project.watermark.templates.as_mut()
+                                        {
+                                            templates.mask = Some(calibration.mask_path);
+                                        }
+                                        let _ = service::save_project_atomic(
+                                            &directory,
+                                            &persisted_project,
+                                        );
+                                    }
+                                }
+                            }
+                            job.status = JobStatus::Completed;
+                            job.stage = "Completed".to_string();
+                            job.progress = 1.0;
+                            job.output_path = Some(output.to_string_lossy().to_string());
+                            job.qa_report_path = Some(
+                                best_quality::qa_report_path(&output)
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                            job.contact_sheet_path = Some(
+                                output
+                                    .with_extension("qa.png")
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                            job.error = None;
+                        }
+                        Err(error) if matches!(error, AppError::OperationCancelled) => {
+                            job.status = JobStatus::Canceled;
+                            job.stage = "Canceled".to_string();
+                            job.error = Some(error.to_string());
+                        }
+                        Err(AppError::QualityNeedsReview(report)) => {
+                            job.status = JobStatus::NeedsReview;
+                            job.stage = "Quality review required".to_string();
+                            job.output_path = report
+                                .strip_suffix(".qa.json")
+                                .map(|value| format!("{value}.mp4"));
+                            job.qa_report_path = Some(report.clone());
+                            job.contact_sheet_path = report
+                                .strip_suffix(".qa.json")
+                                .map(|value| format!("{value}.qa.png"));
+                            job.error_code = Some("QUALITY_NEEDS_REVIEW".to_string());
+                            job.error = Some(format!("Review QA report: {report}"));
+                        }
+                        Err(error) => {
+                            job.status = JobStatus::Failed;
+                            job.stage = "Failed".to_string();
+                            job.error = Some(error.to_string());
+                        }
+                    }
+                    job.updated_at = jobs::chrono_like_now();
+                }
+                let _ = jobs::save(&app_data_dir, &latest);
+            }
+        }
+        if let Ok(mut guard) = running.lock() {
+            *guard = false;
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn suggest_best_quality_samples(
+    app: AppHandle,
+    request: BestQualitySamplesRequest,
+) -> Result<Vec<best_quality::BestQualitySample>, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let project = service::load_project(&app_data_dir, &request.project_id)?;
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        ffmpeg::ensure_tools_available()?;
+        best_quality::find_best_samples(
+            &directory,
+            &project,
+            best_quality::BestQualityScanOptions {
+                scan_round: request.scan_round,
+                excluded_frames: &request.exclude_frames,
+                excluded_scene_signatures: &request.exclude_scene_signatures,
+                roi: request.roi.as_ref(),
+                anchor_frame: request.anchor_frame.unwrap_or(0),
+            },
+            |current, total| {
+                let progress = OperationProgress {
+                    phase: if request.scan_round == 0 {
+                        "Finding high-contrast samples".to_string()
+                    } else {
+                        format!(
+                            "Finding alternative samples (pass {})",
+                            request.scan_round + 1
+                        )
+                    },
+                    current_frame: current,
+                    total_frames: total,
+                    progress: if total == 0 {
+                        0.0
+                    } else {
+                        current as f64 / total as f64
+                    },
+                };
+                let _ = app.emit("operation-progress", progress);
+            },
+        )
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Best-quality sample scan failed: {error}")))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn detect_hardware() -> best_quality::HardwareProfile {
+    best_quality::detect_hardware()
 }
 
 #[tauri::command]
@@ -697,6 +1456,55 @@ pub async fn get_project_asset_path(
     })
     .await
     .map_err(|error| AppError::Io(format!("Asset path task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+/// Reads a project-owned image as bytes so the WebView can create a same-origin
+/// data URL. Drawing a `tauri://`/`asset://` image directly onto a canvas can
+/// taint it and make `toBlob()` fail during mask editing.
+#[tauri::command]
+pub async fn read_project_asset_bytes(
+    app: AppHandle,
+    request: ReadProjectAssetRequest,
+) -> Result<Vec<u8>, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let directory = service::project_directory(&app_data_dir, &request.project_id)?;
+        let requested = PathBuf::from(&request.asset);
+        let path = if requested.is_absolute() {
+            let canonical_directory = fs::canonicalize(&directory)?;
+            let canonical_requested = fs::canonicalize(&requested).map_err(|_| {
+                AppError::InvalidRequest("Project asset was not found.".to_string())
+            })?;
+            if !canonical_requested.starts_with(&canonical_directory) {
+                return Err(AppError::InvalidRequest(
+                    "Invalid project asset path.".to_string(),
+                ));
+            }
+            canonical_requested
+        } else {
+            if requested
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(AppError::InvalidRequest(
+                    "Invalid project asset path.".to_string(),
+                ));
+            }
+            directory.join(requested)
+        };
+        if !path.is_file() {
+            return Err(AppError::InvalidRequest(
+                "Project asset was not found.".to_string(),
+            ));
+        }
+        fs::read(path).map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Reading project asset failed: {error}")))?
     .map_err(Into::into)
 }
 
@@ -741,6 +1549,19 @@ pub fn clamp_and_pad_bbox(
         width: (right - x).max(1.0),
         height: (bottom - y).max(1.0),
     })
+}
+
+fn focus_crop(bbox: &BoundingBox, source_width: u32, source_height: u32) -> BoundingBox {
+    let width = (bbox.width * 3.0).max(520.0).min(f64::from(source_width));
+    let height = (bbox.height * 4.0).max(300.0).min(f64::from(source_height));
+    let center_x = bbox.x + bbox.width / 2.0;
+    let center_y = bbox.y + bbox.height / 2.0;
+    BoundingBox {
+        x: (center_x - width / 2.0).clamp(0.0, f64::from(source_width) - width),
+        y: (center_y - height / 2.0).clamp(0.0, f64::from(source_height) - height),
+        width,
+        height,
+    }
 }
 
 pub fn frame_to_timestamp(frame: u64, fps: f64) -> f64 {

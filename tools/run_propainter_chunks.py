@@ -15,6 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("python", type=Path)
     parser.add_argument("--core-length", type=int, default=60)
     parser.add_argument("--context", type=int, default=8)
+    parser.add_argument("--width", type=int, default=288)
+    parser.add_argument("--height", type=int, default=512)
     return parser.parse_args()
 
 
@@ -66,9 +68,9 @@ def main() -> None:
                 "--output",
                 str(chunk_root / "results"),
                 "--width",
-                "288",
+                str(args.width),
                 "--height",
-                "512",
+                str(args.height),
                 "--mask_dilation",
                 "1",
                 "--neighbor_length",

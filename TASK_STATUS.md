@@ -1,5 +1,36 @@
 # Task status checkpoints
 
+## Best-quality calibration/queue hardening — 2026-08-29
+
+- Final renders no longer use `--anchor-mode`. The new `CalibrationProfileV2` stores a confirmed sample, fixed Learna AI periodic trajectory, per-frame offsets/bboxes, visibility/occlusion flags, confidence and a SHA-256 mask hash.
+- Calibration now treats the confirmed visual sample as authoritative and uses the detector only for diagnostics. This prevents a rough anchor over a subtitle/UI element from moving the removal mask onto unrelated background content.
+- The calibrated mask is built from trajectory-aligned temporal consensus and connected-component filtering; the resulting mask is glyph-shaped (`Learna AI`) instead of a full noisy anchor crop.
+- Added `quality_qa.py`: decode/frame/audio checks plus residual correlation, outside-mask MAE and a source/output contact sheet. A failed gate returns `NEEDS_REVIEW` and blocks completion; the old `decode_passed` report is no longer accepted.
+- Added persistent sequential GPU jobs (`jobs.json`) with normalized lifecycle states, cancel, rescan/regen and restart interruption recovery. The GPU mutex guarantees one ProPainter job at a time on 4 GB cards.
+- Added output-root selection, History actions (Open output/Open folder/View sidecar/Regenerate), bilingual core settings, QuanPH branding/icon assets and signed Tauri updater configuration/workflow.
+- Regression evidence: the legacy `_best_2.mp4` fails the new QA gate (glyph-energy ratio ≈0.94, exit 2), while the accepted reference passes (ratio ≈0.62, exit 0). A fresh calibrated ProPainter run is being used to validate the mask against the same source before promotion.
+- Fresh isolated validation output: `D:\watermark-studio-ai-work\quality-profile-test-output\calibrated-best-static.mp4` (1080×1920, 904 frames, AAC retained, 30.144s). QA status is `passed`, max glyph-energy ratio ≈0.761, and the generated contact sheet is `calibrated-best-static.qa.png`. SHA-256: `E3DEAEEA760A738B697DCCE5FAB8A014836CB847B786DCC4238A24588B960F20`.
+
+## One-anchor Best-quality dev workflow — 2026-08-29
+
+- The workspace now opens in `Best-quality` mode. The final path exposes only sample finding/inspection/confirmation and the ProPainter render; the old tracker, AutoBest, Temporal, Blur, Inpaint, and legacy PNG replacement controls are separated behind an explicit `Legacy / Preview` switch and are labeled non-final.
+- `Find 5 alternatives` now exists for human rejection of the contact-sheet. Every new pass shifts the periodic trajectory sampling phase and excludes all previously presented frames within a temporal safety gap, so repeatedly pressing it cannot simply return the same five cards. Candidate scans are cache-only and do not change the saved profile or render input until a user confirms one sample.
+- The Best-quality renderer now performs a full FFmpeg decode after composite and writes a `*.qa.json` sidecar with the render method, source/output metadata, and hard-frame review locations. A decode or report failure makes the render fail instead of reporting completion.
+- Best-quality replacement labels are optional and default off: text or transparent PNG can follow the validated watermark path or use fixed source coordinates; the inspector renders a placement preview and the Python composite applies it only after ProPainter removal. Best-quality GPU jobs are serialized by an application-wide mutex, preserving per-project workspaces/outputs and preventing multiple 4 GB-VRAM jobs from running together. A multi-project queue screen is still pending; profile confirmation remains per-video by design.
+- Replaced the unsafe direct-anchor assumption with a required quality gate: `Find best samples` now scans periodic-path candidates using the exact persisted-mask generator, ranks only masks with at least 350 pixels at intensity 64 or above, and presents up to five time-separated frames for visual confirmation.
+- The sample scan no longer requires any hand-drawn anchor: it begins from the verified default Learna AI path and deliberately ignores a previously saved weak mask/anchor, so a rough or faint first selection cannot bias the candidate boxes.
+- The five returned samples are now retained as a contact sheet: each card shows the source crop beside its generated glyph mask and its mask coverage, background-complexity, and local temporal-instability scores. The scorer follows the watermark path in the neighbouring frames, so it measures the background behind the moving watermark rather than an unrelated fixed part of the image.
+- Added an inspection-preview command and UI mode: candidate verification now uses an extracted source crop with a fixed, high-contrast watermark frame and 1.00x–3.00x zoom. The original full-frame view remains available, while normal navigation clears the inspection box so it cannot become stale.
+- Selecting a card locks its exact frame/bbox; confirmation persists that selected sample directly instead of trusting the current video-playback position. This avoids the prior focus-jump path saving a different frame than the user inspected.
+- Confirming a candidate refreshes the primary template/mask even when legacy tracking data exists; Best-quality rendering then rejects a weak saved mask before the GPU job can start. This prevents a full ProPainter job with an empty effective mask, which previously produced an output visually indistinguishable from input when the faint frame-136 anchor had only 26 pixels below intensity 64.
+- Validation after this change: `cargo test` (47 passed, 2 intentional real-video ignores), `cargo clippy -D warnings`, `cargo build`, TypeScript production build, formatting, and diff checks pass.
+
+- Added the dedicated `Best-quality AI render` action to the Tauri dev UI. It uses the original saved anchor and does not depend on, alter, or unblock the conservative manual-tracking review queue.
+- The action validates the known 1080×1920 repeating Learna AI layout and tight anchor dimensions before work starts, then invokes the full-frame FP32 ProPainter chunk pipeline and composites only the feathered glyph mask back into the original frames.
+- The source remains read-only. A unique MP4 is created under the source video's `output` folder, and generated AI cache frames are removed after a successful render. Missing model/runtime paths or an incompatible anchor cause an explicit error rather than a guessed render.
+- Dev-machine defaults point to the verified local ProPainter environment; `WATERMARK_STUDIO_PROPAINTER_PYTHON`, `WATERMARK_STUDIO_PROPAINTER_ROOT`, and `WATERMARK_STUDIO_WORK_ROOT` can override those locations.
+- Validation: TypeScript production build, Rust formatting, `cargo test` (47 passed, 2 intentional real-video ignores), `cargo clippy -D warnings`, `cargo build`, Python syntax compilation, and a two-frame real-anchor preparation smoke test all pass.
+
 ## Production-quality periodic watermark removal checkpoint — 2026-08-29
 
 - Reverse-engineered the verified deterministic `Learna AI` trajectory across the 904-frame source, generated a clean glyph-only mask, and preserved the source video unchanged.

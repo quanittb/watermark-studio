@@ -35,6 +35,34 @@ export interface WatermarkConfig {
   templatePadding: number;
 }
 
+export type CalibrationPreset = 'LEARNA_AI_PERIODIC' | 'GENERAL_MOVING';
+export type CalibrationStatus = 'READY' | 'STALE' | 'NEEDS_REVIEW' | 'FAILED';
+export interface CalibrationProfile {
+  version: number;
+  preset: CalibrationPreset;
+  detectorVersion: string | null;
+  sourceFingerprint: { sha256: string; sizeBytes: number; frameCount: number; width: number; height: number } | null;
+  profilePath: string;
+  maskPath: string;
+  canonicalMaskPath: string | null;
+  autoMaskPath: string | null;
+  blendMaskPath: string | null;
+  brushDeltaPath: string | null;
+  maskHash: string;
+  profileHash: string;
+  sampleFrame: number;
+  frameCount: number;
+  quality: {
+    status: CalibrationStatus;
+    reliableFrames: number;
+    lowConfidenceFrames: number;
+    maskPixels: number;
+    glyphCoverage: number;
+    contamination: number;
+    largeHoles: number;
+  };
+}
+
 export type AnchorType = 'INITIAL' | 'MANUAL';
 
 export interface ManualAnchor {
@@ -51,6 +79,7 @@ export interface WatermarkProject {
   source: { path: string; fileName: string };
   video: VideoMetadata;
   watermark: WatermarkConfig;
+  calibration: CalibrationProfile | null;
   anchors: ManualAnchor[];
   tracking: TrackingData | null;
   removal: RemovalConfig | null;

@@ -54,6 +54,41 @@ pub fn load_project(app_data_dir: &Path, project_id: &str) -> Result<Project, Ap
     }
 }
 
+pub fn list_projects(app_data_dir: &Path) -> Result<Vec<Project>, AppError> {
+    let root = projects_root(app_data_dir);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut projects = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(id) = entry.file_name().to_str() {
+            if let Ok(project) = load_project(app_data_dir, id) {
+                projects.push(project);
+            }
+        }
+    }
+    projects.sort_by(|left, right| left.source.file_name.cmp(&right.source.file_name));
+    Ok(projects)
+}
+
+pub fn remove_project_workspace(app_data_dir: &Path, project_id: &str) -> Result<(), AppError> {
+    let root = projects_root(app_data_dir);
+    let directory = project_directory(app_data_dir, project_id)?;
+    if directory.parent() != Some(root.as_path()) {
+        return Err(AppError::InvalidRequest(
+            "Project workspace is outside the library root.".to_string(),
+        ));
+    }
+    if directory.is_dir() {
+        fs::remove_dir_all(directory)?;
+    }
+    Ok(())
+}
+
 fn read_project(path: &Path) -> Result<Project, AppError> {
     let contents = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&contents)?)
@@ -115,6 +150,7 @@ mod tests {
                 template_padding: 4,
                 ..Default::default()
             },
+            calibration: None,
             anchors: Vec::new(),
             tracking: None,
             removal: None,
