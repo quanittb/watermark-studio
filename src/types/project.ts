@@ -35,11 +35,12 @@ export interface WatermarkConfig {
   templatePadding: number;
 }
 
-export type CalibrationPreset = 'LEARNA_AI_PERIODIC' | 'GENERAL_MOVING';
+export type CalibrationPreset = 'LEARNA_AI_PERIODIC' | 'LEARNA_AI_ADAPTIVE' | 'GENERAL_MOVING';
 export type CalibrationStatus = 'READY' | 'STALE' | 'NEEDS_REVIEW' | 'FAILED';
 export interface CalibrationProfile {
   version: number;
   preset: CalibrationPreset;
+  route?: 'AUTO_GLOBAL_TEMPLATE' | 'AUTO_ROI_TEMPLATE' | 'ROI_FALLBACK' | 'AUTO_FIND' | string | null;
   detectorVersion: string | null;
   sourceFingerprint: { sha256: string; sizeBytes: number; frameCount: number; width: number; height: number } | null;
   profilePath: string;
@@ -50,6 +51,35 @@ export interface CalibrationProfile {
   brushDeltaPath: string | null;
   maskHash: string;
   profileHash: string;
+  trajectoryModel?: {
+    type?: string;
+    source?: string;
+    periodicPrior?: string;
+    maxInterpolationGap?: number;
+    segments?: Array<{ startFrame: number; x: number; y: number; scale: number }>;
+  } | null;
+  difficultFrames?: number[];
+  contactSheetPath?: string | null;
+  activeIntervals?: Array<{ startFrame: number; endFrame: number }>;
+  frameData?: Array<{
+    frame: number;
+    bbox: BoundingBox;
+    visibility: boolean;
+    confidence: number;
+    occlusion: boolean;
+    maskRequired: boolean;
+    positionSource: string;
+    scale: number;
+    opacity: number;
+  }>;
+  trajectoryGate?: {
+    status: 'PASSED' | 'FAILED';
+    inlierRatio?: number;
+    residualMedian?: number | null;
+    residualP95?: number | null;
+    maxObservationGap?: number;
+    failureReasons?: string[];
+  };
   sampleFrame: number;
   frameCount: number;
   quality: {

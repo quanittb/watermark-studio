@@ -22,6 +22,8 @@ pub enum AppError {
     Io(String),
     #[error("JSON error: {0}")]
     Json(String),
+    #[error("Calibration profile is corrupt: {0}")]
+    CalibrationCorrupt(String),
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
     #[error("Operation cancelled.")]
@@ -61,6 +63,7 @@ impl From<AppError> for AppErrorDto {
             AppError::ProjectNotFound => "PROJECT_NOT_FOUND",
             AppError::Io(_) => "IO_ERROR",
             AppError::Json(_) => "JSON_ERROR",
+            AppError::CalibrationCorrupt(_) => "CALIBRATION_CORRUPT",
             AppError::InvalidRequest(_) => "INVALID_REQUEST",
             AppError::OperationCancelled => "OPERATION_CANCELLED",
             AppError::QualityNeedsReview(_) => "QUALITY_NEEDS_REVIEW",

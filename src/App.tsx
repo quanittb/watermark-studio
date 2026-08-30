@@ -15,6 +15,7 @@ import {
   chooseVideoPath,
   chooseVideoPaths,
   createCalibrationProfile,
+  autoCalibrateBestQuality,
   detectHardware,
   enqueueBestQualityJob,
   extractFocusPreview,
@@ -52,7 +53,7 @@ import "./styles.css";
 import { translate } from "./i18n";
 
 type LoadingTask =
-  "opening" | "saving" | "tracking" | "sampling" | "rendering" | null;
+  "opening" | "saving" | "tracking" | "sampling" | "calibrating" | "rendering" | null;
 type WorkspaceMode = "best" | "legacy";
 type AppRoute = "projects" | "review" | "queue" | "history" | "settings";
 type SettingsTab = "general" | "processing" | "updates" | "advanced" | "about";
@@ -625,7 +626,7 @@ export default function App() {
       ]);
       activateProject(nextProject);
       setMessage(
-        "Video loaded. Find a verified Learna AI sample to create Calibration V3.",
+        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V6.",
       );
     } catch (openError) {
       setError(getErrorMessage(openError));
@@ -862,7 +863,7 @@ export default function App() {
 
   const cancelBusy = () => {
     if (loadingTask === "tracking") void cancelTracking();
-    if (loadingTask === "rendering") void cancelRender();
+    if (loadingTask === "rendering" || loadingTask === "calibrating") void cancelRender();
   };
 
   const nextProblem = () => {
@@ -1016,6 +1017,36 @@ export default function App() {
     }
   };
 
+  const runAdaptiveCalibration = async () => {
+    if (!project || isBusy) return;
+    const roi = roiFallbackArmed && selection && selection.width >= 32 && selection.height >= 16
+      ? { ...selection, frame: currentFrame }
+      : null;
+    setError(null);
+    setLoadingTask("calibrating");
+    setProgress(null);
+    setMessage(roi ? "Đang quét Learna AI trong ROI và khớp quỹ đạo tự do…" : "Đang quét toàn video và khớp quỹ đạo Learna AI…");
+    try {
+      const updatedProject = await autoCalibrateBestQuality(project.id, roi);
+      setProject(updatedProject);
+      setProjects((current) => current.map((item) => item.id === updatedProject.id ? updatedProject : item));
+      const status = updatedProject.calibration?.quality.status;
+      if (status === "READY") {
+        setRoiFallbackArmed(false);
+        setSelection(null);
+        setMessage("CalibrationProfileV6 đã vượt quality gate; có thể đưa job vào hàng đợi.");
+      } else {
+        setMessage("Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.");
+      }
+    } catch (calibrationError) {
+      setError(getErrorMessage(calibrationError));
+      setMessage("Không thể hoàn tất adaptive calibration");
+    } finally {
+      setLoadingTask(null);
+      setProgress(null);
+    }
+  };
+
   const chooseAndSaveOutputRoot = async () => {
     try {
       const selected = await chooseOutputDirectory();
@@ -1061,8 +1092,8 @@ export default function App() {
     setSelection(null);
     setMessage(
       findAlternatives
-        ? "Scanning a different part of the watermark trajectory…"
-        : "Scanning the video for strong watermark samples…",
+        ? `${t("scanningAllPhases")} (${language === "vi" ? "lượt thay thế" : "alternative pass"} ${scanRound})`
+        : t("scanningAllPhases"),
     );
     try {
       const samples = await suggestBestQualitySamples(project.id, {
@@ -1080,7 +1111,7 @@ export default function App() {
       setMessage(
         samples.length > 0
           ? `Found ${samples.length} ${findAlternatives ? "alternative " : ""}samples. Click one to inspect and confirm it${roiHint ? " (ROI fallback)" : ""}.`
-          : "Không tìm thấy sample hợp lệ. Hãy chọn frame ít blur, khoanh ROI tương đối rồi quét lại.",
+          : t("noValidSample"),
       );
     } catch (sampleError) {
       setError(getErrorMessage(sampleError));
@@ -1256,7 +1287,7 @@ export default function App() {
       setFocusPreview(null);
       setInspectionMode(false);
       setMessage(
-        "CalibrationProfileV3 passed the mask gate and is ready to queue.",
+        "CalibrationProfileV4 passed the mask gate and is ready to queue.",
       );
     } catch (saveError) {
       setError(getErrorMessage(saveError));
@@ -1372,10 +1403,10 @@ export default function App() {
               <>
                 <button
                   className="button secondary"
-                  onClick={() => void findBestQualitySamples()}
+                  onClick={() => void runAdaptiveCalibration()}
                   disabled={!project || isBusy}
                 >
-                  {loadingTask === "sampling" ? t("scanning") : t("findSamples")}
+                    {loadingTask === "calibrating" ? t("calibrating") : t("autoCalibrate")}
                 </button>
                 <button
                   className="button secondary"
@@ -1534,7 +1565,7 @@ export default function App() {
                               )
                             }
                           >
-                            Open output
+                            {t("openOutput")}
                           </button>
                           <button
                             className="button secondary"
@@ -1544,12 +1575,12 @@ export default function App() {
                               )
                             }
                           >
-                            Open folder
+                            {t("openFolder")}
                           </button>
                         </>
                       )}
-                      {job.qaReportPath && <button className="button secondary" onClick={() => void openPath(job.qaReportPath!).catch((openError) => setError(getErrorMessage(openError)))}>View QA</button>}
-                      {job.contactSheetPath && <button className="button secondary" onClick={() => void openPath(job.contactSheetPath!).catch((openError) => setError(getErrorMessage(openError)))}>Contact sheet</button>}
+                      {job.qaReportPath && <button className="button secondary" onClick={() => void openPath(job.qaReportPath!).catch((openError) => setError(getErrorMessage(openError)))}>{t("viewQa")}</button>}
+                      {job.contactSheetPath && <button className="button secondary" onClick={() => void openPath(job.contactSheetPath!).catch((openError) => setError(getErrorMessage(openError)))}>{t("contactSheet")}</button>}
                       {[
                         "COMPLETED",
                         "FAILED",
@@ -2104,8 +2135,13 @@ export default function App() {
                     Profile:{" "}
                     {project?.calibration?.quality.status ??
                       "CALIBRATION PENDING"}{" "}
-                    · source luôn được giữ nguyên.
+                    · V{project?.calibration?.version ?? 5} · source luôn được giữ nguyên.
                   </small>
+                  {project?.calibration?.version && project.calibration.version >= 5 && (
+                    <small className="review-queue">
+                      Trajectory: {project.calibration.quality.reliableFrames} measured · {project.calibration.quality.lowConfidenceFrames} inferred
+                    </small>
+                  )}
                 </div>
                 <div className="best-quality-samples">
                   <span className="eyebrow">
@@ -2148,25 +2184,22 @@ export default function App() {
                           </button>
                         ))}
                       </div>
-                      <small className="alternatives-hint">
-                        Chưa mẫu nào đạt chuẩn theo mắt? Lượt thay thế quét
-                        phase khác, loại ±72 frame và scene vừa xem.
-                      </small>
+                      <small className="alternatives-hint">{t("alternativesHint")}</small>
                       <button
                         className="button secondary full"
                         onClick={() => void findBestQualitySamples(true)}
                         disabled={isBusy}
                       >
-                        Find 5 alternatives
+                        {t("findAlternatives")}
                       </button>
                     </>
                   ) : (
-                    loadingTask !== "sampling" && (<>
-                      <small>Không tìm thấy sample hợp lệ ở phase này. Save/Render vẫn bị khóa.</small>
-                      {roiFallbackArmed && <small className="review-queue">ROI fallback đang bật: kéo vùng tương đối trên preview, không cần khoanh sát từng glyph.</small>}
-                      <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>Khoanh ROI tương đối</button>
-                      {roiFallbackArmed && selection && <button className="button secondary full" onClick={() => void findBestQualitySamples(false)} disabled={isBusy}>Quét theo ROI này</button>}
-                      <button className="button secondary full" onClick={() => void findBestQualitySamples(true)} disabled={isBusy}>Quét phase khác</button>
+                    loadingTask !== "sampling" && loadingTask !== "calibrating" && (<>
+                      <small>{t("noValidSample")}</small>
+                      {roiFallbackArmed && <small className="review-queue">{t("roiFallbackActive")}</small>}
+                      <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>{language === "vi" ? "Khoanh ROI tương đối" : "Draw relative ROI"}</button>
+                      {roiFallbackArmed && selection && <button className="button secondary full" onClick={() => void runAdaptiveCalibration()} disabled={isBusy}>{t("roiFit")}</button>}
+                      <button className="button secondary full" onClick={() => void findBestQualitySamples(true)} disabled={isBusy}>{t("scanAnotherPhase")}</button>
                     </>)
                   )}
                   {selectedBestQualitySample && (
@@ -2179,7 +2212,7 @@ export default function App() {
                       onClick={() => void saveBestQualitySample()}
                       disabled={isBusy || !maskEditorReady}
                     >
-                      Save verified Calibration V3
+                      Save verified Calibration V4 (Legacy)
                     </button>
                     </div>
                   )}
@@ -2479,7 +2512,8 @@ export default function App() {
                 </button>
                 {isBusy &&
                   (loadingTask === "tracking" ||
-                    loadingTask === "rendering") && (
+                    loadingTask === "rendering" ||
+                    loadingTask === "calibrating") && (
                     <button
                       className="button secondary full"
                       onClick={cancelBusy}

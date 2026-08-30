@@ -29,16 +29,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-signatures", default="[]")
     parser.add_argument("--roi-json", default="")
     parser.add_argument("--anchor-frame", type=int, default=0)
+    parser.add_argument(
+        "--all-phases",
+        action="store_true",
+        help="Scan every frame-stride phase in one pass (the Best-quality UI default).",
+    )
     return parser.parse_args()
 
 
 def load_canonical() -> np.ndarray:
     encoded = (Path(__file__).parent / "assets" / "learna_ai_mask.b64").read_text(encoding="ascii").strip()
-    # Keep the descriptor text-only for packaging. Older checkout snapshots
-    # omitted one repeated eight-byte run from this highly compressible PNG.
-    if len(encoded) == 1576:
-        encoded = encoded[:162] + "2uLa4tri" + encoded[162:]
-        encoded = encoded[:1290] + "G" + encoded[1291:]
     decoded = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if decoded is None:
         raise RuntimeError("Unable to decode canonical Learna AI mask")
@@ -236,54 +236,64 @@ def main() -> None:
     args.output_directory.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.output_directory / "canonical-mask.png"), canonical)
 
-    phase = args.scan_round % FRAME_STRIDE
     candidates: list[dict[str, object]] = []
     capture = cv2.VideoCapture(str(source))
     try:
-        for frame_number in range(FIRST_FRAME + phase, frame_count, FRAME_STRIDE):
-            if any(abs(frame_number - rejected) < 72 for rejected in excluded):
-                continue
-            frame = read_frame(capture, frame_number)
-            if frame is None:
-                continue
-            crop, bbox, local_offset, (correlation, iou, contamination, large) = best_roi_crop(frame, frame_number, canonical, roi, anchor_frame, phase_shift)
-            candidate_mask = extract_mask(crop)
-            if correlation < MIN_CORRELATION or iou < MIN_IOU or contamination > MAX_CONTAMINATION or large:
-                continue
-            neighbours, temporal_score = temporal_gate(capture, frame_number, frame_count, canonical, roi, anchor_frame, phase_shift, local_offset)
-            if neighbours < MIN_NEIGHBOURS:
-                continue
-            complexity = background_complexity(crop, canonical)
-            score = 0.45 * correlation + 0.25 * temporal_score + 0.20 * (1.0 - contamination) + 0.10 * (1.0 / (1.0 + complexity / 20.0))
-            preview = args.output_directory / f"frame-{frame_number}.png"
-            mask_path = args.output_directory / f"frame-{frame_number}-mask.png"
-            editor_mask_path = args.output_directory / f"frame-{frame_number}-editor-mask.png"
-            cv2.imwrite(str(preview), crop)
-            cv2.imwrite(str(mask_path), candidate_mask)
-            cv2.imwrite(str(editor_mask_path), canonical)
-            signature = scene_signature(crop, canonical)
-            if signature in excluded_signatures:
-                continue
-            candidates.append({
-                "frame": frame_number,
-                "timestampSeconds": frame_number / float(project["video"]["fps"]),
-                "bbox": bbox,
-                "maskCoverage": int(np.count_nonzero(candidate_mask)),
-                "maskPeak": int(candidate_mask.max()),
-                "backgroundComplexity": complexity,
-                "temporalInstability": 1.0 - temporal_score,
-                "glyphCorrelation": correlation,
-                "glyphIou": iou,
-                "contamination": contamination,
-                "temporalPassCount": neighbours,
-                "score": score,
-                "sceneSignature": signature,
-                "previewPath": str(preview),
-                "maskPath": str(mask_path),
-                "editorMaskPath": str(editor_mask_path),
-                "roiFallback": bool(roi),
-                "trajectoryPhaseOffset": phase_shift,
-            })
+        # The watermark trajectory is periodic, while the detector samples on
+        # a six-frame stride.  A single phase can miss the cleanest glyph
+        # evidence entirely, so the Best-quality flow scans all six phases in
+        # one invocation.  Alternatives rotate the order to avoid repeatedly
+        # preferring the same scene when exclusions are applied.
+        phases = (
+            [(args.scan_round + index) % FRAME_STRIDE for index in range(FRAME_STRIDE)]
+            if args.all_phases
+            else [args.scan_round % FRAME_STRIDE]
+        )
+        for phase in phases:
+            for frame_number in range(FIRST_FRAME + phase, frame_count, FRAME_STRIDE):
+                if any(abs(frame_number - rejected) < 72 for rejected in excluded):
+                    continue
+                frame = read_frame(capture, frame_number)
+                if frame is None:
+                    continue
+                crop, bbox, local_offset, (correlation, iou, contamination, large) = best_roi_crop(frame, frame_number, canonical, roi, anchor_frame, phase_shift)
+                candidate_mask = extract_mask(crop)
+                if correlation < MIN_CORRELATION or iou < MIN_IOU or contamination > MAX_CONTAMINATION or large:
+                    continue
+                neighbours, temporal_score = temporal_gate(capture, frame_number, frame_count, canonical, roi, anchor_frame, phase_shift, local_offset)
+                if neighbours < MIN_NEIGHBOURS:
+                    continue
+                complexity = background_complexity(crop, canonical)
+                score = 0.45 * correlation + 0.25 * temporal_score + 0.20 * (1.0 - contamination) + 0.10 * (1.0 / (1.0 + complexity / 20.0))
+                preview = args.output_directory / f"frame-{frame_number}.png"
+                mask_path = args.output_directory / f"frame-{frame_number}-mask.png"
+                editor_mask_path = args.output_directory / f"frame-{frame_number}-editor-mask.png"
+                cv2.imwrite(str(preview), crop)
+                cv2.imwrite(str(mask_path), candidate_mask)
+                cv2.imwrite(str(editor_mask_path), canonical)
+                signature = scene_signature(crop, canonical)
+                if signature in excluded_signatures:
+                    continue
+                candidates.append({
+                    "frame": frame_number,
+                    "timestampSeconds": frame_number / float(project["video"]["fps"]),
+                    "bbox": bbox,
+                    "maskCoverage": int(np.count_nonzero(candidate_mask)),
+                    "maskPeak": int(candidate_mask.max()),
+                    "backgroundComplexity": complexity,
+                    "temporalInstability": 1.0 - temporal_score,
+                    "glyphCorrelation": correlation,
+                    "glyphIou": iou,
+                    "contamination": contamination,
+                    "temporalPassCount": neighbours,
+                    "score": score,
+                    "sceneSignature": signature,
+                    "previewPath": str(preview),
+                    "maskPath": str(mask_path),
+                    "editorMaskPath": str(editor_mask_path),
+                    "roiFallback": bool(roi),
+                    "trajectoryPhaseOffset": phase_shift,
+                })
     finally:
         capture.release()
 

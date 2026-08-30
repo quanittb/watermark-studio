@@ -29,6 +29,7 @@ pub fn run() {
             commands::project::extract_focus_preview,
             commands::project::save_watermark_anchor,
             commands::project::create_calibration_profile,
+            commands::project::auto_calibrate_best_quality,
             commands::project::save_calibration_mask_edit,
             commands::project::analyze_track,
             commands::project::retrack_track,

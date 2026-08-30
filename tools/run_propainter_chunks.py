@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import cv2
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -39,6 +41,14 @@ def main() -> None:
     merged.mkdir(parents=True, exist_ok=True)
     chunks.mkdir(parents=True, exist_ok=True)
     total = len(source_frames)
+    # Prepared Best-quality crops are landscape (320x160), while the Safe
+    # hardware tier is specified for the portrait source (288x512). ProPainter
+    # resizes to the requested processing size, so swap dimensions for a
+    # landscape crop to preserve aspect ratio and avoid stretching glyphs.
+    first_frame = cv2.imread(str(source_frames[0]), cv2.IMREAD_UNCHANGED)
+    process_width, process_height = args.width, args.height
+    if first_frame is not None and first_frame.shape[1] > first_frame.shape[0] and process_height > process_width:
+        process_width, process_height = process_height, process_width
     for core_start in range(0, total, args.core_length):
         core_end = min(total, core_start + args.core_length)
         input_start = max(0, core_start - args.context)
@@ -68,9 +78,9 @@ def main() -> None:
                 "--output",
                 str(chunk_root / "results"),
                 "--width",
-                str(args.width),
+                str(process_width),
                 "--height",
-                str(args.height),
+                str(process_height),
                 "--mask_dilation",
                 "1",
                 "--neighbor_length",

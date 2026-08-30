@@ -121,6 +121,18 @@ pub struct CreateCalibrationRequest {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AdaptiveCalibrationRequest {
+    pub project_id: String,
+    #[serde(default)]
+    pub roi: Option<BoundingBox>,
+    /// Frame at which the user drew the broad ROI.  It is evidence for the
+    /// detector, not a fixed render position.
+    #[serde(default)]
+    pub roi_frame: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveCalibrationMaskRequest {
     pub project_id: String,
     pub png_bytes: Vec<u8>,
@@ -386,6 +398,44 @@ pub async fn create_calibration_profile(
     })
     .await
     .map_err(|error| AppError::Io(format!("Calibration task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+/// Starts the Best-quality adaptive route.  The command intentionally returns
+/// a project even when the trajectory gate is NEEDS_REVIEW so the UI can show
+/// diagnostics and offer a wider ROI retry without fabricating a READY profile.
+#[tauri::command]
+pub async fn auto_calibrate_best_quality(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: AdaptiveCalibrationRequest,
+) -> Result<Project, AppErrorDto> {
+    let cancel = Arc::clone(&state.render_cancel);
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let mut project = service::load_project(&app_data_dir, &request.project_id)?;
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        let calibration = best_quality::create_adaptive_calibration_profile(
+            &directory,
+            &project,
+            request.roi.as_ref(),
+            request.roi_frame,
+            &cancel,
+        )?;
+        project.watermark.label = Some("Learna AI".to_string());
+        project.calibration = Some(calibration.clone());
+        if let Some(templates) = project.watermark.templates.as_mut() {
+            templates.mask = Some(calibration.mask_path.clone());
+        }
+        service::save_project_atomic(&directory, &project)?;
+        Ok::<Project, AppError>(project)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("Adaptive calibration task failed: {error}")))?
     .map_err(Into::into)
 }
 
@@ -1390,10 +1440,10 @@ pub async fn suggest_best_quality_samples(
             |current, total| {
                 let progress = OperationProgress {
                     phase: if request.scan_round == 0 {
-                        "Finding high-contrast samples".to_string()
+                        "Scanning all six Learna AI trajectory phases".to_string()
                     } else {
                         format!(
-                            "Finding alternative samples (pass {})",
+                            "Scanning all six phases for alternatives (pass {})",
                             request.scan_round + 1
                         )
                     },

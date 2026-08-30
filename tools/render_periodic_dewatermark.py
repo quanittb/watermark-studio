@@ -275,7 +275,9 @@ def create_binary_template(template_frame: np.ndarray, x: float, y: float) -> np
     )
 
 
-def aligned_positions(audit_rows: list[dict[str, float]]) -> tuple[np.ndarray, np.ndarray]:
+def aligned_positions(
+    audit_rows: list[dict[str, float]], phase_shift: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
     frame_count = len(audit_rows)
     reliable_frames: list[int] = []
     offsets_x: list[float] = []
@@ -284,7 +286,7 @@ def aligned_positions(audit_rows: list[dict[str, float]]) -> tuple[np.ndarray, n
         if row["modelScore"] < 0.30:
             continue
         frame_number = int(row["frame"])
-        periodic_x, periodic_y = periodic_position(frame_number)
+        periodic_x, periodic_y = periodic_position((frame_number + phase_shift) % 360)
         reliable_frames.append(frame_number)
         offsets_x.append(float(row["modelX"]) - periodic_x)
         offsets_y.append(float(row["modelY"]) - periodic_y)
@@ -518,7 +520,14 @@ def main() -> None:
     video_path = Path(project["source"]["path"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     offsets_x, offsets_y = aligned_positions(audit_rows)
-    template_frame_number = 530
+    # Choose the strongest evidence frame from the audit.  The pipeline must
+    # not depend on a magic frame number because different videos can start
+    # at a different phase or contain different scene cuts.
+    template_frame_number = max(
+        audit_rows,
+        key=lambda row: float(row.get("modelScore", 0.0)),
+    )["frame"]
+    template_frame_number = int(template_frame_number)
     alpha_template, binary_template, calibrated_background = (
         create_temporal_alpha_template(
             video_path,

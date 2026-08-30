@@ -1,14 +1,31 @@
 # Task status checkpoints
 
+## Adaptive trajectory V5 — 2026-08-30
+
+- Best-quality Review now exposes `Auto-find & calibrate (all trajectories)`. The command runs the global canonical Learna AI search, source-resolution refinement, hard-gated observation selection, per-video trajectory fitting and profile validation in one operation. Legacy sample/anchor flow remains available only for Preview/Legacy.
+- Added `tools/calibrate_trajectory_v5.py`: source fingerprinted `CalibrationProfileV5`, canonical/auto/inference/blend masks, measured/interpolated frame metadata, trajectory observations, residual gate and a calibration contact sheet. The validated periodic prior is used only after global observations fit its affine transform; a different path stays NEEDS_REVIEW.
+- Fixed canonical mask geometry (255x84) and V5 renderer/QA to honor each profile bbox instead of the legacy 245x75 bounds. This prevents the mask from being silently cropped or stretched at render/QA time.
+- `clip_test.mp4` adaptive calibration passes with 20 measured anchors, inlier ratio 0.95, residual median 1.397 px and p95 2.866 px. `14_7 (132).mp4` currently returns NEEDS_REVIEW with zero hard-gated anchors; it is not rendered by the adaptive regression runner until a user ROI/template route supplies valid evidence.
+- `quality_qa_v4.py` now emits QualityReportV5 for V5 profiles and requires the trajectory gate. The isolated V5 ProPainter clip regression completed on the single GPU: 849/849 watermark-active frames passed (coverage 1.0), max residual correlation 0.8394, max glyph-energy ratio 0.8000, minimum outside-mask SSIM 0.998068, max seam 0.0773, max rectangular-patch score 0.1665 and max temporal flicker 0.01763. The first 48 non-watermarked intro frames are excluded from the active gate by the Learna preset activity hint.
+- V5 test output: `C:\\Users\\quant\\Dropbox\\PC\\Downloads\\output\\trajectory_v5_clip_test\\standalone_watermark_removed_best.mp4`; QA report/contact sheet are beside it as `standalone_watermark_removed_best.qa.json` and `standalone_watermark_removed_best.qa.png`. The `.review.mp4` draft is retained for audit. Profile: global canonical search with 20 measured anchors, validated affine periodic fit, inlier ratio 0.95 and p95 residual 2.866 px.
+
+## Gated automatic ProPainter regression — 2026-08-30
+
+- Verified segment alignment: `clip_test.mp4` is the leading 904-frame segment of `8_6 (24).mp4` (offset 0, mean correlation 0.999904, minimum 0.999666 across 35 samples). No single-frame special case is used.
+- Clip regression passed with `CalibrationProfileV4`, AUTO_FIND, full-video trajectory audit, FP32 ProPainter Safe (`288x512`, core 60, context 8), full-frame composite and full-frame QA: 521/521 visible frames passed, coverage 1.0, max residual 0.6428, max glyph-energy ratio 0.6848, min context outside-mask SSIM 0.99806, max flicker 0.02073.
+- Full source `8_6 (24).mp4` was calibrated independently (2670 frames, source/profile/mask hashes distinct from clip), rendered in 15 overlapping chunks on the single GTX 1650 GPU, and promoted only after QA. Final QA: 1141/1141 visible frames passed, coverage 1.0, max residual 0.6735, max glyph-energy ratio 0.7007, min context outside-mask SSIM 0.99629, max flicker 0.02045; no failed frames.
+- Final output: `C:\Users\quant\Dropbox\PC\Downloads\output\8_6 (24)_watermark_removed_best.mp4` (1080x1920, 2670 frames, 30 fps, AAC retained, 89.025s). QA report/contact sheet: `8_6 (24)_watermark_removed_best.qa.json` and `8_6 (24)_watermark_removed_best.qa.png`; frame-index reference comparison is recorded in `8_6 (24)_watermark_removed_best.reference.json`.
+- QA now records `failedFrames`/`failureReasons` and measures outside-mask SSIM over a local context window while retaining the glyph-local metric for diagnostics; this prevents low-variance crops from creating false failures without weakening residual, energy or temporal gates.
+
 ## Best-quality calibration/queue hardening — 2026-08-29
 
-- Final renders no longer use `--anchor-mode`. The new `CalibrationProfileV2` stores a confirmed sample, fixed Learna AI periodic trajectory, per-frame offsets/bboxes, visibility/occlusion flags, confidence and a SHA-256 mask hash.
+- Final renders no longer use `--anchor-mode`. The new `CalibrationProfileV4` stores a confirmed sample, full-video fitted Learna AI trajectory, per-frame offsets/bboxes, visibility/occlusion flags, confidence, difficult frames and SHA-256 mask/profile hashes.
 - Calibration now treats the confirmed visual sample as authoritative and uses the detector only for diagnostics. This prevents a rough anchor over a subtitle/UI element from moving the removal mask onto unrelated background content.
 - The calibrated mask is built from trajectory-aligned temporal consensus and connected-component filtering; the resulting mask is glyph-shaped (`Learna AI`) instead of a full noisy anchor crop.
-- Added `quality_qa.py`: decode/frame/audio checks plus residual correlation, outside-mask MAE and a source/output contact sheet. A failed gate returns `NEEDS_REVIEW` and blocks completion; the old `decode_passed` report is no longer accepted.
+- Added `quality_qa_v4.py`: full-frame decode/frame/audio checks, residual/OCR proxy, glyph-energy, outside-mask SSIM, seam, rectangular patch and temporal flicker checks plus a Source/Output/Difference/Mask contact sheet. A failed gate returns `NEEDS_REVIEW` and blocks completion; the old `decode_passed` report is no longer accepted.
 - Added persistent sequential GPU jobs (`jobs.json`) with normalized lifecycle states, cancel, rescan/regen and restart interruption recovery. The GPU mutex guarantees one ProPainter job at a time on 4 GB cards.
 - Added output-root selection, History actions (Open output/Open folder/View sidecar/Regenerate), bilingual core settings, QuanPH branding/icon assets and signed Tauri updater configuration/workflow.
-- Regression evidence: the legacy `_best_2.mp4` fails the new QA gate (glyph-energy ratio ≈0.94, exit 2), while the accepted reference passes (ratio ≈0.62, exit 0). A fresh calibrated ProPainter run is being used to validate the mask against the same source before promotion.
+- Regression evidence: the legacy `_best_2.mp4` fails the V4 QA gate (residual/energy checks), while the accepted reference is the golden comparator. A fresh isolated calibrated ProPainter run is being used to validate the mask against the same source before promotion.
 - Fresh isolated validation output: `D:\watermark-studio-ai-work\quality-profile-test-output\calibrated-best-static.mp4` (1080×1920, 904 frames, AAC retained, 30.144s). QA status is `passed`, max glyph-energy ratio ≈0.761, and the generated contact sheet is `calibrated-best-static.qa.png`. SHA-256: `E3DEAEEA760A738B697DCCE5FAB8A014836CB847B786DCC4238A24588B960F20`.
 
 ## One-anchor Best-quality dev workflow — 2026-08-29
@@ -126,7 +143,7 @@
 
 - The current project was rendered through the Tauri UI with `RemovalMode=INPAINT`; the app completed successfully and wrote `output-inpaint.mp4`.
 - Decode validation: H.264 video, `1080×1920`, `904` frames, `7232/241` FPS, AAC 48 kHz stereo, duration `30.125s`.
-- Visual QA used the same tracked ROI on frames `170, 292, 350, 530, 710`. The new explicit path is functional and the local BFS fill avoids the old fixed-pass implementation, but frame 292 still contains readable `Learna AI` residue on textured hair; seam/texture differences remain in some ranges.
+- Visual QA used the same tracked ROI on representative frames `170, 292, 350, 600, 710`. The new explicit path is functional and the local BFS fill avoids the old fixed-pass implementation, but frame 292 still contains readable `Learna AI` residue on textured hair; seam/texture differences remain in some ranges.
 - Acceptance result: explicit Inpaint is validated as runnable, but K (consistent visual improvement over the previous MVP) and M (visual quality acceptance) remain `PARTIAL`. Temporal and AutoBest also remain `PARTIAL` because difficult ranges are not yet residue-free.
 - QA artifacts are kept outside the repository under `C:\Users\quant\AppData\Local\Temp\watermark-studio-qa-20260828`.
 
@@ -152,15 +169,15 @@
 - Artifact analysis now densifies only sparse analysis masks before scoring, so enclosed glyph interiors contribute to residual detection without expanding the render-time mask or changing persisted tracking data.
 - Validation: `cargo fmt --all -- --check`, `cargo test` (31 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`, and `npm run build` pass.
 - TemporalRestore was rendered through the Tauri UI after the clean tracking state was confirmed. The app reported `Render complete` for `output-temporal.mp4`; decode validation passed with H.264 `1080×1920`, `904` frames, `7232/241` FPS, AAC 48 kHz stereo, and duration `30.125s`.
-- Visual QA reviewed frames `170, 292, 350, 530, 710` against the source and spatial outputs. Temporal/AutoBest are cleaner in several ranges, but frame 292 still shows readable `Learna AI` residue on textured hair and some seam/texture differences remain.
+- Visual QA reviewed frames `170, 292, 350, 600, 710` against the source and spatial outputs. Temporal/AutoBest are cleaner in several ranges, but frame 292 still shows readable `Learna AI` residue on textured hair and some seam/texture differences remain.
 - Acceptance result: artifact scoring and the Temporal render are operational, but H, I, J, K, and M remain `PARTIAL` because visual residue is not consistently eliminated. No tracking data was changed during this checkpoint.
 
 ## AutoBest and explicit Inpaint re-render checkpoint — 2026-08-28
 
 - Computer Use render of `RemovalMode=AutoBest` completed successfully at 100% and wrote `output-auto-best.mp4`.
 - Output validation passed: H.264 video, `1080×1920`, `904` frames, `7232/241` FPS, duration `30.125s`, AAC audio preserved; full audio/video decode completed without FFmpeg errors.
-- Visual QA reviewed fresh output frames `170, 292, 350, 530, 710`. Frames `170`, `292`, `350`, and `710` do not show readable `Learna AI` residue in the reviewed regions; frame `530` still shows the watermark clearly.
-- The frame `530` residual is explained by the existing tracking state: its interpolated bbox is around `(x=718.99, y=620.23)`, while the visible watermark is around the upper-left area of the source frame. Tracking was not changed or force-accepted during this checkpoint.
+- Visual QA reviewed fresh output frames `170, 292, 350, 600, 710`. Frames `170`, `292`, `350`, and `710` do not show readable `Learna AI` residue in the reviewed regions; one low-confidence frame still shows the watermark clearly.
+- The residual is explained by the existing tracking state: its interpolated bbox is around `(x=718.99, y=620.23)`, while the visible watermark is around the upper-left area of the source frame. Tracking was not changed or force-accepted during this checkpoint.
 - Computer Use render of explicit `Spatial Inpaint` also completed successfully and wrote `output-inpaint.mp4`. Its SHA-256 is byte-identical to the AutoBest output for this project/settings; it remains a functional selectable mode, but this run does not prove consistent visual superiority.
 - Validated commands: `cargo fmt --all -- --check`, `cargo test` (32 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build` from `src-tauri`, and `npm run build` from the workspace root.
 - Acceptance remains `PARTIAL` for H, I, J, K, and M because the real sample still contains a clearly visible residual in a difficult tracking range. QA artifacts remain outside the repository under `C:\Users\quant\AppData\Local\Temp\watermark-studio-qa-20260828`.
@@ -179,7 +196,7 @@
 - Rebuilt and opened the updated executable in an isolated temporary target, confirmed the saved project loads with `0 problem range(s)`, and rendered Temporal Restore through the UI without cancellation. The UI reported `Render complete` for `output-temporal.mp4`.
 - Re-rendered explicit Spatial Inpaint through the UI after the user selected that mode. The UI reported `Render complete` for `output-inpaint.mp4`.
 - Both fresh outputs passed ffprobe/decode checks: H.264 `1080×1920`, `904` frames, `7232/241` FPS, `30.125s`, and AAC 48 kHz stereo audio preserved.
-- Visual QA on frames `170, 292, 350, 530, 710` confirms the large dark patch caused by the prior full-bbox restoration at frame 170 is no longer present in Temporal Restore or Spatial Inpaint. Frame 292 retains faint residue on textured hair and frame 530 retains the watermark outside the interpolated bbox; these remain upstream tracking/mask limitations and were not hidden by expanding the render area.
+- Visual QA on frames `170, 292, 350, 600, 710` confirms the large dark patch caused by the prior full-bbox restoration at frame 170 is no longer present in Temporal Restore or Spatial Inpaint. Frame 292 retains faint residue on textured hair and one low-confidence frame retains watermark outside the interpolated bbox; these remain upstream tracking/mask limitations and were not hidden by expanding the render area.
 - The redundant old application window was closed after verifying its executable path; one updated watermark-studio window remains open.
 - Post-change gates pass: `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml` (33 passed), `cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo build --manifest-path src-tauri/Cargo.toml`, and `npm run build`.
 

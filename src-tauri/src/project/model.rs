@@ -39,6 +39,18 @@ pub struct CalibrationProfile {
     pub blend_mask_path: Option<String>,
     #[serde(default)]
     pub brush_delta_path: Option<String>,
+    /// Versioned detector route (V4/V5 AUTO_FIND, global template or ROI
+    /// fallback). Kept optional so V1/V2 projects still load.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Per-video fitted trajectory and residual statistics from the full audit.
+    #[serde(default)]
+    pub trajectory_model: Option<serde_json::Value>,
+    /// Frames selected by calibration/QA for mandatory visual review.
+    #[serde(default)]
+    pub difficult_frames: Vec<u64>,
+    #[serde(default)]
+    pub contact_sheet_path: Option<String>,
     #[serde(default)]
     pub mask_hash: String,
     pub profile_hash: String,
@@ -61,6 +73,7 @@ pub struct SourceFingerprint {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CalibrationPreset {
     LearnaAiPeriodic,
+    LearnaAiAdaptive,
     GeneralMoving,
 }
 

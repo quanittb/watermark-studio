@@ -9,37 +9,13 @@ import numpy as np
 
 
 ANALYSIS_SCALE = 720.0 / 1920.0
-TEST_FRAMES = [
-    66,
-    111,
-    125,
-    136,
-    140,
-    150,
-    170,
-    235,
-    292,
-    350,
-    480,
-    530,
-    550,
-    600,
-    630,
-    653,
-    654,
-    700,
-    710,
-    800,
-    902,
-    903,
-]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("project_json", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--template-frame", type=int, default=530)
+    parser.add_argument("--template-frame", type=int)
+    parser.add_argument("--template-bbox-json", default="")
+    parser.add_argument("--phase-shift", type=int, default=0)
     parser.add_argument("--all-frames", action="store_true")
     return parser.parse_args()
 
@@ -144,6 +120,7 @@ def analyze_all_frames(
     video_path: Path,
     highpass_template: np.ndarray,
     output_path: Path,
+    phase_shift: int = 0,
 ) -> None:
     capture = cv2.VideoCapture(str(video_path))
     rows: list[dict[str, object]] = []
@@ -157,7 +134,7 @@ def analyze_all_frames(
         score, location, second_score, response = two_best_matches(
             signed_highpass(gray), highpass_template
         )
-        model_x, model_y = periodic_position(frame_number)
+        model_x, model_y = periodic_position((frame_number + phase_shift) % 360)
         analysis_x = int(round(model_x * ANALYSIS_SCALE))
         analysis_y = int(round(model_y * ANALYSIS_SCALE))
         radius = 4
@@ -183,6 +160,7 @@ def analyze_all_frames(
                 "modelY": model_location[1] / ANALYSIS_SCALE,
                 "periodicX": model_x,
                 "periodicY": model_y,
+                "phaseShift": phase_shift,
             }
         )
         frame_number += 1
@@ -245,25 +223,46 @@ def write_mask_diagnostics(
 def main() -> None:
     args = parse_args()
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
-    anchors = {anchor["frame"]: anchor for anchor in project["anchors"]}
-    if args.template_frame not in anchors:
-        raise RuntimeError("Template frame must be an existing manual anchor")
-
-    requested_frames = set(TEST_FRAMES)
-    requested_frames.add(args.template_frame)
+    template_frame = args.template_frame
+    template_bbox_source = None
+    if args.template_bbox_json.strip():
+        template_bbox_source = json.loads(args.template_bbox_json)
+    if template_frame is None:
+        anchor = project.get("watermark", {}).get("anchor")
+        if anchor:
+            template_frame = int(anchor["frame"])
+            template_bbox_source = template_bbox_source or anchor["bbox"]
+        else:
+            anchors = project.get("anchors", [])
+            if not anchors:
+                raise RuntimeError("A template frame and bbox are required for trajectory audit")
+            selected = max(anchors, key=lambda item: int(item.get("frame", 0)))
+            template_frame = int(selected["frame"])
+            template_bbox_source = template_bbox_source or selected["bbox"]
+    if template_frame < 0 or template_frame >= int(project["video"]["frameCount"]):
+        raise RuntimeError("Template frame is outside the source video")
+    if template_bbox_source is None:
+        raise RuntimeError("Template bbox is required for trajectory audit")
+    requested_frames = set(
+        int(value)
+        for value in np.linspace(
+            0, int(project["video"]["frameCount"]) - 1, min(35, int(project["video"]["frameCount"])), dtype=np.int64
+        ).tolist()
+    )
+    requested_frames.add(template_frame)
     frames = read_selected_frames(Path(project["source"]["path"]), requested_frames)
 
-    template_frame = resize_analysis(frames[args.template_frame])
-    template_gray = cv2.cvtColor(template_frame, cv2.COLOR_BGR2GRAY)
-    template_bbox = scaled_bbox(anchors[args.template_frame]["bbox"])
+    template_image = resize_analysis(frames[template_frame])
+    template_gray = cv2.cvtColor(template_image, cv2.COLOR_BGR2GRAY)
+    template_bbox = scaled_bbox(template_bbox_source)
     tx, ty, tw, th = template_bbox
     highpass_template = signed_highpass(template_gray)[ty : ty + th, tx : tx + tw]
     gradient_template = gradient_magnitude(template_gray)[ty : ty + th, tx : tx + tw]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_mask_diagnostics(
-        frames[args.template_frame],
-        anchors[args.template_frame]["bbox"],
+        frames[template_frame],
+        template_bbox_source,
         args.output_dir,
     )
     if args.all_frames:
@@ -271,12 +270,13 @@ def main() -> None:
             Path(project["source"]["path"]),
             highpass_template,
             args.output_dir / "all-matches.json",
+            args.phase_shift,
         )
         print(args.output_dir)
         return
     rows: list[dict[str, object]] = []
     overlays: list[np.ndarray] = []
-    for frame_number in TEST_FRAMES:
+    for frame_number in sorted(requested_frames):
         analysis = resize_analysis(frames[frame_number])
         gray = cv2.cvtColor(analysis, cv2.COLOR_BGR2GRAY)
         highpass_score, highpass_location = best_match(

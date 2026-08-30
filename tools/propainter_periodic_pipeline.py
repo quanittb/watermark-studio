@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Full-video calibration profile. Final renders must use this instead of anchor-mode.",
     )
-    prepare.add_argument("--start-frame", type=int, default=48)
+    prepare.add_argument("--start-frame", type=int, default=0)
     prepare.add_argument("--end-frame", type=int, default=903)
     prepare.add_argument("--full-frame", action="store_true")
 
@@ -64,6 +64,17 @@ def crop_origin(x: float, y: float, frame_width: int, frame_height: int) -> tupl
     return left, top
 
 
+def profile_bounds(bbox: dict[str, float], frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    """Use the profile's calibrated box dimensions, including V6 padding."""
+    x0 = max(0, int(round(float(bbox["x"]))))
+    y0 = max(0, int(round(float(bbox["y"]))))
+    x1 = min(frame_width, int(round(float(bbox["x"]) + float(bbox["width"]))))
+    y1 = min(frame_height, int(round(float(bbox["y"]) + float(bbox["height"]))))
+    if x1 <= x0 or y1 <= y0:
+        raise RuntimeError("Calibration bbox is outside the source frame")
+    return x0, y0, x1, y1
+
+
 def prepare(args: argparse.Namespace) -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
     video_path = Path(project["source"]["path"])
@@ -72,12 +83,14 @@ def prepare(args: argparse.Namespace) -> None:
     if args.profile is not None:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         if (
-            profile.get("version") != 3
+            profile.get("version") not in (4, 5, 6)
             or profile.get("status") != "READY"
-            or profile.get("preset") != "LEARNA_AI_PERIODIC"
+            or profile.get("preset") not in ("LEARNA_AI_PERIODIC", "LEARNA_AI_ADAPTIVE")
             or profile.get("qualityGate", {}).get("status") != "PASSED"
         ):
-            raise RuntimeError("Unsupported or incomplete Best-quality calibration profile")
+            raise RuntimeError("Unsupported or incomplete CalibrationProfileV4/V5/V6")
+        if profile.get("version") in (5, 6) and profile.get("trajectoryGate", {}).get("status") != "PASSED":
+            raise RuntimeError(f"CalibrationProfileV{profile.get('version')} trajectory quality gate did not pass")
         if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
             raise RuntimeError("Calibration profile frame count does not match the source video")
     mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]
@@ -135,7 +148,18 @@ def prepare(args: argparse.Namespace) -> None:
                 bbox = frame_profile["bbox"]
                 x = float(bbox["x"])
                 y = float(bbox["y"])
-                visible = bool(frame_profile.get("visibility", False)) and not bool(frame_profile.get("occlusion", False))
+                # ``confidence`` describes detector evidence only.  A low
+                # score is common during motion blur or textured scenes; the
+                # trajectory/profile still gives us a valid position.  Use
+                # the explicit maskRequired bit so those frames are not
+                # silently copied with the watermark untouched.
+                visible = bool(
+                    frame_profile.get(
+                        "maskRequired",
+                        bool(frame_profile.get("visibility", False))
+                        and not bool(frame_profile.get("occlusion", False)),
+                    )
+                )
             else:
                 periodic_x, periodic_y = periodic_position(frame_number)
                 x = periodic_x + offsets_x[frame_number]
@@ -149,9 +173,12 @@ def prepare(args: argparse.Namespace) -> None:
                 crop_width, crop_height = CROP_WIDTH, CROP_HEIGHT
             crop = frame[top : top + crop_height, left : left + crop_width]
             local_mask = np.zeros((crop_height, crop_width), dtype=np.uint8)
-            box_x0, box_y0, box_x1, box_y1 = bounds_for_position(
-                x, y, frame_width, frame_height
-            )
+            if profile is not None:
+                box_x0, box_y0, box_x1, box_y1 = profile_bounds(bbox, frame_width, frame_height)
+            else:
+                box_x0, box_y0, box_x1, box_y1 = bounds_for_position(
+                    x, y, frame_width, frame_height
+                )
             resized_mask = cv2.resize(
                 glyph_mask,
                 (box_x1 - box_x0, box_y1 - box_y0),

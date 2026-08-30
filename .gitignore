@@ -35,3 +35,6 @@ qa/contact/
 
 # Python bytecode created by the local AI-pipeline validation scripts
 tools/__pycache__/
+
+# Local full-video regression workspaces (regenerable GPU artifacts)
+.regression-work/

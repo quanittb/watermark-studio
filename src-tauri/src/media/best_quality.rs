@@ -8,21 +8,27 @@ use crate::project::model::{
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const SUPPORTED_WIDTH: u32 = 1080;
 const SUPPORTED_HEIGHT: u32 = 1920;
-const FIRST_WATERMARK_FRAME: u64 = 48;
+// Best-quality V6 discovers the active interval from calibration.  The old
+// fixed 48-frame start is retained only by the legacy path/tests.
+const LEGACY_FIRST_WATERMARK_FRAME: u64 = 48;
 const DEFAULT_PROPAINTER_PYTHON: &str = r"D:\propainter-watermark-venv\Scripts\python.exe";
 const DEFAULT_PROPAINTER_ROOT: &str = r"D:\propainter-watermark-work";
 const DEFAULT_WORK_ROOT: &str = r"D:\watermark-studio-ai-work";
 const CALIBRATION_SCRIPT: &str = "calibrate_best_quality.py";
+const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v6.py";
 const FIND_SAMPLES_SCRIPT: &str = "find_learna_samples.py";
+const AUDIT_SCRIPT: &str = "audit_watermark_detection.py";
 const MIN_MASK_COVERAGE: u64 = 350;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -145,7 +151,7 @@ where
         .join("tools")
         .join("propainter_periodic_pipeline.py");
     let chunks = repo_root.join("tools").join("run_propainter_chunks.py");
-    let qa_script = repo_root.join("tools").join("quality_qa.py");
+    let qa_script = repo_root.join("tools").join("quality_qa_v4.py");
 
     require_file(&python, "ProPainter Python")?;
     require_file(
@@ -158,6 +164,19 @@ where
     validate_replacement(replacement)?;
 
     let profile_path = validate_calibration_profile(project_directory, project)?;
+    let profile_value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&profile_path)?).map_err(|error| {
+            AppError::InvalidRequest(format!("Calibration profile is invalid JSON: {error}"))
+        })?;
+    let first_frame = profile_value
+        .get("firstWatermarkFrame")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .min(project.video.frame_count.saturating_sub(1));
+    let last_profile_frame = profile_value
+        .get("lastWatermarkFrame")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(|| project.video.frame_count.saturating_sub(1));
     let hardware = detect_hardware();
     if !hardware.supported {
         return Err(AppError::InvalidRequest(
@@ -189,9 +208,10 @@ where
             .arg("--profile")
             .arg(&profile_path)
             .arg("--start-frame")
-            .arg(FIRST_WATERMARK_FRAME.to_string())
+            .arg(first_frame.to_string())
             .arg("--end-frame")
-            .arg(last_frame.to_string()),
+            .arg(last_profile_frame.min(last_frame).to_string())
+            .arg("--full-frame"),
         cancel,
         "Preparing AI masks",
     )?;
@@ -205,6 +225,7 @@ where
         &propainter_root,
         &hardware,
         cancel,
+        &mut progress,
     ) {
         let message = error.to_string().to_ascii_lowercase();
         if !message.contains("out of memory") && !message.contains("cuda oom") {
@@ -224,6 +245,7 @@ where
             &propainter_root,
             &fallback,
             cancel,
+            &mut progress,
         )?;
     }
 
@@ -273,7 +295,12 @@ pub fn calibration_metadata(
     project: &Project,
 ) -> Result<CalibrationProfile, AppError> {
     let profile_path = project_directory.join("calibration").join("profile.json");
-    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path)?)?;
+    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path)?)
+        .map_err(|error| {
+            AppError::CalibrationCorrupt(format!(
+            "non-standard JSON value or truncated write; regenerate CalibrationProfileV6 ({error})"
+        ))
+        })?;
     let profile_frame_count = profile
         .get("frameCount")
         .and_then(|value| value.as_u64())
@@ -288,7 +315,18 @@ pub fn calibration_metadata(
                 .and_then(|value| value.as_u64())
         })
         .unwrap_or(0);
-    let is_v3_ready = profile.get("version").and_then(|value| value.as_u64()) == Some(3)
+    let profile_version = profile
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let trajectory_ready = !matches!(profile_version, 5 | 6)
+        || (profile
+            .get("trajectoryGate")
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_str())
+            == Some("PASSED")
+            && profile.get("trajectoryModel").is_some());
+    let is_ready = matches!(profile_version, 4..=6)
         && profile_frame_count == project.video.frame_count
         && mask_pixels >= MIN_MASK_COVERAGE
         && profile.get("status").and_then(|value| value.as_str()) == Some("READY")
@@ -300,14 +338,15 @@ pub fn calibration_metadata(
         && profile
             .get("maskSha256")
             .and_then(|value| value.as_str())
-            .is_some();
-    let status = if is_v3_ready {
+            .is_some()
+        && trajectory_ready;
+    let status = if is_ready {
         CalibrationStatus::Ready
     } else if profile
         .get("version")
         .and_then(|value| value.as_u64())
         .unwrap_or(0)
-        < 3
+        < 4
     {
         CalibrationStatus::Stale
     } else {
@@ -320,6 +359,12 @@ pub fn calibration_metadata(
             profile
                 .get("qualityGate")
                 .and_then(|value| value.get("reliableFrames"))
+                .and_then(|value| value.as_u64())
+        })
+        .or_else(|| {
+            profile
+                .get("qualityGate")
+                .and_then(|value| value.get("measuredFrames"))
                 .and_then(|value| value.as_u64())
         })
         .unwrap_or_else(|| {
@@ -349,11 +394,10 @@ pub fn calibration_metadata(
             .get("version")
             .and_then(|value| value.as_u64())
             .unwrap_or(0) as u32,
-        preset: if profile.get("preset").and_then(|value| value.as_str()) == Some("GENERAL_MOVING")
-        {
-            CalibrationPreset::GeneralMoving
-        } else {
-            CalibrationPreset::LearnaAiPeriodic
+        preset: match profile.get("preset").and_then(|value| value.as_str()) {
+            Some("GENERAL_MOVING") => CalibrationPreset::GeneralMoving,
+            Some("LEARNA_AI_ADAPTIVE") => CalibrationPreset::LearnaAiAdaptive,
+            _ => CalibrationPreset::LearnaAiPeriodic,
         },
         detector_version: profile
             .get("detectorVersion")
@@ -380,6 +424,20 @@ pub fn calibration_metadata(
             .get("brushDeltaPath")
             .and_then(|value| value.as_str())
             .map(str::to_string),
+        route: profile
+            .get("route")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        trajectory_model: profile.get("trajectoryModel").cloned(),
+        difficult_frames: profile
+            .get("difficultFrames")
+            .and_then(|value| value.as_array())
+            .map(|frames| frames.iter().filter_map(|value| value.as_u64()).collect())
+            .unwrap_or_default(),
+        contact_sheet_path: profile
+            .get("contactSheetPath")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         mask_hash: profile
             .get("maskSha256")
             .and_then(|value| value.as_str())
@@ -399,7 +457,11 @@ pub fn calibration_metadata(
         quality: CalibrationQuality {
             status,
             reliable_frames,
-            low_confidence_frames: frame_count.saturating_sub(reliable_frames),
+            low_confidence_frames: profile
+                .get("qualityGate")
+                .and_then(|value| value.get("interpolatedFrames"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| frame_count.saturating_sub(reliable_frames)),
             mask_pixels,
             glyph_coverage: profile
                 .get("qualityGate")
@@ -477,7 +539,7 @@ where
 {
     validate_layout(project)?;
     let candidates_directory = project_directory.join("cache").join(format!(
-        "best-quality-candidates-phase-{}",
+        "best-quality-candidates-scan-{}",
         options.scan_round
     ));
     fs::create_dir_all(&candidates_directory)?;
@@ -491,7 +553,10 @@ where
     let detector = repo_root.join("tools").join(FIND_SAMPLES_SCRIPT);
     require_file(&python, "Detector Python")?;
     require_file(&detector, "Learna AI detector")?;
-    progress(0, 1);
+    // The detector now evaluates all six stride phases in one process.  Keep
+    // the progress contract phase-based so the UI does not appear finished
+    // while the remaining phases are still being scanned.
+    progress(0, 6);
     let mut command = Command::new(&python);
     command
         .arg(&detector)
@@ -499,6 +564,10 @@ where
         .arg(&candidates_directory)
         .arg("--scan-round")
         .arg(options.scan_round.to_string())
+        // Match the verified regression path: one click evaluates every
+        // six-frame sampling phase, so the cleanest glyph evidence cannot be
+        // missed merely because it falls between phase-0 samples.
+        .arg("--all-phases")
         .arg("--exclude-frames")
         .arg(serde_json::to_string(options.excluded_frames)?)
         .arg("--exclude-signatures")
@@ -525,12 +594,14 @@ where
                 "Unable to parse Learna AI detector result: {error}"
             ))
         })?;
-    progress(1, 1);
+    progress(6, 6);
     Ok(candidates)
 }
 
 fn validate_project(project_directory: &Path, project: &Project) -> Result<(), AppError> {
-    validate_layout_and_anchor(project)?;
+    // Best-quality is profile-driven; a legacy manual anchor is optional and
+    // must never be required for the final route.
+    validate_layout(project)?;
     let _ = project_directory;
     Ok(())
 }
@@ -561,12 +632,37 @@ pub fn create_calibration_profile(
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
     let calibration_script = repo_root.join("tools").join(CALIBRATION_SCRIPT);
+    let audit_script = repo_root.join("tools").join(AUDIT_SCRIPT);
     require_file(&python, "Calibration Python")?;
     require_file(&calibration_script, "Best-quality calibration script")?;
+    require_file(&audit_script, "Trajectory audit script")?;
     let profile_path = project_directory.join("calibration").join("profile.json");
     if let Some(parent) = profile_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let audit_directory = project_directory
+        .join("calibration")
+        .join("trajectory-audit");
+    fs::create_dir_all(&audit_directory)?;
+    let phase_shift = sample.trajectory_phase_offset.rem_euclid(360);
+    let mut audit = Command::new(&python);
+    audit
+        .arg(&audit_script)
+        .arg(project_directory.join("project.json"))
+        .arg(&audit_directory)
+        .arg("--template-frame")
+        .arg(sample.frame.to_string())
+        .arg("--template-bbox-json")
+        .arg(serde_json::to_string(&sample.bbox)?)
+        .arg("--phase-shift")
+        .arg(phase_shift.to_string())
+        .arg("--all-frames");
+    run_process(
+        &mut audit,
+        cancel,
+        "Analyzing the full-video watermark trajectory",
+    )?;
+    let audit_path = audit_directory.join("all-matches.json");
     let mut command = Command::new(&python);
     command
         .arg(&calibration_script)
@@ -578,22 +674,83 @@ pub fn create_calibration_profile(
         .arg(serde_json::to_string(&sample.bbox)?)
         .arg("--candidate-json")
         .arg(serde_json::to_string(sample)?);
+    command
+        .arg("--audit-json")
+        .arg(&audit_path)
+        .arg("--route")
+        .arg(if sample.roi_fallback {
+            "ROI_FALLBACK"
+        } else {
+            "AUTO_FIND"
+        });
     if let Some(mask) = edited_mask {
         command.arg("--edited-mask").arg(mask);
     }
-    run_process(&mut command, cancel, "Creating CalibrationProfileV3")?;
+    run_process(&mut command, cancel, "Creating CalibrationProfileV4")?;
     if !profile_path.is_file() {
         return Err(AppError::FfmpegFailed(
             "Calibration completed without creating a profile.".to_string(),
         ));
     }
     let metadata = calibration_metadata(project_directory, project)?;
-    if metadata.version != 3 || metadata.quality.status != CalibrationStatus::Ready {
+    if metadata.version != 4 || metadata.quality.status != CalibrationStatus::Ready {
         return Err(AppError::InvalidRequest(
-            "CalibrationProfileV3 did not pass its quality gate.".to_string(),
+            "CalibrationProfileV4 did not pass its quality gate.".to_string(),
         ));
     }
     Ok(metadata)
+}
+
+/// Runs the adaptive Best-quality calibration.  Unlike the legacy sample
+/// route, this searches the full video with the canonical glyph and fits a
+/// trajectory model without assuming the 360-frame prior.
+pub fn create_adaptive_calibration_profile(
+    project_directory: &Path,
+    project: &Project,
+    roi: Option<&BoundingBox>,
+    roi_frame: Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<CalibrationProfile, AppError> {
+    validate_layout(project)?;
+    let python = configured_path(
+        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
+        DEFAULT_PROPAINTER_PYTHON,
+    );
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
+    let script = repo_root.join("tools").join(ADAPTIVE_CALIBRATION_SCRIPT);
+    require_file(&python, "Calibration Python")?;
+    require_file(&script, "Adaptive calibration script")?;
+    let profile_path = project_directory.join("calibration").join("profile.json");
+    if let Some(parent) = profile_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let route = if roi.is_some() {
+        "ROI_FALLBACK"
+    } else {
+        "AUTO_GLOBAL_TEMPLATE"
+    };
+    let mut command = Command::new(&python);
+    command
+        .arg(&script)
+        .arg(project_directory.join("project.json"))
+        .arg(&profile_path)
+        .arg("--route")
+        .arg(route);
+    if let Some(roi) = roi {
+        command.arg("--roi-json").arg(serde_json::to_string(roi)?);
+    }
+    if let Some(frame) = roi_frame {
+        command.arg("--roi-frame").arg(frame.to_string());
+    }
+    run_process(&mut command, cancel, "Adaptive Learna AI calibration")?;
+    if !profile_path.is_file() {
+        return Err(AppError::FfmpegFailed(
+            "Adaptive calibration completed without creating a profile.".to_string(),
+        ));
+    }
+    calibration_metadata(project_directory, project)
 }
 
 fn validate_calibration_profile(
@@ -603,16 +760,20 @@ fn validate_calibration_profile(
     let profile_path = project_directory.join("calibration").join("profile.json");
     if !profile_path.is_file() {
         return Err(AppError::InvalidRequest(
-            "Best-quality render requires a confirmed CalibrationProfileV3. Review and save calibration first."
+            "Best-quality render requires a confirmed CalibrationProfileV6. Run Auto-find & calibrate in Review first."
                 .to_string(),
         ));
     }
     let body = fs::read_to_string(&profile_path)?;
-    let mut profile: serde_json::Value = serde_json::from_str(&body)?;
+    let mut profile: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        AppError::CalibrationCorrupt(format!(
+            "non-standard JSON numbers or truncated write; regenerate V6 ({error})"
+        ))
+    })?;
     let metadata = calibration_metadata(project_directory, project)?;
-    if metadata.version != 3 || metadata.quality.status != CalibrationStatus::Ready {
+    if metadata.version != 6 || metadata.quality.status != CalibrationStatus::Ready {
         return Err(AppError::InvalidRequest(
-            "Calibration is stale or did not pass the V3 quality gate. Regenerate it in Review."
+            "Calibration is stale or did not pass the V6 quality gate. Regenerate it in Review."
                 .to_string(),
         ));
     }
@@ -739,6 +900,7 @@ fn lower_hardware_profile(current: &HardwareProfile) -> Option<HardwareProfile> 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_propainter_chunks(
     python: &Path,
     chunks: &Path,
@@ -747,25 +909,102 @@ fn run_propainter_chunks(
     propainter_root: &Path,
     hardware: &HardwareProfile,
     cancel: &AtomicBool,
+    progress: &mut impl FnMut(&str, u64, u64),
 ) -> Result<(), AppError> {
-    run_process(
-        Command::new(python)
-            .arg(chunks)
-            .arg(workspace)
-            .arg(result_root)
-            .arg(propainter_root)
-            .arg(python)
-            .arg("--width")
-            .arg(hardware.width.to_string())
-            .arg("--height")
-            .arg(hardware.height.to_string())
-            .arg("--core-length")
-            .arg(hardware.core_length.to_string())
-            .arg("--context")
-            .arg(hardware.context.to_string()),
-        cancel,
-        "Running AI restoration",
-    )
+    let mut child = Command::new(python)
+        .arg(chunks)
+        .arg(workspace)
+        .arg(result_root)
+        .arg(propainter_root)
+        .arg(python)
+        .arg("--width")
+        .arg(hardware.width.to_string())
+        .arg("--height")
+        .arg(hardware.height.to_string())
+        .arg("--core-length")
+        .arg(hardware.core_length.to_string())
+        .arg("--context")
+        .arg(hardware.context.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            AppError::Io(format!("Running AI restoration could not start: {error}"))
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Io("AI restoration stdout unavailable.".to_string()))?;
+    // Drain stderr concurrently.  ProPainter writes progress bars and model
+    // diagnostics there; waiting until process exit to read a full pipe can
+    // deadlock once the Windows pipe buffer fills on a long video.
+    let stderr = child.stderr.take();
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer_writer = Arc::clone(&stderr_buffer);
+    thread::spawn(move || {
+        if let Some(pipe) = stderr {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if let Ok(mut buffer) = stderr_buffer_writer.lock() {
+                    if buffer.len() < 16_384 {
+                        buffer.push_str(&line);
+                        buffer.push('\n');
+                    }
+                }
+            }
+        }
+    });
+    let (sender, receiver) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::OperationCancelled);
+        }
+        while let Ok(line) = receiver.try_recv() {
+            if let Some((current, total)) = parse_chunk_progress(&line) {
+                progress("Running temporal AI restoration", current, total);
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                progress("Running temporal AI restoration", 1, 1);
+                return Ok(());
+            }
+            Ok(Some(status)) => {
+                let stderr = stderr_buffer
+                    .lock()
+                    .map(|buffer| buffer.trim().to_string())
+                    .unwrap_or_default();
+                return Err(AppError::FfmpegFailed(format!(
+                    "Running AI restoration failed with exit code {}. {}",
+                    status
+                        .code()
+                        .map_or("unknown".to_string(), |code| code.to_string()),
+                    stderr.trim()
+                )));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                return Err(AppError::Io(format!(
+                    "AI restoration status check failed: {error}"
+                )))
+            }
+        }
+    }
+}
+
+fn parse_chunk_progress(line: &str) -> Option<(u64, u64)> {
+    let marker = "merged ";
+    let start = line.find(marker)? + marker.len();
+    let values = line[start..].split_once('/')?;
+    let current = values.0.trim().parse().ok()?;
+    let total = values.1.trim().parse().ok()?;
+    Some((current, total))
 }
 
 fn validate_replacement(replacement: Option<&BestQualityReplacement>) -> Result<(), AppError> {
@@ -846,22 +1085,6 @@ fn append_replacement_arguments(
     }
 }
 
-fn validate_layout_and_anchor(project: &Project) -> Result<(), AppError> {
-    validate_layout(project)?;
-    let anchor = project.watermark.anchor.as_ref().ok_or_else(|| {
-        AppError::InvalidRequest("Confirm one Best-quality sample before rendering.".to_string())
-    })?;
-    if !(150.0..=360.0).contains(&anchor.bbox.width)
-        || !(40.0..=140.0).contains(&anchor.bbox.height)
-    {
-        return Err(AppError::InvalidRequest(
-            "The confirmed sample size does not match the supported Learna AI watermark."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_layout(project: &Project) -> Result<(), AppError> {
     if project.video.width != SUPPORTED_WIDTH || project.video.height != SUPPORTED_HEIGHT {
         return Err(AppError::InvalidRequest(format!(
@@ -869,7 +1092,7 @@ fn validate_layout(project: &Project) -> Result<(), AppError> {
             project.video.width, project.video.height
         )));
     }
-    if project.video.frame_count <= FIRST_WATERMARK_FRAME {
+    if project.video.frame_count <= LEGACY_FIRST_WATERMARK_FRAME {
         return Err(AppError::InvalidRequest(
             "The video is too short for the supported best-quality workflow.".to_string(),
         ));
@@ -889,7 +1112,7 @@ fn candidate_frames(frame_count: u64, anchor_frame: u64, scan_round: u32) -> Vec
     // cards forever. Prime-ish phase offsets traverse all 24 frame phases
     // before repeating.
     let phase_offset = (u64::from(scan_round) * 7) % 24;
-    let first = FIRST_WATERMARK_FRAME + phase_offset;
+    let first = LEGACY_FIRST_WATERMARK_FRAME + phase_offset;
     let mut frames: Vec<u64> = (first..=end).step_by(24).collect();
     if scan_round == 0 {
         frames.push(anchor_frame);
@@ -1056,11 +1279,11 @@ mod tests {
 
     #[test]
     fn alternative_scan_uses_a_different_trajectory_phase() {
-        let first = candidate_frames(904, FIRST_WATERMARK_FRAME, 0);
-        let alternative = candidate_frames(904, FIRST_WATERMARK_FRAME, 1);
+        let first = candidate_frames(904, LEGACY_FIRST_WATERMARK_FRAME, 0);
+        let alternative = candidate_frames(904, LEGACY_FIRST_WATERMARK_FRAME, 1);
 
-        assert!(first.contains(&FIRST_WATERMARK_FRAME));
-        assert!(!alternative.contains(&FIRST_WATERMARK_FRAME));
+        assert!(first.contains(&LEGACY_FIRST_WATERMARK_FRAME));
+        assert!(!alternative.contains(&LEGACY_FIRST_WATERMARK_FRAME));
         assert!(first.iter().any(|frame| !alternative.contains(frame)));
         assert!(alternative.iter().any(|frame| !first.contains(frame)));
     }

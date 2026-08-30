@@ -21,7 +21,7 @@ export type BestQualitySample = {
   editorMaskPath: string;
   roiFallback?: boolean;
 };
-export type RoiHint = { x: number; y: number; width: number; height: number };
+export type RoiHint = { x: number; y: number; width: number; height: number; frame?: number };
 export type FocusPreview = { frame: number; timestampSeconds: number; path: string; crop: BoundingBox };
 export type JobStatus = 'IMPORTED' | 'SCANNING' | 'AWAITING_REVIEW' | 'READY' | 'QUEUED' | 'PREPARING' | 'INFERENCING' | 'ENCODING' | 'VERIFYING' | 'COMPLETED' | 'NEEDS_REVIEW' | 'FAILED' | 'CANCELED' | 'INTERRUPTED';
 export type JobRecord = { id: string; projectId: string; sourceName: string; outputRoot: string | null; outputName: string | null; outputPath: string | null; status: JobStatus; stage: string; progress: number; batchProgress: number; currentFrame: number | null; currentChunk: number | null; elapsedSeconds: number | null; etaSeconds: number | null; replacementConfig: unknown | null; hardwareProfile: string | null; attempt: number; qaReportPath: string | null; contactSheetPath: string | null; errorCode: string | null; error: string | null; createdAt: string; updatedAt: string };
@@ -124,6 +124,9 @@ export function suggestBestQualitySamples(projectId: string, options: { scanRoun
 
 export function createCalibrationProfile(projectId: string, sample: BestQualitySample, editedMaskPath: string | null = null): Promise<WatermarkProject> {
   return invoke<WatermarkProject>('create_calibration_profile', { request: { projectId, sample, editedMaskPath } });
+}
+export function autoCalibrateBestQuality(projectId: string, roi: RoiHint | null = null): Promise<WatermarkProject> {
+  return invoke<WatermarkProject>('auto_calibrate_best_quality', { request: { projectId, roi } });
 }
 export function saveCalibrationMaskEdit(projectId: string, pngBytes: number[]): Promise<string> {
   return invoke<string>('save_calibration_mask_edit', { request: { projectId, pngBytes } });

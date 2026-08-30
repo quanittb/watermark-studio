@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("audit_json", type=Path)
     parser.add_argument("output_project_dir", type=Path)
     parser.add_argument("--start-frame", type=int, default=48)
+    parser.add_argument("--template-frame", type=int)
     return parser.parse_args()
 
 
@@ -115,7 +116,11 @@ def main() -> None:
     project["removal"]["artifactThreshold"] = 0.25
     project["removal"]["fallbackPolicy"] = "TEMPORAL_INPAINT_BLUR"
 
-    template_frame_number = 530
+    template_frame_number = args.template_frame
+    if template_frame_number is None:
+        template_frame_number = int(
+            max(audit_rows, key=lambda row: float(row.get("modelScore", 0.0)))["frame"]
+        )
     video_path = Path(project["source"]["path"])
     template_frame = read_frame(video_path, template_frame_number)
     periodic_x, periodic_y = periodic_position(template_frame_number)
