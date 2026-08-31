@@ -96,6 +96,20 @@ pub struct TrajectoryGateSummary {
     #[serde(default)]
     pub measured_coverage: Option<f64>,
     #[serde(default)]
+    pub validated_coverage: Option<f64>,
+    #[serde(default)]
+    pub refined_frames: u64,
+    #[serde(default)]
+    pub refined_coverage: Option<f64>,
+    #[serde(default)]
+    pub holdout: Option<serde_json::Value>,
+    #[serde(default)]
+    pub holdout_median: Option<f64>,
+    #[serde(default)]
+    pub holdout_p95: Option<f64>,
+    #[serde(default)]
+    pub holdout_inlier_ratio: Option<f64>,
+    #[serde(default)]
     pub hard_measured_frames: u64,
     #[serde(default)]
     pub roi_evidence_frames: u64,

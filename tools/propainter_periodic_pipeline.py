@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("project_json", type=Path)
     prepare.add_argument("audit_json", type=Path)
     prepare.add_argument("workspace", type=Path)
+    prepare.add_argument("--video", type=Path, help="Optional source override for a targeted retry")
     prepare.add_argument(
         "--anchor-mode",
         action="store_true",
@@ -49,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     composite.add_argument("workspace", type=Path)
     composite.add_argument("inpaint_frames", type=Path)
     composite.add_argument("output", type=Path)
+    composite.add_argument("--video", type=Path, help="Optional source override for a targeted retry")
     composite.add_argument("--crf", type=int, default=14)
     composite.add_argument("--replacement-kind", choices=["text", "image"])
     composite.add_argument("--replacement-text", default="")
@@ -71,7 +73,7 @@ def crop_origin(x: float, y: float, frame_width: int, frame_height: int) -> tupl
 
 
 def profile_bounds(bbox: dict[str, float], frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
-    """Use the profile's calibrated box dimensions, including V6 padding."""
+    """Use the profile's calibrated box dimensions, including V7 padding."""
     x0 = max(0, int(round(float(bbox["x"]))))
     y0 = max(0, int(round(float(bbox["y"]))))
     x1 = min(frame_width, int(round(float(bbox["x"]) + float(bbox["width"]))))
@@ -83,20 +85,20 @@ def profile_bounds(bbox: dict[str, float], frame_width: int, frame_height: int) 
 
 def prepare(args: argparse.Namespace) -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
-    video_path = Path(project["source"]["path"])
+    video_path = args.video if args.video is not None else Path(project["source"]["path"])
     project_dir = args.project_json.parent
     profile = None
     if args.profile is not None:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         if (
-            profile.get("version") != 6
+            profile.get("version") != 7
             or profile.get("status") != "READY"
             or profile.get("preset") != "LEARNA_AI_ADAPTIVE"
             or profile.get("qualityGate", {}).get("status") != "PASSED"
         ):
-            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV6")
+            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV7")
         if profile.get("trajectoryGate", {}).get("status") != "PASSED":
-            raise RuntimeError("CalibrationProfileV6 trajectory quality gate did not pass")
+            raise RuntimeError("CalibrationProfileV7 trajectory quality gate did not pass")
         if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
             raise RuntimeError("Calibration profile frame count does not match the source video")
     mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]
@@ -303,7 +305,7 @@ def replacement_overlay(args: argparse.Namespace, frame: np.ndarray, row: dict[s
 
 def composite(args: argparse.Namespace) -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8"))
-    video_path = Path(project["source"]["path"])
+    video_path = args.video if args.video is not None else Path(project["source"]["path"])
     manifest = json.loads((args.workspace / "manifest.json").read_text(encoding="utf-8"))
     if not manifest:
         raise RuntimeError("Best-quality workspace manifest is empty")

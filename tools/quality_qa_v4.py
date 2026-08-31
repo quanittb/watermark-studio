@@ -26,7 +26,7 @@ MAX_RECTANGULAR_PATCH_SCORE = 0.20
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Streaming QualityReportV4/V5/V6")
+    parser = argparse.ArgumentParser(description="Streaming QualityReportV4/V5/V6/V7")
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("profile", type=Path)
@@ -92,7 +92,7 @@ def selected_frames(profile: dict) -> set[int]:
 
 
 def calibration_bounds(bbox: dict, source: np.ndarray, profile_version: int) -> tuple[int, int, int, int]:
-    if profile_version in (5, 6):
+    if profile_version in (5, 6, 7):
         x0 = max(0, int(round(float(bbox["x"]))))
         y0 = max(0, int(round(float(bbox["y"]))))
         x1 = min(source.shape[1], int(round(float(bbox["x"]) + float(bbox["width"]))))
@@ -290,10 +290,10 @@ def main() -> None:
     args = parse_args()
     profile = json.loads(args.profile.read_text(encoding="utf-8-sig"))
     profile_version = int(profile.get("version", 0))
-    if profile_version not in (4, 5, 6) or profile.get("status") != "READY":
-        raise RuntimeError("QualityReportV4/V5/V6 requires a READY calibration profile")
+    if profile_version not in (4, 5, 6, 7) or profile.get("status") != "READY":
+        raise RuntimeError("QualityReportV4/V5/V6/V7 requires a READY calibration profile")
     trajectory_gate = profile.get("trajectoryGate") or {}
-    if profile_version in (5, 6) and trajectory_gate.get("status") != "PASSED":
+    if profile_version in (5, 6, 7) and trajectory_gate.get("status") != "PASSED":
         raise RuntimeError(f"QualityReportV{profile_version} requires a passed trajectory gate")
     project_dir = args.profile.parent.parent
     mask_path = project_dir / profile["inferenceMaskPath"]
@@ -416,7 +416,7 @@ def main() -> None:
         and metrics["minOutsideMaskSsim"] >= GOLDEN_MIN_OUTSIDE_SSIM
         and metrics["maxSeamScore"] <= MAX_SEAM_SCORE
         and metrics["maxRectangularPatchScore"] <= MAX_RECTANGULAR_PATCH_SCORE
-        and (profile_version not in (5, 6) or trajectory_gate.get("status") == "PASSED")
+        and (profile_version not in (5, 6, 7) or trajectory_gate.get("status") == "PASSED")
     )
     report = {
         "version": profile_version,

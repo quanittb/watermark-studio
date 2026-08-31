@@ -26,6 +26,21 @@ export type FocusPreview = { frame: number; timestampSeconds: number; path: stri
 export type JobStatus = 'IMPORTED' | 'SCANNING' | 'AWAITING_REVIEW' | 'READY' | 'QUEUED' | 'PREPARING' | 'INFERENCING' | 'ENCODING' | 'VERIFYING' | 'COMPLETED' | 'NEEDS_REVIEW' | 'FAILED' | 'CANCELED' | 'INTERRUPTED';
 export type JobRecord = { id: string; projectId: string; sourceName: string; outputRoot: string | null; outputName: string | null; outputPath: string | null; scanRange: ScanRange | null; status: JobStatus; stage: string; progress: number; batchProgress: number; currentFrame: number | null; currentChunk: number | null; elapsedSeconds: number | null; etaSeconds: number | null; replacementConfig: unknown | null; hardwareProfile: string | null; attempt: number; qaReportPath: string | null; contactSheetPath: string | null; errorCode: string | null; error: string | null; createdAt: string; updatedAt: string };
 export type HardwareProfile = { gpuName: string; vramMb: number; cudaAvailable: boolean; supported: boolean; tier: 'UNSUPPORTED' | 'SAFE' | 'BALANCED' | 'HIGH' | 'MAX'; width: number; height: number; coreLength: number; context: number };
+export type RuntimeHealth = {
+  pythonPath: string | null;
+  pythonVersion: string | null;
+  ffmpegPath: string | null;
+  ffprobePath: string | null;
+  cudaAvailable: boolean;
+  gpuName: string | null;
+  vramMb: number;
+  imports: { cv2: boolean; numpy: boolean; torch: boolean };
+  propainterModelReady: boolean;
+  workspaceRoot: string;
+  freeWorkspaceBytes: number | null;
+  status: 'READY' | 'MISCONFIGURED' | 'UNSUPPORTED';
+  problems: string[];
+};
 
 export async function chooseVideoPath(): Promise<string | null> {
   const selected = await open({ multiple: false, directory: false, filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'mkv', 'webm', 'm4v'] }] });
@@ -141,6 +156,7 @@ export function readProjectAssetBytes(projectId: string, asset: string): Promise
 }
 
 export function detectHardware(): Promise<HardwareProfile> { return invoke<HardwareProfile>('detect_hardware'); }
+export function detectRuntimeHealth(): Promise<RuntimeHealth> { return invoke<RuntimeHealth>('detect_runtime_health'); }
 
 export function cancelRender(): Promise<void> {
   return invoke<void>('cancel_render');
@@ -161,13 +177,14 @@ export function getErrorMessage(error: unknown): string {
       case 'FFPROBE_FAILED': return 'Không thể đọc metadata của video này.';
       case 'FFMPEG_FAILED': return `${compact(error.message)}${stage}`;
       case 'STORAGE_FULL': return `${compact(error.message)} Hãy giải phóng dung lượng ở ổ workspace rồi chạy lại.${stage}`;
+      case 'RUNTIME_NOT_READY': return `${compact(error.message)} Mở Settings → Processing để sửa runtime trước khi chạy.${stage}`;
       case 'OPERATION_CANCELLED': return 'Tác vụ đã được hủy.';
-      case 'CALIBRATION_CORRUPT': return `${error.message} Hãy mở Review và chạy lại Calibration V6.`;
+      case 'CALIBRATION_CORRUPT': return `${error.message} Hãy mở Review và chạy lại Calibration V7.`;
       case 'INVALID_SCAN_RANGE': return `${error.message} Hãy chọn lại phạm vi frame hợp lệ trong Review.`;
       case 'ROI_OUTSIDE_SCAN_RANGE': return 'ROI evidence nằm ngoài phạm vi quét hiện tại. Hãy mở rộng phạm vi hoặc chọn ROI trong khoảng đã đặt.';
       case 'INVALID_REQUEST': {
         if (/stale|quality gate/i.test(error.message)) return `${error.message} Profile chưa READY; hãy xem diagnostics và chạy lại Auto-find & calibrate.`;
-        if (/profile hash|mask hash|fingerprint/i.test(error.message)) return `${error.message} Không dùng lại profile sau khi source/mask thay đổi; hãy regenerate V6.`;
+        if (/profile hash|mask hash|fingerprint/i.test(error.message)) return `${error.message} Không dùng lại profile sau khi source/mask thay đổi; hãy regenerate V7.`;
         return error.message;
       }
       case 'QUALITY_NEEDS_REVIEW': return `${error.message} Draft và QA vẫn được giữ để mở lại trong History.`;

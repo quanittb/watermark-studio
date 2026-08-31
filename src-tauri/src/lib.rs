@@ -48,6 +48,7 @@ pub fn run() {
             commands::project::regen_job,
             commands::project::suggest_best_quality_samples,
             commands::project::detect_hardware,
+            commands::project::detect_runtime_health,
             commands::project::cancel_render,
             commands::project::get_project_asset_path,
             commands::project::read_project_asset_bytes

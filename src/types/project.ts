@@ -50,6 +50,7 @@ export interface CalibrationProfile {
   excludedFrameCount?: number;
   outsideRangePolicy?: 'PASSTHROUGH_WARN' | string;
   detectorVersion: string | null;
+  validationVersion?: string | null;
   sourceFingerprint: { sha256: string; sizeBytes: number; frameCount: number; width: number; height: number } | null;
   profilePath: string;
   maskPath: string;
@@ -107,6 +108,19 @@ export interface CalibrationProfile {
       suggestedFrames?: number[];
       reason?: string;
     }>;
+    refinedFrames?: number;
+    refinedCoverage?: number | null;
+    holdout?: {
+      count?: number;
+      trainingCount?: number;
+      median?: number | null;
+      p95?: number | null;
+      inlierRatio?: number;
+      reason?: string | null;
+    } | null;
+    holdoutMedian?: number | null;
+    holdoutP95?: number | null;
+    holdoutInlierRatio?: number | null;
     reviewRanges?: Array<{
       startFrame: number;
       endFrame: number;

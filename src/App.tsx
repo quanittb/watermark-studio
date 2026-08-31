@@ -16,6 +16,7 @@ import {
   chooseVideoPaths,
   autoCalibrateBestQuality,
   detectHardware,
+  detectRuntimeHealth,
   enqueueBestQualityJob,
   extractFocusPreview,
   getErrorMessage,
@@ -368,6 +369,9 @@ export default function App() {
   const [hardware, setHardware] = useState<Awaited<
     ReturnType<typeof detectHardware>
   > | null>(null);
+  const [runtimeHealth, setRuntimeHealth] = useState<Awaited<
+    ReturnType<typeof detectRuntimeHealth>
+  > | null>(null);
   const [brushMode, setBrushMode] = useState<"add" | "erase">("add");
   const [brushSize, setBrushSize] = useState(6);
   const [maskOpacity, setMaskOpacity] = useState(0.65);
@@ -464,8 +468,26 @@ export default function App() {
     ? [...visibleJobs].sort((left, right) => Number(right.updatedAt) - Number(left.updatedAt))
     : visibleJobs;
   const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
+  const runtimeProblemLabel = (problem: string) => {
+    const labels: Record<string, string> = language === "vi" ? {
+      PYTHON_RUNTIME_MISSING: "Thiếu Python runtime 3.10/3.11",
+      PYTHON_IMPORT_FAILED: "Python thiếu cv2/numpy/torch",
+      FFMPEG_MISSING: "Thiếu FFmpeg hoặc ffprobe",
+      CUDA_UNAVAILABLE: "Không phát hiện CUDA/GPU đủ điều kiện",
+      PROPAINTER_MODEL_MISSING: "Thiếu model ProPainter",
+      INSUFFICIENT_STORAGE: "Workspace không đủ dung lượng",
+    } : {
+      PYTHON_RUNTIME_MISSING: "Python 3.10/3.11 runtime is missing",
+      PYTHON_IMPORT_FAILED: "Python cannot import cv2/numpy/torch",
+      FFMPEG_MISSING: "FFmpeg or ffprobe is missing",
+      CUDA_UNAVAILABLE: "CUDA/GPU is unavailable or unsupported",
+      PROPAINTER_MODEL_MISSING: "ProPainter model is missing",
+      INSUFFICIENT_STORAGE: "Workspace does not have enough free space",
+    };
+    return labels[problem] ?? problem;
+  };
   const dialogSteps = operationDialog?.task === "calibrating"
-    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V6"]
+    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V7"]
     : operationDialog?.task === "sampling"
       ? ["Read source", "Scan candidates", "Score glyph", "Build contact sheet"]
       : ["Prepare profile", "ProPainter FP32", "Encode output", "Verify QA"];
@@ -480,7 +502,12 @@ export default function App() {
 
   const refreshHardware = async () => {
     try {
-      setHardware(await detectHardware());
+      const [nextHardware, nextRuntime] = await Promise.all([
+        detectHardware(),
+        detectRuntimeHealth(),
+      ]);
+      setHardware(nextHardware);
+      setRuntimeHealth(nextRuntime);
       setMessage(language === "vi" ? "Đã cập nhật thông tin phần cứng." : "Hardware information refreshed.");
     } catch (hardwareError) {
       setError(getErrorMessage(hardwareError));
@@ -557,6 +584,9 @@ export default function App() {
       .catch(() => undefined);
     void detectHardware()
       .then(setHardware)
+      .catch(() => undefined);
+    void detectRuntimeHealth()
+      .then(setRuntimeHealth)
       .catch(() => undefined);
   }, []);
 
@@ -813,7 +843,7 @@ export default function App() {
       ]);
       activateProject(nextProject);
       setMessage(
-        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V6.",
+        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V7.",
       );
     } catch (openError) {
       setError(getErrorMessage(openError));
@@ -1279,8 +1309,8 @@ export default function App() {
         setSelection(null);
         setRoiEvidence([]);
         window.localStorage.removeItem(roiEvidenceStorageKey(updatedProject.id));
-        setMessage(`CalibrationProfileV6 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
-        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V6 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
+        setMessage(`CalibrationProfileV7 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
+        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V7 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
       } else {
         setMessage("Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.");
         const reasons = updatedProject.calibration?.trajectoryGate?.failureReasons?.join(", ") || "TRAJECTORY_UNDERCONSTRAINED";
@@ -1633,7 +1663,7 @@ export default function App() {
       });
       const editedMaskPath = await saveCalibrationMaskEdit(project.id, Array.from(new Uint8Array(await blob.arrayBuffer())));
       // The sample editor is only an evidence/descriptor step.  Always finish
-      // through the same V6 adaptive calibration service used by the main
+      // through the same V7 adaptive calibration service used by the main
       // Best-quality button so a legacy V4 profile can never reach Queue.
       const updatedProject = await autoCalibrateBestQuality(
         project.id,
@@ -1651,8 +1681,8 @@ export default function App() {
       setInspectionMode(false);
       setMessage(
         updatedProject.calibration?.quality.status === "READY"
-          ? "CalibrationProfileV6 đã vượt quality gate; có thể đưa job vào hàng đợi."
-          : "Mask đã lưu. Calibration V6 chưa vượt quality gate; hãy bổ sung ROI hoặc quét lại trước khi Queue.",
+          ? "CalibrationProfileV7 đã vượt quality gate; có thể đưa job vào hàng đợi."
+          : "Mask đã lưu. Calibration V7 chưa vượt quality gate; hãy bổ sung ROI hoặc quét lại trước khi Queue.",
       );
     } catch (saveError) {
       setError(getErrorMessage(saveError));
@@ -1865,6 +1895,19 @@ export default function App() {
                 <div className="hardware-card">
                   <div className="hardware-main"><span className="hardware-icon">GPU</span><div><strong>{hardware?.gpuName ?? (language === "vi" ? "Đang phát hiện…" : "Detecting…")}</strong><small>{hardware?.cudaAvailable ? t("cudaAvailable") : t("cudaUnavailable")}</small></div><span className={`hardware-pill ${hardware?.supported ? "supported" : "warning"}`}>{hardware?.tier ?? "—"}</span></div>
                   <div className="hardware-stats"><div><span>VRAM</span><strong>{hardware ? `${(hardware.vramMb / 1024).toFixed(1)} GB` : "—"}</strong></div><div><span>{t("aiProfile")}</span><strong>{hardware?.supported ? `${hardware.width}×${hardware.height}` : t("notSupported")}</strong></div><div><span>{t("context")}</span><strong>{hardware?.supported ? `${hardware.context} frames` : "—"}</strong></div><div><span>Queue</span><strong>{t("gpuQueue")}</strong></div></div>
+                </div>
+                <div className={`runtime-health-card runtime-${(runtimeHealth?.status ?? "MISCONFIGURED").toLowerCase()}`}>
+                  <div className="runtime-health-header">
+                    <div><span className="eyebrow">RUNTIME PREFLIGHT</span><strong>{language === "vi" ? "Sức khỏe AI runtime" : "AI runtime health"}</strong></div>
+                    <span className="hardware-pill">{runtimeHealth?.status ?? "—"}</span>
+                  </div>
+                  <div className="runtime-health-grid">
+                    <div><span>Python</span><strong>{runtimeHealth?.pythonVersion ?? "—"}</strong><small>{runtimeHealth?.pythonPath ?? (language === "vi" ? "Chưa phát hiện" : "Not detected")}</small></div>
+                    <div><span>Imports</span><strong>{runtimeHealth ? `${runtimeHealth.imports.cv2 ? "✓" : "✗"} cv2 · ${runtimeHealth.imports.numpy ? "✓" : "✗"} numpy · ${runtimeHealth.imports.torch ? "✓" : "✗"} torch` : "—"}</strong><small>{runtimeHealth?.propainterModelReady ? "ProPainter model ✓" : (language === "vi" ? "Model chưa sẵn sàng" : "Model not ready")}</small></div>
+                    <div><span>FFmpeg</span><strong>{runtimeHealth?.ffmpegPath && runtimeHealth?.ffprobePath ? "✓ Ready" : "✗ Missing"}</strong><small>{runtimeHealth?.workspaceRoot ?? "—"}</small></div>
+                  </div>
+                  {runtimeHealth && runtimeHealth.problems.length > 0 && <div className="runtime-problems"><strong>{language === "vi" ? "Cần xử lý trước khi Calibration/Render:" : "Fix before Calibration/Render:"}</strong><ul>{runtimeHealth.problems.map((problem) => <li key={problem}>{runtimeProblemLabel(problem)}</li>)}</ul></div>}
+                  {runtimeHealth?.status === "READY" && <small className="runtime-ready-note">{language === "vi" ? "Runtime đạt preflight; Queue chỉ mở khi profile V7 cũng vượt quality gate." : "Runtime preflight passed; Queue also requires a V7 profile that passes the quality gate."}</small>}
                 </div>
                 <small className="settings-note">{language === "vi" ? "GPU mạnh hơn sẽ tăng resolution/context. Mỗi GPU vẫn chỉ chạy một job ProPainter để giữ chất lượng và tránh OOM." : "A stronger GPU increases resolution/context. Each GPU still runs one ProPainter job to preserve quality and avoid OOM."}</small>
               </>}
@@ -2666,9 +2709,9 @@ export default function App() {
                   ) : (
                     loadingTask !== "sampling" && loadingTask !== "calibrating" && (<>
                       {project?.calibration?.quality.status === "READY" && project.calibration.scanRange ? (
-                        <small className="calibration-ready-note">Calibration V6 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
+                        <small className="calibration-ready-note">Calibration V7 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
                       ) : project?.calibration?.quality.status === "READY" ? (
-                        <small className="scan-range-caution">Profile V6 cũ chưa có phạm vi quét; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
+                        <small className="scan-range-caution">Profile cũ chưa có phạm vi quét hoặc chưa được V7 xác thực; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
                       ) : <small>{t("noValidSample")}</small>}
                       {roiFallbackArmed && <small className="review-queue">{t("roiFallbackActive")}</small>}
                       <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>{language === "vi" ? "Khoanh ROI tương đối" : "Draw relative ROI"}</button>
@@ -2690,7 +2733,7 @@ export default function App() {
                       onClick={() => void saveBestQualitySample()}
                       disabled={isBusy || !maskEditorReady}
                     >
-                      Save mask & run Calibration V6
+                      Save mask & run Calibration V7
                     </button>
                     </div>
                   )}

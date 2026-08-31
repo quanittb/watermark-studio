@@ -27,6 +27,27 @@ def candidate(frame: int, direct: bool) -> dict[str, object]:
 
 
 class CalibrationV6ReviewTests(unittest.TestCase):
+    def test_v7_calibration_contract_and_holdout(self) -> None:
+        rows = [candidate(frame, True) for frame in range(0, 120, 2)]
+        for row in rows:
+            row["x"] = 100.0 + float(row["frame"]) * 1.5
+            row["y"] = 200.0 + float(row["frame"]) * 0.5
+            row["refined"] = True
+        result = CALIBRATION.holdout_metrics(rows)
+        self.assertGreaterEqual(int(result["count"]), 10)
+        self.assertLessEqual(float(result["p95"]), 1e-6)
+        self.assertGreaterEqual(float(result["inlierRatio"]), 0.80)
+
+    def test_v7_holdout_rejects_overfit_path(self) -> None:
+        rows = [candidate(frame, True) for frame in range(0, 120, 2)]
+        for row in rows:
+            row["x"] = 100.0 + float(row["frame"]) * 1.5
+            row["y"] = 200.0 + float(row["frame"]) * 0.5
+            row["refined"] = True
+        for row in rows[::5]:
+            row["x"] = float(row["x"]) + 30.0
+        result = CALIBRATION.holdout_metrics(rows)
+        self.assertGreater(float(result["p95"]), 3.0)
     def test_scan_range_defaults_to_full_video(self) -> None:
         self.assertEqual(CALIBRATION.normalize_scan_range(904, None, None), (0, 903))
 

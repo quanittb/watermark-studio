@@ -26,10 +26,11 @@ const DEFAULT_PROPAINTER_PYTHON: &str = r"D:\propainter-watermark-venv\Scripts\p
 const DEFAULT_PROPAINTER_ROOT: &str = r"D:\propainter-watermark-work";
 const DEFAULT_WORK_ROOT: &str = r"D:\watermark-studio-ai-work";
 const CALIBRATION_SCRIPT: &str = "calibrate_best_quality.py";
-const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v6.py";
+const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v7.py";
 const FIND_SAMPLES_SCRIPT: &str = "find_learna_samples.py";
 const AUDIT_SCRIPT: &str = "audit_watermark_detection.py";
 const MIN_MASK_COVERAGE: u64 = 350;
+const QUALITY_QA_SCRIPT: &str = "quality_qa_v7.py";
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +78,137 @@ pub struct HardwareProfile {
     pub height: u32,
     pub core_length: u32,
     pub context: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHealth {
+    pub python_path: Option<String>,
+    pub python_version: Option<String>,
+    pub ffmpeg_path: Option<String>,
+    pub ffprobe_path: Option<String>,
+    pub cuda_available: bool,
+    pub gpu_name: Option<String>,
+    pub vram_mb: u64,
+    pub imports: RuntimeImports,
+    pub propainter_model_ready: bool,
+    pub workspace_root: String,
+    pub free_workspace_bytes: Option<u64>,
+    pub status: String,
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeImports {
+    pub cv2: bool,
+    pub numpy: bool,
+    pub torch: bool,
+}
+
+fn find_binary(name: &str) -> Option<String> {
+    Command::new("where")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .filter(|path| !path.is_empty())
+}
+
+/// Performs a side-effect-free preflight so calibration/render failures are
+/// actionable instead of surfacing later as a generic child-process error.
+pub fn detect_runtime_health() -> RuntimeHealth {
+    let python = configured_path(
+        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
+        DEFAULT_PROPAINTER_PYTHON,
+    );
+    let propainter_root =
+        configured_path("WATERMARK_STUDIO_PROPAINTER_ROOT", DEFAULT_PROPAINTER_ROOT);
+    let workspace_root = configured_path("WATERMARK_STUDIO_WORK_ROOT", DEFAULT_WORK_ROOT);
+    let mut problems = Vec::new();
+    let mut python_version = None;
+    let mut imports = RuntimeImports {
+        cv2: false,
+        numpy: false,
+        torch: false,
+    };
+    if !python.is_file() {
+        problems.push("PYTHON_RUNTIME_MISSING".to_string());
+    } else {
+        let probe = Command::new(&python)
+            .args(["-c", "import sys, json; mods={m: __import__(m) is not None for m in ('cv2','numpy','torch')}; print(json.dumps({'version':sys.version.split()[0], 'mods':mods}))"])
+            .output();
+        match probe {
+            Ok(output) if output.status.success() => {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    python_version = value
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(mods) = value.get("mods").and_then(|v| v.as_object()) {
+                        imports.cv2 = mods.get("cv2").and_then(|v| v.as_bool()).unwrap_or(false);
+                        imports.numpy =
+                            mods.get("numpy").and_then(|v| v.as_bool()).unwrap_or(false);
+                        imports.torch =
+                            mods.get("torch").and_then(|v| v.as_bool()).unwrap_or(false);
+                    }
+                } else {
+                    problems.push("PYTHON_IMPORT_FAILED".to_string());
+                }
+            }
+            _ => problems.push("PYTHON_IMPORT_FAILED".to_string()),
+        }
+    }
+    if (!imports.cv2 || !imports.numpy || !imports.torch)
+        && python.is_file()
+        && !problems.iter().any(|item| item == "PYTHON_IMPORT_FAILED")
+    {
+        problems.push("PYTHON_IMPORT_FAILED".to_string());
+    }
+    let ffmpeg_path = find_binary("ffmpeg");
+    let ffprobe_path = find_binary("ffprobe");
+    if ffmpeg_path.is_none() || ffprobe_path.is_none() {
+        problems.push("FFMPEG_MISSING".to_string());
+    }
+    let propainter_model_ready = propainter_root.join("inference_propainter.py").is_file();
+    if !propainter_model_ready {
+        problems.push("PROPAINTER_MODEL_MISSING".to_string());
+    }
+    let hardware = detect_hardware();
+    if !hardware.supported {
+        problems.push("CUDA_UNAVAILABLE".to_string());
+    }
+    let status = if problems.is_empty() {
+        "READY"
+    } else if !hardware.supported {
+        "UNSUPPORTED"
+    } else {
+        "MISCONFIGURED"
+    };
+    RuntimeHealth {
+        python_path: python
+            .is_file()
+            .then(|| python.to_string_lossy().to_string()),
+        python_version,
+        ffmpeg_path,
+        ffprobe_path,
+        cuda_available: hardware.cuda_available,
+        gpu_name: (hardware.gpu_name != "CUDA GPU not detected").then_some(hardware.gpu_name),
+        vram_mb: hardware.vram_mb,
+        imports,
+        propainter_model_ready,
+        workspace_root: workspace_root.to_string_lossy().to_string(),
+        free_workspace_bytes: None,
+        status: status.to_string(),
+        problems,
+    }
 }
 
 pub fn detect_hardware() -> HardwareProfile {
@@ -138,6 +270,13 @@ where
     F: FnMut(&str, u64, u64),
 {
     validate_project(project_directory, project)?;
+    let runtime = detect_runtime_health();
+    if runtime.status != "READY" {
+        return Err(AppError::RuntimeNotReady(format!(
+            "{}; configure Python/FFmpeg/CUDA in Settings before starting Best-quality",
+            runtime.problems.join(", ")
+        )));
+    }
     let python = configured_path(
         "WATERMARK_STUDIO_PROPAINTER_PYTHON",
         DEFAULT_PROPAINTER_PYTHON,
@@ -152,7 +291,7 @@ where
         .join("tools")
         .join("propainter_periodic_pipeline.py");
     let chunks = repo_root.join("tools").join("run_propainter_chunks.py");
-    let qa_script = repo_root.join("tools").join("quality_qa_v4.py");
+    let qa_script = repo_root.join("tools").join(QUALITY_QA_SCRIPT);
 
     require_file(&python, "ProPainter Python")?;
     require_file(
@@ -218,6 +357,7 @@ where
         replacement,
         cancel,
         0,
+        None,
         &mut progress,
     )?;
     progress("Decoding final output for QA", 4, 5);
@@ -227,11 +367,16 @@ where
         run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)
     {
         let report = qa_report_path(&draft);
-        if !quality_retry_allowed(&report) {
+        let retry_range =
+            quality_failed_range(&report, first_frame, last_profile_frame.min(last_frame));
+        if !quality_retry_allowed(&report) || retry_range.is_none() {
             return Err(first_qa_error);
         }
+        let (retry_start, retry_end) = retry_range.expect("checked above");
+        let retry_input = draft.with_file_name(format!("{output_stem}.retry-input.mp4"));
+        fs::copy(&draft, &retry_input)?;
         progress(
-            "QA phát hiện residual glyph; đang retry với mask mở rộng 2 px",
+            "QA phát hiện residual glyph; đang retry đúng difficult range với mask mở rộng 2 px",
             4,
             5,
         );
@@ -245,14 +390,16 @@ where
             &result_root,
             &propainter_root,
             &hardware,
-            first_frame,
-            last_profile_frame.min(last_frame),
+            retry_start,
+            retry_end,
             &draft,
             replacement,
             cancel,
             2,
+            Some(&retry_input),
             &mut progress,
         )?;
+        let _ = fs::remove_file(&retry_input);
         ffmpeg::verify_video_decode(&draft)?;
         run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)?;
     }
@@ -297,6 +444,7 @@ fn render_attempt(
     replacement: Option<&BestQualityReplacement>,
     cancel: &AtomicBool,
     mask_dilate: u8,
+    source_override: Option<&Path>,
     progress: &mut impl FnMut(&str, u64, u64),
 ) -> Result<(), AppError> {
     progress("Preparing full-resolution AI masks", 1, 5);
@@ -314,6 +462,9 @@ fn render_attempt(
         .arg("--end-frame")
         .arg(last_frame.to_string())
         .arg("--full-frame");
+    if let Some(video) = source_override {
+        prepare.arg("--video").arg(video);
+    }
     if mask_dilate > 0 {
         prepare.arg("--mask-dilate").arg(mask_dilate.to_string());
     }
@@ -361,6 +512,9 @@ fn render_attempt(
         .arg(workspace)
         .arg(result_root.join("merged-frames"))
         .arg(draft);
+    if let Some(video) = source_override {
+        composite.arg("--video").arg(video);
+    }
     append_replacement_arguments(&mut composite, replacement);
     run_process(&mut composite, cancel, "Encoding final video")?;
     if !draft.is_file() {
@@ -409,6 +563,25 @@ fn quality_retry_allowed(report: &Path) -> bool {
     saw_residual
 }
 
+fn quality_failed_range(report: &Path, lower: u64, upper: u64) -> Option<(u64, u64)> {
+    let body = fs::read_to_string(report).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let frames = value.get("metrics")?.get("failedFrames")?.as_array()?;
+    let mut values = frames
+        .iter()
+        .filter_map(|item| item.as_u64())
+        .filter(|frame| *frame >= lower && *frame <= upper)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some((
+        values[0].saturating_sub(2).max(lower),
+        values[values.len() - 1].saturating_add(2).min(upper),
+    ))
+}
+
 pub fn qa_report_path(output: &Path) -> PathBuf {
     output.with_extension("qa.json")
 }
@@ -451,7 +624,7 @@ where
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
-    let qa_script = repo_root.join("tools").join("quality_qa_v4.py");
+    let qa_script = repo_root.join("tools").join(QUALITY_QA_SCRIPT);
     require_file(&python, "ProPainter Python")?;
     require_file(&qa_script, "Best-quality QA script")?;
     progress("Re-validating review output", 1, 2);
@@ -512,7 +685,7 @@ pub fn calibration_metadata(
     let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path)?)
         .map_err(|error| {
             AppError::CalibrationCorrupt(format!(
-            "non-standard JSON value or truncated write; regenerate CalibrationProfileV6 ({error})"
+            "non-standard JSON value or truncated write; regenerate CalibrationProfileV7 ({error})"
         ))
         })?;
     let profile_frame_count = profile
@@ -533,14 +706,14 @@ pub fn calibration_metadata(
         .get("version")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    let trajectory_ready = !matches!(profile_version, 5 | 6)
+    let trajectory_ready = !matches!(profile_version, 5..=7)
         || (profile
             .get("trajectoryGate")
             .and_then(|value| value.get("status"))
             .and_then(|value| value.as_str())
             == Some("PASSED")
             && profile.get("trajectoryModel").is_some());
-    let is_ready = matches!(profile_version, 4..=6)
+    let is_ready = profile_version == 7
         && profile_frame_count == project.video.frame_count
         && mask_pixels >= MIN_MASK_COVERAGE
         && profile.get("status").and_then(|value| value.as_str()) == Some("READY")
@@ -851,6 +1024,13 @@ pub fn create_calibration_profile(
     cancel: &AtomicBool,
 ) -> Result<CalibrationProfile, AppError> {
     validate_layout(project)?;
+    let runtime = detect_runtime_health();
+    if runtime.status != "READY" {
+        return Err(AppError::RuntimeNotReady(format!(
+            "{}; configure Python/FFmpeg/CUDA in Settings before calibration",
+            runtime.problems.join(", ")
+        )));
+    }
     if sample.frame >= project.video.frame_count
         || sample.glyph_correlation < 0.65
         || sample.glyph_iou < 0.55
@@ -953,6 +1133,13 @@ pub fn create_adaptive_calibration_profile(
     cancel: &AtomicBool,
 ) -> Result<CalibrationProfile, AppError> {
     validate_layout(project)?;
+    let runtime = detect_runtime_health();
+    if runtime.status != "READY" {
+        return Err(AppError::RuntimeNotReady(format!(
+            "{}; configure Python/FFmpeg/CUDA in Settings before calibration",
+            runtime.problems.join(", ")
+        )));
+    }
     let scan_range = normalize_scan_range(project, scan_range)?;
     if roi_evidence.iter().any(|evidence| {
         evidence.frame < scan_range.start_frame || evidence.frame > scan_range.end_frame
@@ -1046,20 +1233,20 @@ fn validate_calibration_profile(
     let profile_path = project_directory.join("calibration").join("profile.json");
     if !profile_path.is_file() {
         return Err(AppError::InvalidRequest(
-            "Best-quality render requires a confirmed CalibrationProfileV6. Run Auto-find & calibrate in Review first."
+            "Best-quality render requires a confirmed CalibrationProfileV7. Run Auto-find & calibrate in Review first."
                 .to_string(),
         ));
     }
     let body = fs::read_to_string(&profile_path)?;
     let mut profile: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         AppError::CalibrationCorrupt(format!(
-            "non-standard JSON numbers or truncated write; regenerate V6 ({error})"
+            "non-standard JSON numbers or truncated write; regenerate V7 ({error})"
         ))
     })?;
     let metadata = calibration_metadata(project_directory, project)?;
-    if metadata.version != 6 || metadata.quality.status != CalibrationStatus::Ready {
+    if metadata.version != 7 || metadata.quality.status != CalibrationStatus::Ready {
         return Err(AppError::InvalidRequest(
-            "Calibration is stale or did not pass the V6 quality gate. Regenerate it in Review."
+            "Calibration is stale or did not pass the V7 quality gate. Regenerate it in Review."
                 .to_string(),
         ));
     }

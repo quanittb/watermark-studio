@@ -36,6 +36,8 @@ pub enum AppError {
     OperationCancelled,
     #[error("Quality review is required: {0}")]
     QualityNeedsReview(String),
+    #[error("AI runtime is not ready: {0}")]
+    RuntimeNotReady(String),
 }
 
 impl From<io::Error> for AppError {
@@ -81,6 +83,7 @@ impl From<AppError> for AppErrorDto {
             AppError::RoiOutsideScanRange => "ROI_OUTSIDE_SCAN_RANGE",
             AppError::OperationCancelled => "OPERATION_CANCELLED",
             AppError::QualityNeedsReview(_) => "QUALITY_NEEDS_REVIEW",
+            AppError::RuntimeNotReady(_) => "RUNTIME_NOT_READY",
         };
 
         let stage = match &error {
@@ -101,6 +104,7 @@ impl From<AppError> for AppErrorDto {
             AppError::StorageFull(_) => "STORAGE",
             AppError::FfmpegFailed(_) => "PROCESSING",
             AppError::QualityNeedsReview(_) => "VERIFYING",
+            AppError::RuntimeNotReady(_) => "VALIDATE_SOURCE",
             AppError::OperationCancelled => "CANCELED",
             AppError::ProjectNotFound | AppError::Io(_) | AppError::Json(_) => "STORAGE",
         };

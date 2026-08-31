@@ -82,7 +82,15 @@ MAX_REVIEW_RANGES = 8
 ROI_SATURATION_MIN_EVIDENCE = 24
 ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15
 ROI_SATURATION_MIN_PATH_COVERAGE = 0.70
-CANDIDATE_CACHE_VERSION = 2
+# V7 changes the acceptance contract: the selected path must be locally
+# refined and validated on held-out observations.  Never reuse a V6 cache for
+# final calibration, even when its source and mask hashes match.
+CANDIDATE_CACHE_VERSION = 3
+CALIBRATION_VERSION = 7
+MIN_INLIER_RATIO = 0.80
+LOCAL_REFINE_STRIDE = 2
+LOCAL_REFINE_RADIUS = 12
+LOCAL_REFINE_STEP = 3
 
 
 def should_suppress_roi_review(
@@ -112,7 +120,7 @@ def should_suppress_roi_review(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create an adaptive Learna AI CalibrationProfileV6")
+    parser = argparse.ArgumentParser(description="Create an independently validated Learna AI CalibrationProfileV7")
     parser.add_argument("project_json", type=Path)
     parser.add_argument("profile_json", type=Path)
     parser.add_argument("--roi-json", default="")
@@ -1020,6 +1028,151 @@ def interpolate(keys: list[dict[str, float | int | bool]], frame: int) -> tuple[
     return float(keys[-1]["x"]), float(keys[-1]["y"]), float(keys[-1]["scale"]), False, 0.0
 
 
+def _path_key_rows(rows: list[dict[str, float | int | bool]], epsilon: float = 2.0) -> list[dict[str, float | int | bool]]:
+    """Build a compact path without allowing an observation to validate itself."""
+    ordered = sorted(rows, key=lambda row: int(row["frame"]))
+    if len(ordered) < 2:
+        return ordered
+    points = [(float(row["x"]), float(row["y"])) for row in ordered]
+    indices = rdp_indices(points, epsilon)
+    compact = [ordered[index] for index in indices]
+    return compact if len(compact) >= 2 else [ordered[0], ordered[-1]]
+
+
+def holdout_metrics(rows: list[dict[str, float | int | bool]], epsilon: float = 2.0) -> dict[str, object]:
+    """Validate a trajectory on observations excluded from fitting.
+
+    A low residual on the same ROI anchors used to build a path is not an
+    independent quality signal.  V7 therefore reserves a deterministic,
+    time-stratified fifth of the accepted rows for this check.
+    """
+    ordered = sorted(rows, key=lambda row: int(row["frame"]))
+    if len(ordered) < 10:
+        return {
+            "count": 0,
+            "trainingCount": len(ordered),
+            "median": None,
+            "p95": None,
+            "inlierRatio": 0.0,
+            "reason": "INSUFFICIENT_HOLDOUT_OBSERVATIONS",
+        }
+    holdout = [row for index, row in enumerate(ordered) if index % 5 == 0]
+    training = [row for index, row in enumerate(ordered) if index % 5 != 0]
+    keys = _path_key_rows(training, epsilon)
+    if len(keys) < 2:
+        return {
+            "count": len(holdout),
+            "trainingCount": len(training),
+            "median": None,
+            "p95": None,
+            "inlierRatio": 0.0,
+            "reason": "HOLDOUT_PATH_UNDERCONSTRAINED",
+        }
+    residuals: list[float] = []
+    for row in holdout:
+        px, py, _, _, _ = interpolate(keys, int(row["frame"]))
+        residuals.append(math.hypot(float(row["x"]) - px, float(row["y"]) - py))
+    return {
+        "count": len(holdout),
+        "trainingCount": len(training),
+        "median": float(np.median(residuals)) if residuals else None,
+        "p95": float(np.percentile(residuals, 95)) if residuals else None,
+        "max": max(residuals, default=None),
+        "inlierRatio": float(sum(value <= 3.0 for value in residuals) / max(1, len(residuals))),
+        "reason": None,
+    }
+
+
+def refine_local_path(
+    source: Path,
+    canonical: np.ndarray,
+    seed_rows: list[dict[str, float | int | bool]],
+    active_intervals: list[dict[str, int]],
+    frame_width: int,
+    frame_height: int,
+) -> list[dict[str, float | int | bool]]:
+    """Refine a seeded trajectory at source resolution with local masked NCC.
+
+    The global scan remains sparse.  This pass only evaluates a small window
+    around the predicted path, so adding evidence does not trigger another
+    full-frame multi-scale scan.  It is deliberately conservative: a weak
+    local match is left to trajectory interpolation instead of becoming a
+    false observation.
+    """
+    if len(seed_rows) < 2 or not active_intervals:
+        return []
+    ordered = sorted(seed_rows, key=lambda row: int(row["frame"]))
+    targets: set[int] = set()
+    for interval in active_intervals:
+        start = int(interval["startFrame"])
+        end = int(interval["endFrame"])
+        targets.update(range(start, end + 1, LOCAL_REFINE_STRIDE))
+        targets.add(start)
+        targets.add(end)
+    refined: list[dict[str, float | int | bool]] = []
+    capture = cv2.VideoCapture(str(source))
+    frame_number = 0
+    try:
+        while targets:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame_number not in targets:
+                frame_number += 1
+                continue
+            px, py, predicted_scale, _, predicted_score = interpolate(ordered, frame_number)
+            best: tuple[float, float, float, float, float, float, bool] | None = None
+            for scale_factor in (0.94, 1.0, 1.06):
+                scale = max(0.55, min(1.55, predicted_scale * scale_factor))
+                box_width = CANONICAL_WIDTH * scale
+                box_height = CANONICAL_HEIGHT * scale
+                for dx in range(-LOCAL_REFINE_RADIUS, LOCAL_REFINE_RADIUS + 1, LOCAL_REFINE_STEP):
+                    for dy in range(-LOCAL_REFINE_RADIUS, LOCAL_REFINE_RADIUS + 1, LOCAL_REFINE_STEP):
+                        x = px + dx
+                        y = py + dy
+                        metrics = evaluate_box(frame, x, y, box_width, box_height, canonical)
+                        if metrics is None:
+                            continue
+                        corr, iou, contamination, large = metrics
+                        distance = math.hypot(dx, dy)
+                        rank = corr + 0.35 * iou - 0.40 * contamination - 0.015 * distance - (0.15 if large else 0.0)
+                        if best is None or rank > best[0]:
+                            best = (rank, x, y, scale, corr, iou, large)
+                            best_contamination = contamination
+            if best is not None:
+                rank, x, y, scale, corr, iou, large = best
+                contamination = best_contamination
+                refined_width = CANONICAL_WIDTH * scale
+                refined_height = CANONICAL_HEIGHT * scale
+                # Local refinement is accepted only with structural evidence;
+                # path continuity alone cannot manufacture a glyph.
+                if corr >= 0.42 and iou >= 0.22 and contamination <= 0.55 and rank >= 0.20:
+                    refined.append(
+                        {
+                            "frame": frame_number,
+                            "x": float(x),
+                            "y": float(y),
+                            "width": float(refined_width),
+                            "height": float(refined_height),
+                            "scale": float(scale),
+                            "score": float(max(0.0, min(1.0, rank))),
+                            "glyphCorrelation": float(corr),
+                            "glyphIou": float(iou),
+                            "contamination": float(contamination),
+                            "largeOutsideComponent": bool(large),
+                            "refined": True,
+                            "positionSource": "LOCAL_NCC",
+                            "predictedScore": float(predicted_score),
+                        }
+                    )
+            targets.remove(frame_number)
+            frame_number += 1
+    finally:
+        capture.release()
+    # Keep one refined row per physical frame and discard accidental duplicates.
+    return sorted({int(row["frame"]): row for row in refined}.values(), key=lambda row: int(row["frame"]))
+
+
 def contiguous_gaps(frames: Iterable[int]) -> int:
     values = sorted(set(frames))
     if len(values) < 2:
@@ -1609,23 +1762,10 @@ def main() -> None:
         # Use the seeded path exclusively; it still goes through the normal
         # residual, gap and mask gates and therefore cannot bypass review.
         tracks = [user_seed]
-    if validated_periodic_track:
-        # The generic graph is still useful for non-periodic paths, but this
-        # validated Learna path must not be replaced by a shorter terminal
-        # chain simply because blurred frames have similar background scores.
-        tracks = [validated_periodic_track]
-    elif periodic_seed_valid and tracks:
-        # Prefer the coherent path containing validated prior rows.  A second
-        # background track must never dilute the periodic residual statistics.
-        periodic_track = max(
-            tracks,
-            key=lambda segment: (
-                sum(1 for row in segment if bool(row.get("periodicPrior", False))),
-                int(segment[-1]["frame"]) - int(segment[0]["frame"]),
-            ),
-        )
-        if any(bool(row.get("periodicPrior", False)) for row in periodic_track):
-            tracks = [periodic_track]
+    # A periodic prior is retained as another graph hypothesis only.  It must
+    # never replace the free trajectory selected from image evidence: doing so
+    # made a known 360-frame clip appear correct while silently misplacing a
+    # different Learna trajectory.
     # Do not turn a long static subtitle/UI match into an active watermark
     # interval.  A real static watermark can still be recovered through
     # explicit ROI evidence; without that evidence the safe state is review,
@@ -1659,6 +1799,28 @@ def main() -> None:
     active_intervals = active_intervals_from_segments(
         tracks, frame_count, fps, scan_start, scan_end
     )
+    # V7 performs a dense, source-resolution local pass around the selected
+    # path.  This is the important bridge between a handful of ROI seeds and
+    # every active frame: it validates the predicted location instead of
+    # fitting a path only through the user's anchors.
+    refined_rows = refine_local_path(
+        source,
+        matching_mask,
+        measured,
+        active_intervals,
+        width,
+        height,
+    )
+    if refined_rows:
+        for row in refined_rows:
+            frame = int(row["frame"])
+            existing = measured_by_frame.get(frame)
+            # Prefer an image-refined row unless it is materially weaker than
+            # a hard/direct observation already present at the same frame.
+            if existing is None or not hard_gate(existing) or float(row.get("score", 0.0)) >= float(existing.get("score", 0.0)) * 0.70:
+                measured_by_frame[frame] = row
+        measured = [measured_by_frame[frame] for frame in sorted(measured_by_frame)]
+        track = measured
     # Trim a terminal chain of background candidates after the last validated
     # glyph evidence.  This handles videos whose watermark disappears before
     # the file ends without assuming a fixed end frame.
@@ -1697,7 +1859,7 @@ def main() -> None:
     roi_measured = [row for row in measured if bool(row.get("userRoi", False))]
     confirmed_measured = [
         row for row in measured
-        if hard_gate(row) or bool(row.get("userRoi", False))
+        if hard_gate(row) or bool(row.get("userRoi", False)) or bool(row.get("refined", False))
     ]
     # Provisional global matches are useful for finding active intervals but
     # can jump to a subtitle/face branch on busy shots.  Once enough explicit
@@ -1733,21 +1895,36 @@ def main() -> None:
     raw_median_residual = float(np.median(raw_residuals)) if raw_residuals else None
     raw_p95_residual = float(np.percentile(raw_residuals, 95)) if raw_residuals else None
     inlier_ratio = float(sum(value <= 3.0 for value in residuals) / max(1, len(residuals)))
+    # Compute the active denominator before any coverage gate.  The previous
+    # V6 path calculated refined coverage before ``active_count`` existed,
+    # which made a valid calibration crash with an unbound-local error.
+    active_count = sum(interval["endFrame"] - interval["startFrame"] + 1 for interval in active_intervals)
+    holdout = holdout_metrics(confirmed_measured, 2.0)
+    refined_frames = {int(row["frame"]) for row in measured if bool(row.get("refined", False))}
+    refined_coverage = min(1.0, len(refined_frames) / max(1, active_count))
     # Fit the affine prior only from independent global hard-gate rows.  The
     # periodic rows are image-validated bridge evidence and must not be able
     # to fit the model they were generated from.
     periodic_fit = fit_periodic_prior(periodic_seed_rows) if periodic_candidate_allowed else None
     periodic_transform: dict[str, float] | None = None
     if periodic_fit is not None:
-        periodic_transform, periodic_residuals = periodic_fit
-        # The prior is accepted only after global observations fit it.  Once
-        # accepted, it supplies positions through low-opacity/occluded gaps;
-        # it never creates a profile by itself.
-        residuals = periodic_residuals
-        median_residual = float(np.median(residuals))
-        p95_residual = float(np.percentile(residuals, 95))
-        inlier_ratio = float(sum(value <= 3.0 for value in residuals) / max(1, len(residuals)))
-    max_gap = max((contiguous_gaps(int(row["frame"]) for row in segment) for segment in tracks), default=10**9)
+        candidate_transform, periodic_residuals = periodic_fit
+        # Select the prior only when it is demonstrably better than the free
+        # fit on independent global observations.  Otherwise the free model
+        # remains authoritative for this video.
+        candidate_median = float(np.median(periodic_residuals))
+        candidate_p95 = float(np.percentile(periodic_residuals, 95))
+        candidate_inlier = float(sum(value <= 3.0 for value in periodic_residuals) / max(1, len(periodic_residuals)))
+        if (
+            candidate_inlier >= MIN_INLIER_RATIO
+            and (p95_residual is None or candidate_p95 <= p95_residual)
+        ):
+            periodic_transform = candidate_transform
+            residuals = periodic_residuals
+            median_residual = candidate_median
+            p95_residual = candidate_p95
+            inlier_ratio = candidate_inlier
+    max_gap = contiguous_gaps(int(row["frame"]) for row in measured) if measured else 10**9
     raw_review_ranges = review_ranges_from_gaps(
         measured,
         active_intervals,
@@ -1756,7 +1933,6 @@ def main() -> None:
         scan_start,
         scan_end,
     )
-    active_count = sum(interval["endFrame"] - interval["startFrame"] + 1 for interval in active_intervals)
     confirmed_frames = {
         int(row["frame"])
         for row in measured
@@ -1772,6 +1948,9 @@ def main() -> None:
     direct_coverage = min(1.0, len(hard_measured) * SAMPLE_STRIDE / max(1, active_count))
     confirmed_coverage = min(1.0, len(confirmed_frames) * SAMPLE_STRIDE / max(1, active_count))
     measured_coverage = min(1.0, len(measured) * SAMPLE_STRIDE / max(1, active_count))
+    validated_frames = set(int(row["frame"]) for row in hard_measured)
+    validated_frames.update(refined_frames)
+    validated_coverage = min(1.0, len(validated_frames) * LOCAL_REFINE_STRIDE / max(1, active_count))
     measured_span = (
         max(int(row["frame"]) for row in measured) - min(int(row["frame"]) for row in measured) + SAMPLE_STRIDE
         if measured
@@ -1806,13 +1985,9 @@ def main() -> None:
     # Auto-global therefore needs independently hard-gated glyph anchors
     # spanning a meaningful part of the source; ROI routes may use weaker
     # provisional anchors, but still need the temporal/uncertainty gates.
-    sparse_fit_ok = bool(
-        args.route != "AUTO_GLOBAL_TEMPLATE"
-        and len(measured) >= 12
-        and inlier_ratio >= 0.80
-        and p95_residual is not None and p95_residual <= residual_p95_tolerance
-        and len(key_track) <= max(2, int(len(measured) * 0.50))
-    )
+    # V7 never turns a sparse ROI path into READY.  Refinement must produce
+    # enough independent observations for the active interval and holdout.
+    sparse_fit_ok = False
     auto_global_evidence_ok = bool(
         args.route != "AUTO_GLOBAL_TEMPLATE"
         or (
@@ -1821,9 +1996,12 @@ def main() -> None:
             and global_span_ratio >= 0.25
         )
     )
+    holdout_p95 = holdout.get("p95")
+    holdout_median = holdout.get("median")
+    holdout_inlier_ratio = float(holdout.get("inlierRatio", 0.0) or 0.0)
     trajectory_passed = bool(
         auto_global_evidence_ok
-        and (len(measured) >= max(30, math.ceil(active_count * 0.10)) or sparse_fit_ok)
+        and len(measured) >= max(30, math.ceil(active_count * 0.10))
         # ROI-assisted calibration may use the temporally validated graph path
         # as its coverage signal; AUTO_GLOBAL must still prove coverage with
         # hard image matches.  ROI anchors are sparse by design, so using only
@@ -1832,14 +2010,18 @@ def main() -> None:
         # Residual, gap, uncertainty and mask gates remain mandatory in both
         # routes.
         and (
-            (measured_coverage if args.route != "AUTO_GLOBAL_TEMPLATE" else direct_coverage)
+            (measured_coverage if args.route != "AUTO_GLOBAL_TEMPLATE" else validated_coverage)
             >= 0.70
         )
-        and inlier_ratio >= 0.60
+        and inlier_ratio >= MIN_INLIER_RATIO
         and median_residual is not None and median_residual <= residual_tolerance
         and p95_residual is not None and p95_residual <= residual_p95_tolerance
-        and (max_gap <= MAX_GAP or sparse_fit_ok)
-        and (periodic_transform is not None or len(key_track) <= max(2, int(len(measured) * 0.35)))
+        and max_gap <= MAX_GAP
+        and refined_coverage >= 0.70
+        and holdout_p95 is not None and float(holdout_p95) <= residual_p95_tolerance
+        and holdout_median is not None and float(holdout_median) <= residual_tolerance
+        and holdout_inlier_ratio >= MIN_INLIER_RATIO
+        and len(key_track) >= 2
     )
 
     calibration_dir = args.profile_json.parent
@@ -1858,6 +2040,9 @@ def main() -> None:
 
     frame_data: list[dict[str, object]] = []
     measured_frames = {int(row["frame"]) for row in measured}
+    refined_by_frame = {
+        int(row["frame"]): row for row in measured if bool(row.get("refined", False))
+    }
     for frame in range(frame_count):
         inside_scan_range = scan_start <= frame <= scan_end
         active = bool(
@@ -1865,7 +2050,14 @@ def main() -> None:
             and measured
             and frame_in_intervals(frame, active_intervals)
         )
-        if active and periodic_transform is not None:
+        if active and frame in refined_by_frame:
+            refined = refined_by_frame[frame]
+            x = float(refined["x"])
+            y = float(refined["y"])
+            scale = float(refined.get("scale", 1.0))
+            confidence = float(refined.get("score", 0.0))
+            source_name = "local-ncc"
+        elif active and periodic_transform is not None:
             base_x, base_y = periodic_position(frame)
             x = periodic_transform["scaleX"] * base_x + periodic_transform["offsetX"]
             y = periodic_transform["scaleY"] * base_y + periodic_transform["offsetY"]
@@ -1924,6 +2116,7 @@ def main() -> None:
                 "maxGap": max_gap,
                 "keyPoints": len(key_track),
                 "directCoverage": direct_coverage,
+                "validatedCoverage": validated_coverage,
                 "confirmedCoverage": confirmed_coverage,
                 "measuredCoverage": measured_coverage,
                 "hardMeasuredCount": len(hard_measured),
@@ -1958,31 +2151,47 @@ def main() -> None:
     failure_reasons: list[str] = []
     if not measured:
         failure_reasons.append("NO_VALID_OBSERVATIONS")
-    if (
-        measured
-        and len(measured) < max(30, math.ceil(active_count * 0.10))
-        and not sparse_fit_ok
-        and periodic_transform is None
-    ):
+    if measured and len(measured) < max(30, math.ceil(active_count * 0.10)):
         failure_reasons.append("TRAJECTORY_UNDERCONSTRAINED")
     if args.route == "AUTO_GLOBAL_TEMPLATE" and not auto_global_evidence_ok:
         failure_reasons.append("INSUFFICIENT_GLOBAL_EVIDENCE")
-    # A validated periodic model can bridge an occasional sparse sample gap;
-    # only report it as unresolved when no validated model/sparse fit covers
-    # the range.  The actual sampled gap remains exposed in diagnostics.
-    if max_gap > MAX_GAP and periodic_transform is None and not sparse_fit_ok and not roi_review_saturated:
+    # A periodic prior may help prediction, but it cannot hide an unresolved
+    # active gap from the V7 gate or make the UI appear complete.
+    if max_gap > MAX_GAP:
         failure_reasons.append("UNRESOLVED_ACTIVE_RANGE")
     if roi_review_saturated and not trajectory_passed:
         failure_reasons.append("TRAJECTORY_REFINEMENT_REQUIRED")
-    if p95_residual is not None and p95_residual > 3.0:
+    if p95_residual is not None and p95_residual > residual_p95_tolerance:
         failure_reasons.append("TRAJECTORY_RESIDUAL_TOO_HIGH")
-    if inlier_ratio < 0.60:
+    if inlier_ratio < MIN_INLIER_RATIO:
         failure_reasons.append("LOW_INLIER_RATIO")
+    if refined_coverage < 0.70:
+        failure_reasons.append("INSUFFICIENT_REFINED_COVERAGE")
+    if holdout_p95 is None:
+        failure_reasons.append("HOLDOUT_UNAVAILABLE")
+    elif float(holdout_p95) > residual_p95_tolerance:
+        failure_reasons.append("HOLDOUT_RESIDUAL_TOO_HIGH")
+    if holdout_inlier_ratio < MIN_INLIER_RATIO:
+        failure_reasons.append("LOW_HOLDOUT_INLIER_RATIO")
+    # Keep trajectory segments tied to evidence found in this video.  The
+    # periodic model is optional, so never bake the old 0/120/180/300/360
+    # checkpoints into a V7 profile.
+    trajectory_segment_frames = {
+        scan_start,
+        scan_end,
+        *(int(row["frame"]) for row in key_track),
+        *(int(interval["startFrame"]) for interval in active_intervals),
+        *(int(interval["endFrame"]) for interval in active_intervals),
+    }
+    trajectory_segment_frames = {
+        frame for frame in trajectory_segment_frames if scan_start <= frame <= scan_end
+    }
     profile = {
-        "version": 6,
+        "version": CALIBRATION_VERSION,
         "status": "READY" if trajectory_passed else "NEEDS_REVIEW",
         "preset": "LEARNA_AI_ADAPTIVE",
-        "detectorVersion": "learna-global-template-v6.0",
+        "detectorVersion": "learna-global-template-v7.0-local-refine",
+        "validationVersion": "holdout-v1",
         "route": args.route,
         "sourceFingerprint": {
             "sha256": sha256_file(source),
@@ -2027,16 +2236,7 @@ def main() -> None:
                 "transform": periodic_transform,
                 "segments": [
                     {"startFrame": frame, "x": periodic_transform["scaleX"] * periodic_position(frame)[0] + periodic_transform["offsetX"], "y": periodic_transform["scaleY"] * periodic_position(frame)[1] + periodic_transform["offsetY"], "scale": 1.0}
-                    for frame in sorted(
-                        {
-                            scan_start,
-                            *(
-                                frame
-                                for frame in (0, 120, 180, 300, 360)
-                                if scan_start <= frame <= scan_end
-                            ),
-                        }
-                    )
+                    for frame in sorted(trajectory_segment_frames)
                 ],
                 "maxInterpolationGap": 6,
                 "maxObservationGap": max_gap,
@@ -2075,7 +2275,14 @@ def main() -> None:
             "rawTrajectoryResidualP95": raw_p95_residual,
             "trajectoryResidualFitSource": "CONFIRMED_CONTROL_PATH" if len(confirmed_measured) >= ROI_SATURATION_MIN_EVIDENCE else "SELECTED_CANDIDATE_PATH",
             "trajectoryResidualFitFrames": len(fit_rows),
+            "refinedFrames": len(refined_frames),
+            "refinedCoverage": refined_coverage,
+            "holdout": holdout,
+            "holdoutMedian": holdout_median,
+            "holdoutP95": holdout_p95,
+            "holdoutInlierRatio": holdout_inlier_ratio,
             "directCoverage": direct_coverage,
+            "validatedCoverage": validated_coverage,
             "confirmedCoverage": confirmed_coverage,
             "measuredCoverage": measured_coverage,
             "hardMeasuredFrames": len(hard_measured),
@@ -2099,7 +2306,14 @@ def main() -> None:
             "rawResidualP95": raw_p95_residual,
             "residualFitSource": "CONFIRMED_CONTROL_PATH" if len(confirmed_measured) >= ROI_SATURATION_MIN_EVIDENCE else "SELECTED_CANDIDATE_PATH",
             "residualFitFrames": len(fit_rows),
+            "refinedFrames": len(refined_frames),
+            "refinedCoverage": refined_coverage,
+            "holdout": holdout,
+            "holdoutMedian": holdout_median,
+            "holdoutP95": holdout_p95,
+            "holdoutInlierRatio": holdout_inlier_ratio,
             "directCoverage": direct_coverage,
+            "validatedCoverage": validated_coverage,
             "confirmedCoverage": confirmed_coverage,
             "measuredCoverage": measured_coverage,
             "hardMeasuredFrames": len(hard_measured),

@@ -1610,6 +1610,11 @@ pub fn detect_hardware() -> best_quality::HardwareProfile {
 }
 
 #[tauri::command]
+pub fn detect_runtime_health() -> best_quality::RuntimeHealth {
+    best_quality::detect_runtime_health()
+}
+
+#[tauri::command]
 pub fn cancel_render(state: State<'_, AppState>) {
     state.render_cancel.store(true, Ordering::Relaxed);
 }
