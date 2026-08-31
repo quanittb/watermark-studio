@@ -276,8 +276,10 @@ def contact_panel(frame_number: int, source: np.ndarray, output: np.ndarray, fra
     local_mask = cv2.resize(mask, (source_crop.shape[1], source_crop.shape[0]), interpolation=cv2.INTER_NEAREST)
     difference = cv2.convertScaleAbs(output_crop.astype(np.float32) - source_crop.astype(np.float32), alpha=4.0)
     mask_panel = cv2.cvtColor(local_mask, cv2.COLOR_GRAY2BGR)
+    trajectory_panel = source_crop.copy()
+    cv2.rectangle(trajectory_panel, (0, 0), (max(0, trajectory_panel.shape[1] - 1), max(0, trajectory_panel.shape[0] - 1)), (0, 220, 255), 1)
     panels = []
-    for label, panel in (("Source", source_crop), ("Output", output_crop), ("Difference x4", difference), ("Mask", mask_panel)):
+    for label, panel in (("Source", source_crop), ("Trajectory", trajectory_panel), ("Mask", mask_panel), ("Output", output_crop), ("Difference x4", difference)):
         panel = cv2.resize(panel, (255, 85), interpolation=cv2.INTER_NEAREST if label == "Mask" else cv2.INTER_AREA)
         cv2.putText(panel, label, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1, cv2.LINE_AA)
         panels.append(panel)
@@ -420,6 +422,7 @@ def main() -> None:
     )
     report = {
         "version": profile_version,
+        "reportVersion": 7,
         "status": "passed" if passed else "needs_review",
         "gate": f"quality_report_v{profile_version}",
         "source": str(args.source),
@@ -435,6 +438,7 @@ def main() -> None:
         "scanRange": {"startFrame": scan_start, "endFrame": scan_end},
         "excludedFrameCount": frame_count - scan_length,
         "outsideRangeUnchecked": scan_length != frame_count,
+        "coverageContract": "100% of maskRequired frames in scanRange; excluded frames are passthrough and metadata-only",
         "trajectory": {
             "gate": trajectory_gate,
             "model": profile.get("trajectoryModel"),
@@ -469,7 +473,7 @@ def main() -> None:
     if panels:
         sheet = np.concatenate(panels, axis=0)
     else:
-        sheet = np.zeros((85, 1020, 3), dtype=np.uint8)
+        sheet = np.zeros((85, 1275, 3), dtype=np.uint8)
     args.contact_sheet.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.contact_sheet), sheet)
     print(json.dumps(report), flush=True)

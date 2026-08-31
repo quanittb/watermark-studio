@@ -380,7 +380,7 @@ where
             4,
             5,
         );
-        render_attempt(
+        let retry_result = render_attempt(
             &python,
             &pipeline,
             &chunks,
@@ -398,19 +398,20 @@ where
             2,
             Some(&retry_input),
             &mut progress,
-        )?;
+        );
         let _ = fs::remove_file(&retry_input);
+        retry_result?;
         ffmpeg::verify_video_decode(&draft)?;
         run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)?;
     }
     let draft_report = qa_report_path(&draft);
-    let draft_sheet = draft.with_extension("qa.png");
+    let draft_sheet = qa_contact_sheet_path(&draft);
     fs::rename(&draft, &output)?;
     if draft_report.is_file() {
         fs::rename(draft_report, qa_report_path(&output))?;
     }
     if draft_sheet.is_file() {
-        fs::rename(draft_sheet, output.with_extension("qa.png"))?;
+        fs::rename(draft_sheet, qa_contact_sheet_path(&output))?;
     }
 
     progress("Best-quality render complete", 5, 5);
@@ -583,7 +584,19 @@ fn quality_failed_range(report: &Path, lower: u64, upper: u64) -> Option<(u64, u
 }
 
 pub fn qa_report_path(output: &Path) -> PathBuf {
-    output.with_extension("qa.json")
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    output.with_file_name(format!("{stem}.qa.v7.json"))
+}
+
+fn qa_contact_sheet_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    output.with_file_name(format!("{stem}.qa.v7.png"))
 }
 
 /// Re-checks an existing `.review.mp4` with the current QA implementation and
@@ -648,13 +661,13 @@ where
         .ok_or_else(|| AppError::InvalidRequest("Review output folder is invalid.".to_string()))?;
     let final_output = collision_safe_final_path(parent, review_stem)?;
     let review_report = qa_report_path(review_output);
-    let review_sheet = review_output.with_extension("qa.png");
+    let review_sheet = qa_contact_sheet_path(review_output);
     fs::rename(review_output, &final_output)?;
     if review_report.is_file() {
         fs::rename(review_report, qa_report_path(&final_output))?;
     }
     if review_sheet.is_file() {
-        fs::rename(review_sheet, final_output.with_extension("qa.png"))?;
+        fs::rename(review_sheet, qa_contact_sheet_path(&final_output))?;
     }
     progress("Review output promoted after QA", 2, 2);
     Ok(final_output)
@@ -890,7 +903,7 @@ fn run_quality_qa(
     cancel: &AtomicBool,
 ) -> Result<(), AppError> {
     let report = qa_report_path(output);
-    let contact_sheet = output.with_extension("qa.png");
+    let contact_sheet = qa_contact_sheet_path(output);
     check_cancel(cancel)?;
     let result = Command::new(python)
         .arg(qa_script)

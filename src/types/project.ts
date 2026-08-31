@@ -90,6 +90,7 @@ export interface CalibrationProfile {
     residualMedian?: number | null;
     residualP95?: number | null;
     directCoverage?: number | null;
+    validatedCoverage?: number | null;
     confirmedCoverage?: number | null;
     measuredCoverage?: number | null;
     hardMeasuredFrames?: number;
