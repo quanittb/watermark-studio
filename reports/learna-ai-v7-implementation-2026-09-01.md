@@ -11,6 +11,9 @@ diagnostics nhưng không được render final.
 
 - Checkpoint trước khi sửa: `11482702cef42a543ae91814d59f1eeb1f7462b6`.
 - Milestone V7 hiện tại: `0d5a3a42761e7296c8ad09a49ef004994b58eda9`.
+- Commit QA/retry: `926571fe5cfcd18df68c1658036bd841f2af865e`.
+- Commit regression: `0292f6bcb6a292713671ea7d6117772343f41499`.
+- Commit workspace hygiene mới nhất: `cea0e7faabff62728616da1b8082d8dfd0d9ee47`.
 - Không tạo branch mới, không reset/rebase/pull và không stage cache tạm.
 
 ## Thay đổi đã thực hiện
@@ -43,6 +46,7 @@ diagnostics nhưng không được render final.
 - Tauri executable Windows x64: PASS tại
   `src-tauri/target/release/watermark-studio.exe`.
 - MSI bundling: BLOCKED ở WiX `light.exe`; không ảnh hưởng executable đã build.
+- Executable đã được rebuild sau khi đổi artifact QA sang đuôi `.qa.v7.*`.
 
 ## Kiểm thử UI và ba video yêu cầu
 
