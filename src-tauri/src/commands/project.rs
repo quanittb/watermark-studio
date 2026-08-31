@@ -4,7 +4,7 @@ use crate::media::{best_quality, ffmpeg, ffprobe};
 use crate::media::{mask, render};
 use crate::project::model::{
     AnchorFrame, AnchorType, BoundingBox, FrameResult, ManualAnchor, Project, RemovalConfig,
-    TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
+    ScanRange, TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
 };
 use crate::project::service;
 use crate::tracking;
@@ -109,6 +109,8 @@ pub struct BestQualitySamplesRequest {
     pub roi: Option<BoundingBox>,
     #[serde(default)]
     pub anchor_frame: Option<u64>,
+    #[serde(default)]
+    pub scan_range: Option<ScanRange>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -123,12 +125,33 @@ pub struct CreateCalibrationRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AdaptiveCalibrationRequest {
     pub project_id: String,
+    /// Optional inclusive range in which Best-quality searches for WTM.
+    /// Absent means the complete source video.
+    #[serde(default)]
+    pub scan_range: Option<ScanRange>,
     #[serde(default)]
     pub roi: Option<BoundingBox>,
     /// Frame at which the user drew the broad ROI.  It is evidence for the
     /// detector, not a fixed render position.
     #[serde(default)]
     pub roi_frame: Option<u64>,
+    /// Optional canonical mask edited in the Review Mask Editor.  V6 keeps
+    /// the source geometry/trajectory independent from this mask, but uses it
+    /// for glyph scoring and the inference/blend mask artifacts.
+    #[serde(default)]
+    pub edited_mask_path: Option<String>,
+    /// Optional broad ROI evidence collected on multiple representative
+    /// frames.  Each item is used only on its own frame as a seed; the
+    /// trajectory remains free and is learned globally.
+    #[serde(default)]
+    pub roi_evidence: Vec<RoiEvidence>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoiEvidence {
+    pub frame: u64,
+    pub bbox: BoundingBox,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -419,11 +442,20 @@ pub async fn auto_calibrate_best_quality(
             .map_err(|error| AppError::Io(error.to_string()))?;
         let mut project = service::load_project(&app_data_dir, &request.project_id)?;
         let directory = service::project_directory(&app_data_dir, &project.id)?;
+        let scan_range = request.scan_range.or_else(|| {
+            project
+                .calibration
+                .as_ref()
+                .and_then(|profile| profile.scan_range)
+        });
         let calibration = best_quality::create_adaptive_calibration_profile(
             &directory,
             &project,
             request.roi.as_ref(),
             request.roi_frame,
+            request.edited_mask_path.as_deref(),
+            &request.roi_evidence,
+            scan_range,
             &cancel,
         )?;
         project.watermark.label = Some("Learna AI".to_string());
@@ -1077,6 +1109,106 @@ pub async fn list_jobs(app: AppHandle) -> Result<Vec<JobRecord>, AppErrorDto> {
     .map_err(Into::into)
 }
 
+/// Re-validates a completed review draft with the current QA rules.  This is
+/// useful when a QA classifier is corrected after a long GPU render: the
+/// existing draft is promoted only after the same fail-closed checks pass.
+#[tauri::command]
+pub async fn revalidate_review_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<JobRecord, AppErrorDto> {
+    let gpu_lock = Arc::clone(&state.best_quality_gpu_lock);
+    let store_lock = Arc::clone(&state.job_store_lock);
+    let cancel = Arc::clone(&state.render_cancel);
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let record = {
+            let _store_guard = store_lock
+                .lock()
+                .map_err(|_| AppError::Io("Job queue is unavailable.".to_string()))?;
+            jobs::load(&app_data_dir)?
+                .into_iter()
+                .find(|item| item.id == job_id)
+                .ok_or_else(|| AppError::InvalidRequest("Job not found.".to_string()))?
+        };
+        if record.status != JobStatus::NeedsReview {
+            return Err(AppError::InvalidRequest(
+                "Only a NEEDS_REVIEW job can be revalidated.".to_string(),
+            ));
+        }
+        let review_output = record.output_path.clone().ok_or_else(|| {
+            AppError::InvalidRequest(
+                "This job has no review draft to revalidate; render it again.".to_string(),
+            )
+        })?;
+        let project = service::load_project(&app_data_dir, &record.project_id)?;
+        let directory = service::project_directory(&app_data_dir, &record.project_id)?;
+        let _gpu_job = gpu_lock
+            .lock()
+            .map_err(|_| AppError::Io("Best-quality GPU queue is unavailable.".to_string()))?;
+        cancel.store(false, Ordering::Relaxed);
+        let output = best_quality::revalidate_review_output(
+            &directory,
+            &project,
+            Path::new(&review_output),
+            &cancel,
+            |phase, current, total| {
+                let _ = app.emit(
+                    "operation-progress",
+                    OperationProgress {
+                        phase: phase.to_string(),
+                        current_frame: current,
+                        total_frames: total,
+                        progress: if total == 0 {
+                            0.0
+                        } else {
+                            current as f64 / total as f64
+                        },
+                    },
+                );
+            },
+        )?;
+        let _store_guard = store_lock
+            .lock()
+            .map_err(|_| AppError::Io("Job queue is unavailable.".to_string()))?;
+        let mut records = jobs::load(&app_data_dir)?;
+        let updated = records
+            .iter_mut()
+            .find(|item| item.id == job_id)
+            .ok_or_else(|| {
+                AppError::InvalidRequest("Job disappeared from the queue.".to_string())
+            })?;
+        updated.status = JobStatus::Completed;
+        updated.stage = "Completed after QA revalidation".to_string();
+        updated.progress = 1.0;
+        updated.output_path = Some(output.to_string_lossy().to_string());
+        updated.qa_report_path = Some(
+            best_quality::qa_report_path(&output)
+                .to_string_lossy()
+                .to_string(),
+        );
+        updated.contact_sheet_path = Some(
+            output
+                .with_extension("qa.png")
+                .to_string_lossy()
+                .to_string(),
+        );
+        updated.error_code = None;
+        updated.error = None;
+        updated.updated_at = jobs::chrono_like_now();
+        let result = updated.clone();
+        jobs::save(&app_data_dir, &records)?;
+        Ok::<JobRecord, AppError>(result)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("QA revalidation failed: {error}")))?
+    .map_err(Into::into)
+}
+
 #[tauri::command]
 pub async fn enqueue_best_quality_job(
     app: AppHandle,
@@ -1111,6 +1243,10 @@ pub async fn enqueue_best_quality_job(
         JobStatus::Queued,
     );
     record.output_name = request.output_name;
+    record.scan_range = project
+        .calibration
+        .as_ref()
+        .and_then(|profile| profile.scan_range);
     record.hardware_profile = Some(format!(
         "{} · {} · {} MB",
         hardware.tier, hardware.gpu_name, hardware.vram_mb
@@ -1295,15 +1431,18 @@ fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
                             if let Ok(mut latest) = jobs::load(&app_data_dir) {
                                 if let Some(job) = latest.iter_mut().find(|job| job.id == job_id) {
                                     job.stage = phase.to_string();
+                                    // Check preparation before the generic AI label: the mask
+                                    // preparation phase also contains "AI" in its user-facing
+                                    // text, but must remain PREPARING in Queue/History.
                                     job.status =
                                         if phase.contains("QA") || phase.contains("Decoding") {
                                             JobStatus::Verifying
-                                        } else if phase.contains("AI") {
-                                            JobStatus::Inferencing
                                         } else if phase.contains("Preparing")
                                             || phase.contains("Validating")
                                         {
                                             JobStatus::Preparing
+                                        } else if phase.contains("AI") {
+                                            JobStatus::Inferencing
                                         } else {
                                             JobStatus::Encoding
                                         };
@@ -1436,6 +1575,7 @@ pub async fn suggest_best_quality_samples(
                 excluded_scene_signatures: &request.exclude_scene_signatures,
                 roi: request.roi.as_ref(),
                 anchor_frame: request.anchor_frame.unwrap_or(0),
+                scan_range: request.scan_range,
             },
             |current, total| {
                 let progress = OperationProgress {

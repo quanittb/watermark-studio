@@ -7,6 +7,7 @@ profiles are intentionally marked stale for final rendering.
 
 from calibrate_trajectory_v6 import (
     assert_finite_json,
+    choose_track,
     fit_periodic_prior,
     hard_gate,
     main,
@@ -16,6 +17,7 @@ from calibrate_trajectory_v6 import (
 
 __all__ = [
     "assert_finite_json",
+    "choose_track",
     "fit_periodic_prior",
     "hard_gate",
     "main",

@@ -14,7 +14,6 @@ import {
   chooseReplacementPath,
   chooseVideoPath,
   chooseVideoPaths,
-  createCalibrationProfile,
   autoCalibrateBestQuality,
   detectHardware,
   enqueueBestQualityJob,
@@ -27,6 +26,7 @@ import {
   markOccludedRange,
   openVideo,
   regenJob,
+  revalidateReviewJob,
   removeProject,
   readProjectAssetBytes,
   renderVideo,
@@ -42,10 +42,12 @@ import type {
   BestQualitySample,
   FocusPreview,
   JobRecord,
+  RoiHint,
 } from "./services/projectApi";
 import type {
   BoundingBox,
   RemovalConfig,
+  ScanRange,
   TrackingFrame,
   WatermarkProject,
 } from "./types/project";
@@ -65,6 +67,18 @@ type OperationProgress = {
   totalFrames: number;
   progress: number;
 };
+type OperationDialogState = {
+  task: Exclude<LoadingTask, null>;
+  status: "running" | "success" | "error";
+  title: string;
+  detail: string;
+  reviewRanges?: Array<{
+    startFrame: number;
+    endFrame: number;
+    suggestedFrames: number[];
+    reason?: string;
+  }>;
+};
 
 const defaultRemoval: RemovalConfig = {
   mode: "BLUR",
@@ -83,6 +97,13 @@ const defaultRemoval: RemovalConfig = {
   fallbackPolicy: "TEMPORAL_INPAINT_BLUR",
   inpaintVariant: "ITERATIVE",
 };
+
+// Match the calibration convergence guard in calibrate_trajectory_v6.py.  It
+// is intentionally only a review-hint guard: a saturated but inaccurate path
+// remains NEEDS_REVIEW and cannot be queued or rendered.
+const ROI_SATURATION_MIN_EVIDENCE = 24;
+const ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15;
+const ROI_SATURATION_MIN_PATH_COVERAGE = 0.70;
 const defaultBestReplacement: BestQualityReplacement = {
   kind: "text",
   text: "",
@@ -111,6 +132,88 @@ function formatTime(seconds: number): string {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function formatJobError(error: string): string {
+  const normalized = error.replace(/\s+/g, " ").trim();
+  if (/No space left on device|libpng error: Write Error/i.test(normalized)) {
+    return "Không đủ dung lượng tạm khi tạo mask AI. Hãy kiểm tra workspace/cache rồi thử Regen.";
+  }
+  if (normalized.length <= 280) return normalized;
+  return `${normalized.slice(0, 277).trimEnd()}…`;
+}
+
+function formatCalibrationReviewRanges(
+  ranges?: Array<{
+    startFrame: number;
+    endFrame: number;
+    suggestedFrames?: number[];
+  }>,
+): string {
+  if (!ranges?.length) return "";
+  return ranges
+    .slice(0, 8)
+    .map((range) => {
+      const fallback = Math.round((range.startFrame + range.endFrame) / 2);
+      const frames = (range.suggestedFrames?.length ? range.suggestedFrames : [fallback]).slice(0, 3);
+      return `${range.startFrame}–${range.endFrame} → ưu tiên ${frames[0]}${frames.length > 1 ? ` (dự phòng ${frames.slice(1).join("/")})` : ""}`;
+    })
+    .join("; ");
+}
+
+function roiEvidenceStorageKey(projectId: string): string {
+  return `watermark-studio:roi-evidence:${projectId}`;
+}
+
+function scanRangeStorageKey(projectId: string): string {
+  return `watermark-studio:scan-range:${projectId}`;
+}
+
+function readStoredScanRange(project: WatermarkProject): ScanRange {
+  const lastFrame = Math.max(0, project.video.frameCount - 1);
+  const profileRange = project.calibration?.scanRange;
+  const stored = (() => {
+    try {
+      const raw = window.localStorage.getItem(scanRangeStorageKey(project.id));
+      return raw ? JSON.parse(raw) as Partial<ScanRange> : null;
+    } catch {
+      return null;
+    }
+  })();
+  const startFrame = Number(profileRange?.startFrame ?? stored?.startFrame ?? 0);
+  const endFrame = Number(profileRange?.endFrame ?? stored?.endFrame ?? lastFrame);
+  if (!Number.isInteger(startFrame) || !Number.isInteger(endFrame) || startFrame < 0 || endFrame < startFrame || endFrame > lastFrame) {
+    return { startFrame: 0, endFrame: lastFrame };
+  }
+  return { startFrame, endFrame };
+}
+
+function readStoredRoiEvidence(projectId: string): Array<RoiHint & { frame: number }> {
+  try {
+    const raw = window.localStorage.getItem(roiEvidenceStorageKey(projectId));
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is RoiHint & { frame: number } => {
+      if (!item || typeof item !== "object") return false;
+      const value = item as Record<string, unknown>;
+      return Number.isFinite(value.frame)
+        && Number.isFinite(value.x)
+        && Number.isFinite(value.y)
+        && Number.isFinite(value.width)
+        && Number.isFinite(value.height)
+        && Number(value.width) >= 1
+        && Number(value.height) >= 1;
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function openArtifact(path: string): Promise<void> {
+  const lowerPath = path.toLowerCase();
+  const openWith = lowerPath.endsWith(".json") ? "notepad.exe" : lowerPath.endsWith(".png") ? "mspaint.exe" : undefined;
+  await openPath(path, openWith);
 }
 
 function sourceToPercent(value: number, sourceSize: number): number {
@@ -207,6 +310,7 @@ export default function App() {
   const videoFrameRef = useRef<HTMLDivElement>(null);
   const selectionSurfaceRef = useRef<HTMLDivElement>(null);
   const selectionStartRef = useRef<Point | null>(null);
+  const selectionFrameRef = useRef<number | null>(null);
   const lockedBestSampleFrameRef = useRef<number | null>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
   const maskDrawingRef = useRef(false);
@@ -216,6 +320,7 @@ export default function App() {
   const [loadingTask, setLoadingTask] = useState<LoadingTask>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [scanRange, setScanRange] = useState<ScanRange>({ startFrame: 0, endFrame: 0 });
   const [selectionMode, setSelectionMode] = useState(false);
   const [selection, setSelection] = useState<BoundingBox | null>(null);
   const [contentRect, setContentRect] = useState<ContentRect | null>(null);
@@ -236,6 +341,7 @@ export default function App() {
   >([]);
   const [rejectedSceneSignatures, setRejectedSceneSignatures] = useState<string[]>([]);
   const [roiFallbackArmed, setRoiFallbackArmed] = useState(false);
+  const [roiEvidence, setRoiEvidence] = useState<Array<RoiHint & { frame: number }>>([]);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("best");
   const [bestReplacement, setBestReplacement] =
     useState<BestQualityReplacement | null>(null);
@@ -269,6 +375,12 @@ export default function App() {
   const [maskRedo, setMaskRedo] = useState<string[]>([]);
   const [maskEditorReady, setMaskEditorReady] = useState(false);
   const [videoLoadError, setVideoLoadError] = useState<string | null>(null);
+  const [operationDialog, setOperationDialog] = useState<OperationDialogState | null>(null);
+  // Queue progress events can arrive while an adaptive calibration is still
+  // running.  Calibration currently reports its result atomically, so keep
+  // those stale queue values out of the calibration dialog instead of
+  // showing a misleading percentage/step.
+  const operationTaskRef = useRef<LoadingTask>(null);
 
   const videoUrl = project ? convertFileSrc(project.source.path) : null;
   const currentTracking =
@@ -296,6 +408,45 @@ export default function App() {
           : `${range.startFrame}–${range.endFrame}`,
       )
       .join(", ") ?? "";
+  const calibrationEvidenceFrames = new Set<number>([
+    ...(project?.calibration?.roiEvidenceFrames ?? []),
+    ...roiEvidence.map((item) => item.frame),
+  ]);
+  const calibrationGate = project?.calibration?.trajectoryGate;
+  const calibrationRoiCount = calibrationGate?.roiEvidenceFrames ?? calibrationEvidenceFrames.size;
+  const calibrationConfirmedCoverage = calibrationGate?.confirmedCoverage ?? 0;
+  const calibrationMeasuredCoverage = calibrationGate?.measuredCoverage ?? 0;
+  const calibrationResidualP95 = calibrationGate?.residualP95 ?? null;
+  const calibrationResidualTolerance = project
+    ? 3 * project.video.width / 1080
+    : 3;
+  const calibrationMaxGap = calibrationGate?.maxObservationGap
+    ?? calibrationGate?.maxInterpolationGap
+    ?? 0;
+  const roiReviewSaturated = Boolean(
+    calibrationRoiCount >= ROI_SATURATION_MIN_EVIDENCE
+    && calibrationConfirmedCoverage >= ROI_SATURATION_MIN_CONFIRMED_COVERAGE
+    && calibrationMeasuredCoverage >= ROI_SATURATION_MIN_PATH_COVERAGE
+    && (
+      calibrationMaxGap > 18
+      || (calibrationResidualP95 != null && calibrationResidualP95 > calibrationResidualTolerance)
+    ),
+  );
+  // Once the profile has broad evidence but still has a poor fit, showing the
+  // same weak clusters again only creates an endless manual-ROI loop.  The
+  // backend records the raw ranges in diagnostics; the Review UI hides them
+  // and points to automatic trajectory refinement instead.
+  const calibrationReviewRanges = roiReviewSaturated
+    ? []
+    : (calibrationGate?.reviewRanges ?? []).filter(
+      (range) => !Array.from(calibrationEvidenceFrames).some(
+        (frame) => frame >= range.startFrame && frame <= range.endFrame,
+      ),
+    );
+  const pendingCalibrationReviewRanges = calibrationReviewRanges;
+  const hasNextReviewProblem = workspaceMode === "legacy"
+    ? unresolvedCount > 0
+    : pendingCalibrationReviewRanges.length > 0;
   const isBusy = loadingTask !== null;
   const inspectionTarget =
     focusPreview?.frame === currentFrame ? displaySelection : null;
@@ -309,7 +460,23 @@ export default function App() {
   const visibleJobs = jobs.filter((job) => route === "queue"
     ? ["QUEUED", "PREPARING", "INFERENCING", "ENCODING", "VERIFYING"].includes(job.status)
     : ["COMPLETED", "NEEDS_REVIEW", "FAILED", "CANCELED", "INTERRUPTED"].includes(job.status));
+  const orderedJobs = route === "history"
+    ? [...visibleJobs].sort((left, right) => Number(right.updatedAt) - Number(left.updatedAt))
+    : visibleJobs;
   const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
+  const dialogSteps = operationDialog?.task === "calibrating"
+    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V6"]
+    : operationDialog?.task === "sampling"
+      ? ["Read source", "Scan candidates", "Score glyph", "Build contact sheet"]
+      : ["Prepare profile", "ProPainter FP32", "Encode output", "Verify QA"];
+  const dialogProgress = progress && operationDialog?.status === "running"
+    ? Math.round(clamp(progress.progress, 0, 1) * 100)
+    : operationDialog?.status === "success" || operationDialog?.status === "error" ? 100 : 0;
+  const dialogActiveStep = operationDialog?.status === "success"
+    ? dialogSteps.length - 1
+    : progress && operationDialog?.status === "running"
+      ? Math.min(dialogSteps.length - 1, Math.floor(clamp(progress.progress, 0, 0.999) * dialogSteps.length))
+      : operationDialog?.status === "error" ? Math.max(0, dialogSteps.length - 1) : 0;
 
   const refreshHardware = async () => {
     try {
@@ -348,7 +515,16 @@ export default function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<OperationProgress>("operation-progress", (event) => {
-      if (!disposed) setProgress(event.payload);
+      if (disposed) return;
+      const activeTask = operationTaskRef.current;
+      if (!activeTask || activeTask === "calibrating") return;
+      // Queue workers share the same event channel as Review operations.  A
+      // background render must not overwrite the sample-scan dialog (and a
+      // stale scan event must not move the render stepper backwards).
+      const phase = event.payload.phase.toLowerCase();
+      if (activeTask === "sampling" && !/(scan|sample|candidate|phase)/.test(phase)) return;
+      if (activeTask === "rendering" && /(scan|sample|candidate)/.test(phase)) return;
+      setProgress(event.payload);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -454,6 +630,8 @@ export default function App() {
       .then((savedProject) => {
         if (disposed) return;
         setProject(savedProject);
+        setScanRange(readStoredScanRange(savedProject));
+        setRoiEvidence(readStoredRoiEvidence(savedProject.id));
         setSelection(
           savedProject.tracking
             ? null
@@ -533,6 +711,7 @@ export default function App() {
     videoRef.current.currentTime = nextTime;
     if (!preserveBestSampleSelection) {
       lockedBestSampleFrameRef.current = null;
+      selectionFrameRef.current = null;
       setSelection(null);
       setInspectionMode(false);
     }
@@ -545,6 +724,7 @@ export default function App() {
     const nextTime = clamp(time, 0, project.video.durationSeconds);
     videoRef.current.currentTime = nextTime;
     lockedBestSampleFrameRef.current = null;
+    selectionFrameRef.current = null;
     setSelection(null);
     setInspectionMode(false);
     setCurrentTime(nextTime);
@@ -582,8 +762,12 @@ export default function App() {
     setCurrentFrame(frame);
     // Keep a confirmed candidate box visible while the seek settles on that
     // exact frame. Any navigation to another frame clears the stale box.
-    if (!selectionMode && lockedBestSampleFrameRef.current !== frame)
+    if (selectionFrameRef.current !== null && selectionFrameRef.current !== frame) {
+      selectionFrameRef.current = null;
       setSelection(null);
+    } else if (!selectionMode && lockedBestSampleFrameRef.current !== frame) {
+      setSelection(null);
+    }
   };
 
   const activateProject = (nextProject: WatermarkProject) => {
@@ -592,7 +776,10 @@ export default function App() {
       nextProject.id,
     );
     setProject(nextProject);
+    setScanRange(readStoredScanRange(nextProject));
+    setRoiEvidence(readStoredRoiEvidence(nextProject.id));
     setSelection(null);
+    selectionFrameRef.current = null;
     lockedBestSampleFrameRef.current = null;
     setContentRect(null);
     setCurrentFrame(nextProject.watermark.anchor?.frame ?? 0);
@@ -783,6 +970,7 @@ export default function App() {
       nextSelection.height >= 8
     ) {
       setSelection(nextSelection);
+      selectionFrameRef.current = currentFrame;
       setMessage(
         "Watermark selected. Review source coordinates, then save the anchor.",
       );
@@ -866,17 +1054,57 @@ export default function App() {
     if (loadingTask === "rendering" || loadingTask === "calibrating") void cancelRender();
   };
 
+  const openCalibrationReviewRange = (range: {
+    startFrame: number;
+    endFrame: number;
+    suggestedFrames?: number[];
+  }) => {
+    const frame = range.suggestedFrames?.[0]
+      ?? Math.round((range.startFrame + range.endFrame) / 2);
+    videoRef.current?.pause();
+    setPlaying(false);
+    setVideoFrame(frame);
+    setInspectionMode(false);
+    setFocusPreview(null);
+    setSelection(null);
+    selectionFrameRef.current = null;
+    setRoiFallbackArmed(true);
+    setSelectionMode(true);
+    setMessage(
+      language === "vi"
+        ? `Frame review ROI ${frame} (${range.startFrame}–${range.endFrame}). Vẽ ROI rộng rồi bấm thêm evidence; Next problem sẽ chuyển sang cụm tiếp theo.`
+        : `ROI review frame ${frame} (${range.startFrame}–${range.endFrame}). Draw a broad ROI and add evidence; Next problem will advance to the next cluster.`,
+    );
+  };
+
   const nextProblem = () => {
-    if (!project?.tracking) return;
-    const next =
-      project.tracking.problemRanges.find(
-        (range) => range.worstFrame > currentFrame,
-      ) ?? project.tracking.problemRanges[0];
+    if (!project) return;
+    if (workspaceMode === "legacy" && project.tracking?.problemRanges.length) {
+      const next =
+        project.tracking.problemRanges.find(
+          (range) => range.worstFrame > currentFrame,
+        ) ?? project.tracking.problemRanges[0];
+      if (next) {
+        setVideoFrame(next.worstFrame);
+        setMessage(
+          `Review frame ${next.worstFrame} (${next.startFrame}–${next.endFrame}).`,
+        );
+      }
+      return;
+    }
+
+    // Best-quality calibration ranges are consumed by ROI evidence.  A range
+    // is considered reviewed as soon as one evidence frame falls inside it;
+    // the next click then advances to the next unreviewed motion cluster.
+    const next = pendingCalibrationReviewRanges.find(
+      (range) => range.startFrame > currentFrame,
+    ) ?? pendingCalibrationReviewRanges[0];
     if (next) {
-      setVideoFrame(next.worstFrame);
-      setMessage(
-        `Review frame ${next.worstFrame} (${next.startFrame}–${next.endFrame}).`,
-      );
+      openCalibrationReviewRange(next);
+    } else {
+      setMessage(language === "vi"
+        ? "Đã duyệt hết các cụm ROI hiện có. Hãy chạy lại calibration để cập nhật quality gate."
+        : "All current ROI clusters have been reviewed. Run calibration again to update the quality gate.");
     }
   };
 
@@ -985,23 +1213,28 @@ export default function App() {
     if (!project || isBusy) return;
     setError(null);
     setLoadingTask("rendering");
+    operationTaskRef.current = "rendering";
+    setOperationDialog({ task: "rendering", status: "running", title: "Đang render Best-quality", detail: "Chuẩn bị profile, chạy ProPainter FP32 và kiểm tra QA…" });
     setMessage("Rendering full-resolution output…");
     try {
       const saved = await saveRemovalConfig(project.id, removal);
       setProject(saved);
       const result = await renderVideo(saved.id, removal);
       setMessage(`Render complete: ${result.outputPath}`);
+      setOperationDialog({ task: "rendering", status: "success", title: "Render hoàn tất", detail: result.outputPath });
     } catch (renderError) {
       setError(getErrorMessage(renderError));
       setMessage("Render failed");
+      setOperationDialog({ task: "rendering", status: "error", title: "Render không thành công", detail: getErrorMessage(renderError) });
     } finally {
       setLoadingTask(null);
+      operationTaskRef.current = null;
       setProgress(null);
     }
   };
 
   const queueBestQuality = async () => {
-    if (!project || isBusy || project.calibration?.quality.status !== "READY") return;
+    if (!project || isBusy || project.calibration?.quality.status !== "READY" || !project.calibration.scanRange) return;
     try {
       const job = await enqueueBestQualityJob(project.id, outputRoot || null, outputName || null, bestReplacement);
       setJobs((current) => [
@@ -1019,32 +1252,126 @@ export default function App() {
 
   const runAdaptiveCalibration = async () => {
     if (!project || isBusy) return;
-    const roi = roiFallbackArmed && selection && selection.width >= 32 && selection.height >= 16
+    const roi = roiFallbackArmed && selection && currentFrame >= scanRange.startFrame && currentFrame <= scanRange.endFrame && selection.width >= 32 && selection.height >= 16
       ? { ...selection, frame: currentFrame }
       : null;
     setError(null);
     setLoadingTask("calibrating");
+    operationTaskRef.current = "calibrating";
+    setOperationDialog({ task: "calibrating", status: "running", title: "Đang calibration Learna AI", detail: `Quét frame ${scanRange.startFrame}–${scanRange.endFrame}, fit quỹ đạo và tạo consensus mask…` });
     setProgress(null);
-    setMessage(roi ? "Đang quét Learna AI trong ROI và khớp quỹ đạo tự do…" : "Đang quét toàn video và khớp quỹ đạo Learna AI…");
+    setMessage(roi ? `Đang quét Learna AI trong ROI ở phạm vi ${scanRange.startFrame}–${scanRange.endFrame}…` : `Đang quét frame ${scanRange.startFrame}–${scanRange.endFrame} và khớp quỹ đạo Learna AI…`);
     try {
-      const updatedProject = await autoCalibrateBestQuality(project.id, roi);
+      const allEvidence = [
+        ...roiEvidence,
+        ...(roi ? [roi as RoiHint & { frame: number }] : []),
+      ].filter((item, index, items) => items.findIndex((other) => other.frame === item.frame) === index);
+      const evidence = allEvidence.filter((item) => item.frame >= scanRange.startFrame && item.frame <= scanRange.endFrame);
+      if (evidence.length !== allEvidence.length) {
+        setMessage(language === "vi" ? "Đã bỏ qua ROI evidence nằm ngoài phạm vi quét đã chọn." : "ROI evidence outside the selected scan range was ignored.");
+      }
+      const updatedProject = await autoCalibrateBestQuality(project.id, roi, null, evidence, scanRange);
       setProject(updatedProject);
       setProjects((current) => current.map((item) => item.id === updatedProject.id ? updatedProject : item));
       const status = updatedProject.calibration?.quality.status;
       if (status === "READY") {
         setRoiFallbackArmed(false);
         setSelection(null);
-        setMessage("CalibrationProfileV6 đã vượt quality gate; có thể đưa job vào hàng đợi.");
+        setRoiEvidence([]);
+        window.localStorage.removeItem(roiEvidenceStorageKey(updatedProject.id));
+        setMessage(`CalibrationProfileV6 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
+        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V6 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
       } else {
         setMessage("Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.");
+        const reasons = updatedProject.calibration?.trajectoryGate?.failureReasons?.join(", ") || "TRAJECTORY_UNDERCONSTRAINED";
+        const gate = updatedProject.calibration?.trajectoryGate;
+        const measured = updatedProject.calibration?.quality.reliableFrames ?? 0;
+        const evidenceFrames = new Set<number>([
+          ...(updatedProject.calibration?.roiEvidenceFrames ?? []),
+          ...evidence.map((item) => item.frame),
+        ]);
+        const actionableRanges = (gate?.reviewRanges ?? []).filter(
+          (range) => !Array.from(evidenceFrames).some(
+            (frame) => frame >= range.startFrame && frame <= range.endFrame,
+          ),
+        );
+        const reviewRanges = formatCalibrationReviewRanges(actionableRanges);
+        const roiCount = gate?.roiEvidenceFrames ?? roiEvidence.length;
+        const refinementRequired = gate?.failureReasons?.includes("TRAJECTORY_REFINEMENT_REQUIRED")
+          || Boolean(
+            roiCount >= ROI_SATURATION_MIN_EVIDENCE
+            && (gate?.confirmedCoverage ?? 0) >= ROI_SATURATION_MIN_CONFIRMED_COVERAGE
+            && (gate?.measuredCoverage ?? 0) >= ROI_SATURATION_MIN_PATH_COVERAGE
+            && (
+              (gate?.maxObservationGap ?? gate?.maxInterpolationGap ?? 0) > 18
+              || ((gate?.residualP95 ?? null) != null && (gate?.residualP95 ?? 0) > 3 * (project.video.width / 1080))
+            ),
+          );
+        const guidance = refinementRequired
+          ? `Đã đủ evidence đại diện (${roiCount} frame); không cần khoanh thêm ROI. Các cụm yếu còn lại được giữ trong diagnostics, còn profile cần refine quỹ đạo tự động trước khi được phép render.`
+          : reviewRanges
+          ? `Danh sách đã gom thành ${actionableRanges.length} cụm đại diện chưa có evidence. Mỗi cụm chỉ cần thêm 1 ROI ở frame ưu tiên (không cần chọn tất cả frame); chỉ thêm khi watermark còn xuất hiện, phần sau active interval không cần chọn.`
+          : roiCount >= 12
+            ? "Bạn đã cung cấp đủ ROI evidence đại diện; không cần khoanh thêm. Quỹ đạo còn cần bước refine tự động trước khi được phép render."
+            : "Profile này chưa chứa reviewRanges (lần quét cũ hoặc chưa gửi ROI evidence). Hãy đóng dialog, thêm ROI ở vài đoạn watermark còn nhìn thấy rồi chạy lại để hệ thống tính gợi ý chính xác.";
+        const hardMeasured = gate?.hardMeasuredFrames ?? 0;
+        const confirmedCoverage = gate?.confirmedCoverage;
+        const measuredCoverage = gate?.measuredCoverage;
+        const coverageText = confirmedCoverage != null
+          ? `${Math.round(confirmedCoverage * 100)}% evidence đã xác nhận`
+          : gate?.directCoverage != null
+            ? `${Math.round(gate.directCoverage * 100)}% hard-direct`
+            : "—";
+        setOperationDialog({
+          task: "calibrating",
+          status: "error",
+          title: "Calibration cần Review",
+          detail: `Quality gate chưa đạt trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}: ${reasons}. Candidate path: ${measured} frame; hard-direct: ${hardMeasured} frame; ${coverageText}; sampled path coverage: ${measuredCoverage != null ? `${Math.round(measuredCoverage * 100)}%` : "—"}; residual p95: ${gate?.residualP95 != null ? gate.residualP95.toFixed(2) : "—"} px. ${guidance} Ngoài phạm vi sẽ không được đưa vào review ROI.`,
+          reviewRanges: actionableRanges.map((range) => ({
+            startFrame: range.startFrame,
+            endFrame: range.endFrame,
+            suggestedFrames: range.suggestedFrames?.length
+              ? range.suggestedFrames
+              : [Math.round((range.startFrame + range.endFrame) / 2)],
+            reason: range.reason,
+          })),
+        });
       }
     } catch (calibrationError) {
       setError(getErrorMessage(calibrationError));
       setMessage("Không thể hoàn tất adaptive calibration");
+      setOperationDialog({ task: "calibrating", status: "error", title: "Calibration lỗi", detail: getErrorMessage(calibrationError) });
     } finally {
       setLoadingTask(null);
+      operationTaskRef.current = null;
       setProgress(null);
     }
+  };
+
+  const updateScanRange = (field: "startFrame" | "endFrame", rawValue: string) => {
+    if (!project) return;
+    const lastFrame = Math.max(0, project.video.frameCount - 1);
+    const parsed = Number(rawValue);
+    if (!Number.isInteger(parsed)) return;
+    const next = {
+      startFrame: field === "startFrame" ? parsed : scanRange.startFrame,
+      endFrame: field === "endFrame" ? parsed : scanRange.endFrame,
+    };
+    if (next.startFrame < 0 || next.startFrame > lastFrame || next.endFrame < 0 || next.endFrame > lastFrame) {
+      return;
+    }
+    if (field === "startFrame" && next.startFrame > next.endFrame) next.endFrame = next.startFrame;
+    if (field === "endFrame" && next.endFrame < next.startFrame) next.startFrame = next.endFrame;
+    if (next.startFrame > lastFrame || next.endFrame > lastFrame) return;
+    setScanRange(next);
+    window.localStorage.setItem(scanRangeStorageKey(project.id), JSON.stringify(next));
+  };
+
+  const resetScanRange = () => {
+    if (!project) return;
+    const next = { startFrame: 0, endFrame: Math.max(0, project.video.frameCount - 1) };
+    setScanRange(next);
+    window.localStorage.setItem(scanRangeStorageKey(project.id), JSON.stringify(next));
   };
 
   const chooseAndSaveOutputRoot = async () => {
@@ -1084,6 +1411,8 @@ export default function App() {
       : null;
     setError(null);
     setLoadingTask("sampling");
+    operationTaskRef.current = "sampling";
+    setOperationDialog({ task: "sampling", status: "running", title: "Đang tìm sample", detail: "Quét candidate, chấm điểm glyph và kiểm tra ổn định theo frame lân cận…" });
     setProgress(null);
     focusPreviewTokenRef.current += 1;
     setFocusPreview(null);
@@ -1102,6 +1431,7 @@ export default function App() {
         excludeSceneSignatures,
         roi: roiHint,
         anchorFrame: roiHint ? currentFrame : undefined,
+        scanRange,
       });
       setBestQualitySamples(samples);
       setSelectedBestQualitySample(null);
@@ -1113,11 +1443,14 @@ export default function App() {
           ? `Found ${samples.length} ${findAlternatives ? "alternative " : ""}samples. Click one to inspect and confirm it${roiHint ? " (ROI fallback)" : ""}.`
           : t("noValidSample"),
       );
+      setOperationDialog({ task: "sampling", status: "success", title: samples.length ? "Đã tìm thấy sample" : "Không có sample đạt gate", detail: samples.length ? `Có ${samples.length} candidate để inspect.` : "Có thể dùng ROI evidence hoặc chạy phase khác; chưa được render khi chưa có profile READY." });
     } catch (sampleError) {
       setError(getErrorMessage(sampleError));
       setMessage("Could not find a usable Best-quality sample");
+      setOperationDialog({ task: "sampling", status: "error", title: "Tìm sample lỗi", detail: getErrorMessage(sampleError) });
     } finally {
       setLoadingTask(null);
+      operationTaskRef.current = null;
       setProgress(null);
     }
   };
@@ -1128,9 +1461,30 @@ export default function App() {
     setInspectionMode(false);
     setFocusPreview(null);
     setSelection(null);
+    selectionFrameRef.current = null;
     setRoiFallbackArmed(true);
     setSelectionMode(true);
-    setMessage("Chọn một frame watermark nhìn rõ, sau đó kéo một ROI tương đối bao quanh toàn bộ chữ Learna AI.");
+    setMessage(
+      roiEvidence.length > 0
+        ? `Đã giữ ${roiEvidence.length} evidence frame. Chọn thêm một frame ở đoạn chuyển động khác rồi kéo ROI.`
+        : "Chọn một frame watermark nhìn rõ, sau đó kéo một ROI tương đối bao quanh toàn bộ chữ Learna AI.",
+    );
+  };
+
+  const addRoiEvidence = () => {
+    if (!selection || !project || selectionFrameRef.current !== currentFrame || selection.width < 32 || selection.height < 16) {
+      setMessage("ROI đã cũ hoặc chưa đủ rộng. Hãy dừng video và vẽ lại trên đúng frame đang xem.");
+      return;
+    }
+    setRoiEvidence((current) => {
+      const next = [
+        ...current.filter((item) => item.frame !== currentFrame),
+        { ...selection, frame: currentFrame },
+      ];
+      window.localStorage.setItem(roiEvidenceStorageKey(project.id), JSON.stringify(next));
+      return next;
+    });
+    setMessage(`Đã thêm ROI evidence tại frame ${currentFrame}. Có thể thêm frame ở đoạn chuyển động khác.`);
   };
 
   const inspectBestQualitySample = (sample: BestQualitySample) => {
@@ -1278,7 +1632,16 @@ export default function App() {
         }
       });
       const editedMaskPath = await saveCalibrationMaskEdit(project.id, Array.from(new Uint8Array(await blob.arrayBuffer())));
-      const updatedProject = await createCalibrationProfile(project.id, selectedBestQualitySample, editedMaskPath);
+      // The sample editor is only an evidence/descriptor step.  Always finish
+      // through the same V6 adaptive calibration service used by the main
+      // Best-quality button so a legacy V4 profile can never reach Queue.
+      const updatedProject = await autoCalibrateBestQuality(
+        project.id,
+        { ...selectedBestQualitySample.bbox, frame: selectedBestQualitySample.frame },
+        editedMaskPath,
+        [],
+        scanRange,
+      );
       setProject(updatedProject);
       setSelection(updatedProject.watermark.anchor?.bbox ?? selection);
       setBestQualitySamples([]);
@@ -1287,7 +1650,9 @@ export default function App() {
       setFocusPreview(null);
       setInspectionMode(false);
       setMessage(
-        "CalibrationProfileV4 passed the mask gate and is ready to queue.",
+        updatedProject.calibration?.quality.status === "READY"
+          ? "CalibrationProfileV6 đã vượt quality gate; có thể đưa job vào hàng đợi."
+          : "Mask đã lưu. Calibration V6 chưa vượt quality gate; hãy bổ sung ROI hoặc quét lại trước khi Queue.",
       );
     } catch (saveError) {
       setError(getErrorMessage(saveError));
@@ -1412,7 +1777,7 @@ export default function App() {
                   className="button secondary"
                   onClick={() => void queueBestQuality()}
                   disabled={
-                    project?.calibration?.quality.status !== "READY" || isBusy
+                    project?.calibration?.quality.status !== "READY" || !project?.calibration?.scanRange || isBusy
                   }
                 >
                   {t("queueRender")}
@@ -1540,13 +1905,18 @@ export default function App() {
                   Chưa có job. Hãy dùng Queue render sau khi xác nhận sample.
                 </small>
               ) : (
-                visibleJobs.map((job) => (
+                orderedJobs.map((job) => (
                   <div className="job-row" key={job.id}>
                     <div className="job-main">
                       <strong>{job.sourceName}</strong>
                       <small>
                         {job.stage} · {Math.round(job.progress * 100)}%
                       </small>
+                      {job.scanRange && (
+                        <small>
+                          {language === "vi" ? "Phạm vi quét" : "Scan range"}: {job.scanRange.startFrame}–{job.scanRange.endFrame}
+                        </small>
+                      )}
                       <progress max={1} value={job.progress} />
                     </div>
                     <span
@@ -1560,7 +1930,7 @@ export default function App() {
                           <button
                             className="button secondary"
                             onClick={() =>
-                              void openPath(job.outputPath!).catch((error) =>
+                              void openArtifact(job.outputPath!).catch((error) =>
                                 setMessage(getErrorMessage(error)),
                               )
                             }
@@ -1579,8 +1949,34 @@ export default function App() {
                           </button>
                         </>
                       )}
-                      {job.qaReportPath && <button className="button secondary" onClick={() => void openPath(job.qaReportPath!).catch((openError) => setError(getErrorMessage(openError)))}>{t("viewQa")}</button>}
-                      {job.contactSheetPath && <button className="button secondary" onClick={() => void openPath(job.contactSheetPath!).catch((openError) => setError(getErrorMessage(openError)))}>{t("contactSheet")}</button>}
+                      {job.qaReportPath && <button className="button secondary" onClick={() => { setError(null); void openArtifact(job.qaReportPath!).catch((openError) => setError(getErrorMessage(openError))); }}>{t("viewQa")}</button>}
+                      {job.contactSheetPath && <button className="button secondary" onClick={() => { setError(null); void openArtifact(job.contactSheetPath!).catch((openError) => setError(getErrorMessage(openError))); }}>{t("contactSheet")}</button>}
+                      {job.status === "NEEDS_REVIEW" && job.outputPath && (
+                        <button
+                          className="button primary"
+                          onClick={() => {
+                            setError(null);
+                            setProgress(null);
+                            setLoadingTask("rendering");
+                            operationTaskRef.current = "rendering";
+                            setOperationDialog({ task: "rendering", status: "running", title: language === "vi" ? "Đang kiểm tra lại QA" : "Re-validating QA", detail: language === "vi" ? "Đọc lại draft hiện có và chỉ chốt output khi toàn bộ frame vượt quality gate…" : "Rechecking the existing draft and promoting only after every frame passes the quality gate…" });
+                            void revalidateReviewJob(job.id).then((updated) => {
+                              setJobs((current) => current.map((item) => item.id === updated.id ? updated : item));
+                              setMessage(language === "vi" ? "Draft đã vượt QA và được chuyển thành output final." : "The draft passed QA and was promoted to the final output.");
+                              setOperationDialog({ task: "rendering", status: "success", title: language === "vi" ? "QA đạt – đã chốt output" : "QA passed – output promoted", detail: updated.outputPath ?? "" });
+                            }).catch((reviewError) => {
+                              const detail = getErrorMessage(reviewError);
+                              setError(detail);
+                              setOperationDialog({ task: "rendering", status: "error", title: language === "vi" ? "QA vẫn cần review" : "QA still needs review", detail });
+                            }).finally(() => {
+                              operationTaskRef.current = null;
+                              setLoadingTask(null);
+                            });
+                          }}
+                        >
+                          {t("recheckPromote")}
+                        </button>
+                      )}
                       {[
                         "COMPLETED",
                         "FAILED",
@@ -1623,7 +2019,7 @@ export default function App() {
                       )}
                     </div>
                     {job.error && (
-                      <small className="job-error">{job.error}</small>
+                      <small className="job-error">{formatJobError(job.error)}</small>
                     )}
                   </div>
                 ))
@@ -2142,7 +2538,81 @@ export default function App() {
                       Trajectory: {project.calibration.quality.reliableFrames} measured · {project.calibration.quality.lowConfidenceFrames} inferred
                     </small>
                   )}
+                  {project?.calibration?.scanRange && (
+                    <small className="review-queue">
+                      {language === "vi"
+                        ? `Phạm vi đã lưu: ${project.calibration.scanRange.startFrame}–${project.calibration.scanRange.endFrame}; ngoài phạm vi giữ nguyên.`
+                        : `Saved range: ${project.calibration.scanRange.startFrame}–${project.calibration.scanRange.endFrame}; outside frames are passthrough.`}
+                    </small>
+                  )}
+                  {project?.calibration && (project.calibration.excludedFrameCount ?? 0) > 0 && (
+                    <small className="scan-range-caution">
+                      {language === "vi"
+                        ? `${project.calibration.excludedFrameCount} frame ngoài phạm vi không được kiểm tra/xử lý.`
+                        : `${project.calibration.excludedFrameCount} frames outside the range were not checked or processed.`}
+                    </small>
+                  )}
                 </div>
+                {project && (
+                  <div className="scan-range-card">
+                    <div className="scan-range-header">
+                      <div>
+                        <span className="eyebrow">SCAN SCOPE</span>
+                        <strong>{language === "vi" ? "Phạm vi quét watermark" : "Watermark scan range"}</strong>
+                      </div>
+                      <span className="scan-range-badge">{scanRange.startFrame}–{scanRange.endFrame}</span>
+                    </div>
+                    <div className="scan-range-fields">
+                      <label className="field">
+                        <span>{language === "vi" ? "Frame bắt đầu" : "Start frame"}</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={Math.max(0, project.video.frameCount - 1)}
+                          value={scanRange.startFrame}
+                          onChange={(event) => updateScanRange("startFrame", event.target.value)}
+                          disabled={isBusy}
+                        />
+                        <small>{formatTime(scanRange.startFrame / project.video.fps)}</small>
+                      </label>
+                      <label className="field">
+                        <span>{language === "vi" ? "Frame kết thúc" : "End frame"}</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={Math.max(0, project.video.frameCount - 1)}
+                          value={scanRange.endFrame}
+                          onChange={(event) => updateScanRange("endFrame", event.target.value)}
+                          disabled={isBusy}
+                        />
+                        <small>{formatTime(scanRange.endFrame / project.video.fps)}</small>
+                      </label>
+                    </div>
+                    <div className="scan-range-actions">
+                      <button className="button secondary" onClick={() => updateScanRange("startFrame", String(currentFrame))} disabled={isBusy || currentFrame > scanRange.endFrame}>
+                        {language === "vi" ? "Lấy frame hiện tại làm đầu" : "Use current as start"}
+                      </button>
+                      <button className="button secondary" onClick={() => updateScanRange("endFrame", String(currentFrame))} disabled={isBusy || currentFrame < scanRange.startFrame}>
+                        {language === "vi" ? "Lấy frame hiện tại làm cuối" : "Use current as end"}
+                      </button>
+                      <button className="button secondary" onClick={resetScanRange} disabled={isBusy}>
+                        {language === "vi" ? "Quét toàn bộ video" : "Scan full video"}
+                      </button>
+                    </div>
+                    <small className="scan-range-warning">
+                      {language === "vi"
+                        ? `Đang quét frame ${scanRange.startFrame}–${scanRange.endFrame} / ${project.video.frameCount}. Frame ngoài phạm vi sẽ giữ nguyên và không yêu cầu ROI.`
+                        : `Scanning frames ${scanRange.startFrame}–${scanRange.endFrame} / ${project.video.frameCount}. Frames outside the range stay unchanged and never require ROI.`}
+                    </small>
+                    {scanRange.startFrame > 0 || scanRange.endFrame < project.video.frameCount - 1 ? (
+                      <small className="scan-range-caution">
+                        {language === "vi"
+                          ? "Nếu watermark xuất hiện ngoài phạm vi, output sẽ vẫn giữ watermark ở đoạn đó."
+                          : "If the watermark appears outside this range, the output will keep it there."}
+                      </small>
+                    ) : null}
+                  </div>
+                )}
                 <div className="best-quality-samples">
                   <span className="eyebrow">
                     1. FIND · 2. INSPECT · 3. CONFIRM
@@ -2195,10 +2665,18 @@ export default function App() {
                     </>
                   ) : (
                     loadingTask !== "sampling" && loadingTask !== "calibrating" && (<>
-                      <small>{t("noValidSample")}</small>
+                      {project?.calibration?.quality.status === "READY" && project.calibration.scanRange ? (
+                        <small className="calibration-ready-note">Calibration V6 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
+                      ) : project?.calibration?.quality.status === "READY" ? (
+                        <small className="scan-range-caution">Profile V6 cũ chưa có phạm vi quét; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
+                      ) : <small>{t("noValidSample")}</small>}
                       {roiFallbackArmed && <small className="review-queue">{t("roiFallbackActive")}</small>}
                       <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>{language === "vi" ? "Khoanh ROI tương đối" : "Draw relative ROI"}</button>
-                      {roiFallbackArmed && selection && <button className="button secondary full" onClick={() => void runAdaptiveCalibration()} disabled={isBusy}>{t("roiFit")}</button>}
+                      {roiFallbackArmed && <>
+                        {selection && <button className="button secondary full" onClick={addRoiEvidence} disabled={isBusy}>{language === "vi" ? "Thêm ROI evidence frame này" : "Add ROI evidence for this frame"}</button>}
+                        {(selection || roiEvidence.length > 0) && <small className="roi-evidence-count">{language === "vi" ? `Đã có ${roiEvidence.length} frame evidence. Nên thêm các đoạn chuyển động khác nhau.` : `${roiEvidence.length} evidence frame(s) saved. Add frames from different motion segments.`}</small>}
+                        {roiEvidence.length > 0 && <button className="button secondary full" onClick={() => void runAdaptiveCalibration()} disabled={isBusy}>{t("roiFit")}</button>}
+                      </>}
                       <button className="button secondary full" onClick={() => void findBestQualitySamples(true)} disabled={isBusy}>{t("scanAnotherPhase")}</button>
                     </>)
                   )}
@@ -2212,7 +2690,7 @@ export default function App() {
                       onClick={() => void saveBestQualitySample()}
                       disabled={isBusy || !maskEditorReady}
                     >
-                      Save verified Calibration V4 (Legacy)
+                      Save mask & run Calibration V6
                     </button>
                     </div>
                   )}
@@ -2540,12 +3018,23 @@ export default function App() {
                 {progress
                   ? ` · ${Math.round(progress.progress * 100)}% ${progress.phase}`
                   : ""}
+                {workspaceMode === "best" && pendingCalibrationReviewRanges.length > 0
+                  ? language === "vi"
+                    ? ` · ${pendingCalibrationReviewRanges.length} cụm ROI chưa duyệt`
+                    : ` · ${pendingCalibrationReviewRanges.length} ROI cluster(s) pending`
+                  : workspaceMode === "best" && calibrationReviewRanges.length > 0
+                    ? language === "vi" ? " · Đã duyệt hết cụm ROI" : " · All ROI clusters reviewed"
+                    : workspaceMode === "best" && roiReviewSaturated
+                      ? language === "vi" ? " · Đủ evidence; cần refine quỹ đạo" : " · Evidence saturated; trajectory refinement required"
+                      : ""}
               </span>
               <button
                 onClick={nextProblem}
-                disabled={!project?.tracking?.problemRanges.length || isBusy}
+                disabled={!hasNextReviewProblem || isBusy}
               >
-                Next problem →
+                {workspaceMode === "best" && pendingCalibrationReviewRanges.length > 0
+                  ? language === "vi" ? "Tiếp ROI →" : "Next ROI problem →"
+                  : language === "vi" ? "Vấn đề tiếp theo →" : "Next problem →"}
               </button>
             </div>
           </div>
@@ -2607,6 +3096,53 @@ export default function App() {
           </div>
         </section>
       </section>
+      {operationDialog && (
+        <div className="operation-dialog-backdrop" role="presentation">
+          <section className={`operation-dialog operation-${operationDialog.status}`} role="dialog" aria-modal="true" aria-label={operationDialog.title}>
+            <div className="operation-dialog-header">
+              <div>
+                <span className="eyebrow">{operationDialog.task.toUpperCase()}</span>
+                <h2>{operationDialog.title}</h2>
+              </div>
+              {operationDialog.status !== "running" && <button className="dialog-close" onClick={() => { setOperationDialog(null); setError(null); }}>×</button>}
+            </div>
+            <p className="operation-detail">{operationDialog.detail}</p>
+            {operationDialog.status === "error" && operationDialog.task === "calibrating" && operationDialog.reviewRanges?.length ? (
+              <div className="operation-review-ranges">
+                <strong>Khoảng yếu cần bổ sung ROI</strong>
+                <ul>
+                  {operationDialog.reviewRanges.map((range) => (
+                    <li key={`${range.startFrame}-${range.endFrame}`}>
+                      <span>{range.startFrame}–{range.endFrame}</span>
+                      <small>
+                        ưu tiên frame {range.suggestedFrames[0]}
+                        {range.suggestedFrames.length > 1 ? ` · dự phòng ${range.suggestedFrames.slice(1).join(", ")}` : ""}
+                      </small>
+                      <button
+                        className="button secondary compact"
+                        onClick={() => {
+                          openCalibrationReviewRange(range);
+                          setOperationDialog(null);
+                        }}
+                      >
+                        Mở frame ưu tiên
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <small>Chọn ROI tương đối rộng tại một frame được gợi ý, chỉ khi watermark còn xuất hiện.</small>
+              </div>
+            ) : null}
+            <div className="operation-progress-row"><strong>{progress || operationDialog.status !== "running" ? `${dialogProgress}%` : "…"}</strong><span>{progress ? `${progress.currentFrame}/${progress.totalFrames} frame · ${progress.phase}` : operationDialog.status === "running" ? "Đang xử lý; backend sẽ cập nhật kết quả khi hoàn tất…" : "Đã hoàn tất bước xử lý"}</span></div>
+            <div className={`operation-progress-track${!progress && operationDialog.status === "running" ? " indeterminate" : ""}`}><i style={{ width: `${dialogProgress}%` }} /></div>
+            <div className="operation-stepper">
+              {dialogSteps.map((step, index) => <div className={`operation-step${index < dialogActiveStep ? " done" : index === dialogActiveStep ? " active" : ""}`} key={step}><span>{index < dialogActiveStep ? "✓" : index + 1}</span><small>{step}</small></div>)}
+            </div>
+            {operationDialog.status === "running" && (operationDialog.task === "calibrating" || operationDialog.task === "rendering") && <button className="button secondary full" onClick={cancelBusy}>Hủy tác vụ</button>}
+            {operationDialog.status !== "running" && <button className="button primary full" onClick={() => { setOperationDialog(null); setError(null); }}>{operationDialog.status === "success" ? "Tiếp tục" : "Quay lại Review"}</button>}
+          </section>
+        </div>
+      )}
     </main>
   );
 }

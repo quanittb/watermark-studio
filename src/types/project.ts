@@ -37,15 +37,25 @@ export interface WatermarkConfig {
 
 export type CalibrationPreset = 'LEARNA_AI_PERIODIC' | 'LEARNA_AI_ADAPTIVE' | 'GENERAL_MOVING';
 export type CalibrationStatus = 'READY' | 'STALE' | 'NEEDS_REVIEW' | 'FAILED';
+export interface ScanRange {
+  startFrame: number;
+  endFrame: number;
+}
 export interface CalibrationProfile {
   version: number;
   preset: CalibrationPreset;
   route?: 'AUTO_GLOBAL_TEMPLATE' | 'AUTO_ROI_TEMPLATE' | 'ROI_FALLBACK' | 'AUTO_FIND' | string | null;
+  scanRange?: ScanRange | null;
+  scanRangeSemantics?: 'inclusive' | string;
+  excludedFrameCount?: number;
+  outsideRangePolicy?: 'PASSTHROUGH_WARN' | string;
   detectorVersion: string | null;
   sourceFingerprint: { sha256: string; sizeBytes: number; frameCount: number; width: number; height: number } | null;
   profilePath: string;
   maskPath: string;
   canonicalMaskPath: string | null;
+  editedMaskPath?: string | null;
+  editedMaskSha256?: string | null;
   autoMaskPath: string | null;
   blendMaskPath: string | null;
   brushDeltaPath: string | null;
@@ -61,6 +71,7 @@ export interface CalibrationProfile {
   difficultFrames?: number[];
   contactSheetPath?: string | null;
   activeIntervals?: Array<{ startFrame: number; endFrame: number }>;
+  roiEvidenceFrames?: number[];
   frameData?: Array<{
     frame: number;
     bbox: BoundingBox;
@@ -77,8 +88,31 @@ export interface CalibrationProfile {
     inlierRatio?: number;
     residualMedian?: number | null;
     residualP95?: number | null;
+    directCoverage?: number | null;
+    confirmedCoverage?: number | null;
+    measuredCoverage?: number | null;
+    hardMeasuredFrames?: number;
+    roiEvidenceFrames?: number;
+    maxInterpolationGap?: number;
     maxObservationGap?: number;
+    rawResidualMedian?: number | null;
+    rawResidualP95?: number | null;
+    residualFitSource?: 'CONFIRMED_CONTROL_PATH' | 'SELECTED_CANDIDATE_PATH' | string;
+    residualFitFrames?: number;
     failureReasons?: string[];
+    reviewRangesSuppressed?: boolean;
+    rawReviewRanges?: Array<{
+      startFrame: number;
+      endFrame: number;
+      suggestedFrames?: number[];
+      reason?: string;
+    }>;
+    reviewRanges?: Array<{
+      startFrame: number;
+      endFrame: number;
+      suggestedFrames?: number[];
+      reason?: string;
+    }>;
   };
   sampleFrame: number;
   frameCount: number;
@@ -196,4 +230,6 @@ export interface FrameResult {
 export interface AppError {
   code: string;
   message: string;
+  stage?: string;
+  artifactPath?: string | null;
 }

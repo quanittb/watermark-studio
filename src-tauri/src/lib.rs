@@ -42,6 +42,7 @@ pub fn run() {
             commands::project::render_video,
             commands::project::render_best_quality_video,
             commands::project::list_jobs,
+            commands::project::revalidate_review_job,
             commands::project::enqueue_best_quality_job,
             commands::project::cancel_job,
             commands::project::regen_job,

@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::project::model::ScanRange;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -39,6 +40,8 @@ pub struct JobRecord {
     #[serde(default)]
     pub output_name: Option<String>,
     pub output_path: Option<String>,
+    #[serde(default)]
+    pub scan_range: Option<ScanRange>,
     pub status: JobStatus,
     pub stage: String,
     pub progress: f64,
@@ -221,6 +224,7 @@ pub fn new_record(
         output_root,
         output_name: None,
         output_path: None,
+        scan_range: None,
         status,
         stage: "Queued".to_string(),
         progress: 0.0,

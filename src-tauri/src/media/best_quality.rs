@@ -3,7 +3,7 @@ use crate::error::AppError;
 use crate::media::ffmpeg;
 use crate::project::model::{
     BoundingBox, CalibrationPreset, CalibrationProfile, CalibrationQuality, CalibrationStatus,
-    Project, SourceFingerprint,
+    Project, ScanRange, SourceFingerprint, TrajectoryGateSummary,
 };
 use sha2::{Digest, Sha256};
 use std::env;
@@ -62,6 +62,7 @@ pub struct BestQualityScanOptions<'a> {
     pub excluded_scene_signatures: &'a [String],
     pub roi: Option<&'a BoundingBox>,
     pub anchor_frame: u64,
+    pub scan_range: Option<ScanRange>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -185,6 +186,10 @@ where
     }
 
     let workspace = workspace_root.join(&project.id);
+    // A failed/canceled attempt can leave tens of thousands of PNGs.  Keep
+    // the cleanup guard alive for every return path so a later retry cannot
+    // silently exhaust the workspace volume.
+    let _workspace_cleanup = WorkspaceCleanup(workspace.clone());
     let result_root = workspace.join("results");
     let output = next_output_path(project, output_root, output_name)?;
     let output_stem = output
@@ -197,78 +202,60 @@ where
 
     progress("Validating best-quality render", 0, 5);
     check_cancel(cancel)?;
-    progress("Preparing full-resolution AI masks", 1, 5);
-    run_process(
-        Command::new(&python)
-            .arg(&pipeline)
-            .arg("prepare")
-            .arg(&project_json)
-            .arg("-")
-            .arg(&workspace)
-            .arg("--profile")
-            .arg(&profile_path)
-            .arg("--start-frame")
-            .arg(first_frame.to_string())
-            .arg("--end-frame")
-            .arg(last_profile_frame.min(last_frame).to_string())
-            .arg("--full-frame"),
-        cancel,
-        "Preparing AI masks",
-    )?;
-
-    progress("Running temporal AI restoration", 2, 5);
-    if let Err(error) = run_propainter_chunks(
+    render_attempt(
         &python,
+        &pipeline,
         &chunks,
+        &project_json,
+        &profile_path,
         &workspace,
         &result_root,
         &propainter_root,
         &hardware,
+        first_frame,
+        last_profile_frame.min(last_frame),
+        &draft,
+        replacement,
         cancel,
+        0,
         &mut progress,
-    ) {
-        let message = error.to_string().to_ascii_lowercase();
-        if !message.contains("out of memory") && !message.contains("cuda oom") {
-            return Err(error);
-        }
-        let fallback = lower_hardware_profile(&hardware).ok_or(error)?;
-        progress(
-            &format!("CUDA OOM; retrying once with {} profile", fallback.tier),
-            2,
-            5,
-        );
-        run_propainter_chunks(
-            &python,
-            &chunks,
-            &workspace,
-            &result_root,
-            &propainter_root,
-            &fallback,
-            cancel,
-            &mut progress,
-        )?;
-    }
-
-    progress("Encoding final full-resolution video", 3, 5);
-    let mut composite = Command::new(&python);
-    composite
-        .arg(&pipeline)
-        .arg("composite")
-        .arg(&project_json)
-        .arg(&workspace)
-        .arg(result_root.join("merged-frames"))
-        .arg(&draft);
-    append_replacement_arguments(&mut composite, replacement);
-    run_process(&mut composite, cancel, "Encoding final video")?;
-    if !draft.is_file() {
-        return Err(AppError::FfmpegFailed(
-            "Best-quality pipeline completed without creating an output video.".to_string(),
-        ));
-    }
+    )?;
     progress("Decoding final output for QA", 4, 5);
     check_cancel(cancel)?;
     ffmpeg::verify_video_decode(&draft)?;
-    run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)?;
+    if let Err(first_qa_error) =
+        run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)
+    {
+        let report = qa_report_path(&draft);
+        if !quality_retry_allowed(&report) {
+            return Err(first_qa_error);
+        }
+        progress(
+            "QA phát hiện residual glyph; đang retry với mask mở rộng 2 px",
+            4,
+            5,
+        );
+        render_attempt(
+            &python,
+            &pipeline,
+            &chunks,
+            &project_json,
+            &profile_path,
+            &workspace,
+            &result_root,
+            &propainter_root,
+            &hardware,
+            first_frame,
+            last_profile_frame.min(last_frame),
+            &draft,
+            replacement,
+            cancel,
+            2,
+            &mut progress,
+        )?;
+        ffmpeg::verify_video_decode(&draft)?;
+        run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)?;
+    }
     let draft_report = qa_report_path(&draft);
     let draft_sheet = draft.with_extension("qa.png");
     fs::rename(&draft, &output)?;
@@ -279,15 +266,242 @@ where
         fs::rename(draft_sheet, output.with_extension("qa.png"))?;
     }
 
-    // These are generated cache frames, never user source or final output.
-    // They are expensive to retain (several GB) and can always be recreated.
-    let _ = fs::remove_dir_all(&workspace);
     progress("Best-quality render complete", 5, 5);
     Ok(output)
 }
 
+struct WorkspaceCleanup(PathBuf);
+
+impl Drop for WorkspaceCleanup {
+    fn drop(&mut self) {
+        // Generated cache frames are reproducible and must never be confused
+        // with source/output artifacts.  Ignore an already-removed directory.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_attempt(
+    python: &Path,
+    pipeline: &Path,
+    chunks: &Path,
+    project_json: &Path,
+    profile_path: &Path,
+    workspace: &Path,
+    result_root: &Path,
+    propainter_root: &Path,
+    hardware: &HardwareProfile,
+    first_frame: u64,
+    last_frame: u64,
+    draft: &Path,
+    replacement: Option<&BestQualityReplacement>,
+    cancel: &AtomicBool,
+    mask_dilate: u8,
+    progress: &mut impl FnMut(&str, u64, u64),
+) -> Result<(), AppError> {
+    progress("Preparing full-resolution AI masks", 1, 5);
+    let mut prepare = Command::new(python);
+    prepare
+        .arg(pipeline)
+        .arg("prepare")
+        .arg(project_json)
+        .arg("-")
+        .arg(workspace)
+        .arg("--profile")
+        .arg(profile_path)
+        .arg("--start-frame")
+        .arg(first_frame.to_string())
+        .arg("--end-frame")
+        .arg(last_frame.to_string())
+        .arg("--full-frame");
+    if mask_dilate > 0 {
+        prepare.arg("--mask-dilate").arg(mask_dilate.to_string());
+    }
+    run_process(&mut prepare, cancel, "Preparing AI masks")?;
+
+    progress("Running temporal AI restoration", 2, 5);
+    if let Err(error) = run_propainter_chunks(
+        python,
+        chunks,
+        workspace,
+        result_root,
+        propainter_root,
+        hardware,
+        cancel,
+        progress,
+    ) {
+        let message = error.to_string().to_ascii_lowercase();
+        if !message.contains("out of memory") && !message.contains("cuda oom") {
+            return Err(error);
+        }
+        let fallback = lower_hardware_profile(hardware).ok_or(error)?;
+        progress(
+            &format!("CUDA OOM; retrying once with {} profile", fallback.tier),
+            2,
+            5,
+        );
+        run_propainter_chunks(
+            python,
+            chunks,
+            workspace,
+            result_root,
+            propainter_root,
+            &fallback,
+            cancel,
+            progress,
+        )?;
+    }
+
+    progress("Encoding final full-resolution video", 3, 5);
+    let mut composite = Command::new(python);
+    composite
+        .arg(pipeline)
+        .arg("composite")
+        .arg(project_json)
+        .arg(workspace)
+        .arg(result_root.join("merged-frames"))
+        .arg(draft);
+    append_replacement_arguments(&mut composite, replacement);
+    run_process(&mut composite, cancel, "Encoding final video")?;
+    if !draft.is_file() {
+        return Err(AppError::FfmpegFailed(
+            "Best-quality pipeline completed without creating an output video.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A retry is safe only when QA identifies residual glyph energy.  Expanding
+/// a mask cannot repair a seam, patch or temporal-flicker defect and would
+/// risk altering valid background pixels, so those failures remain review-only.
+fn quality_retry_allowed(report: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(report) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    let Some(reasons) = value
+        .get("metrics")
+        .and_then(|metrics| metrics.get("failureReasons"))
+    else {
+        return false;
+    };
+    let Some(object) = reasons.as_object() else {
+        return false;
+    };
+    let mut saw_residual = false;
+    for row_reasons in object.values() {
+        let Some(items) = row_reasons.as_array() else {
+            return false;
+        };
+        for item in items {
+            let Some(reason) = item.as_str() else {
+                return false;
+            };
+            if reason == "residual_correlation" || reason == "glyph_energy_ratio" {
+                saw_residual = true;
+            } else {
+                return false;
+            }
+        }
+    }
+    saw_residual
+}
+
 pub fn qa_report_path(output: &Path) -> PathBuf {
     output.with_extension("qa.json")
+}
+
+/// Re-checks an existing `.review.mp4` with the current QA implementation and
+/// promotes it only when every required frame passes.  This is intentionally
+/// separate from rendering so a QA-rule fix (for example, distinguishing a
+/// subtitle from residual glyph energy) can safely revalidate a completed
+/// draft without consuming another GPU run.
+pub fn revalidate_review_output<F>(
+    project_directory: &Path,
+    project: &Project,
+    review_output: &Path,
+    cancel: &AtomicBool,
+    mut progress: F,
+) -> Result<PathBuf, AppError>
+where
+    F: FnMut(&str, u64, u64),
+{
+    validate_project(project_directory, project)?;
+    if !review_output.is_absolute() || !review_output.is_file() {
+        return Err(AppError::InvalidRequest(
+            "Review output was not found; render the job again before promotion.".to_string(),
+        ));
+    }
+    let file_name = review_output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::InvalidRequest("Review output name is invalid.".to_string()))?;
+    if !file_name.ends_with(".review.mp4") {
+        return Err(AppError::InvalidRequest(
+            "Only a .review.mp4 draft can be promoted after QA.".to_string(),
+        ));
+    }
+    let profile_path = validate_calibration_profile(project_directory, project)?;
+    let python = configured_path(
+        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
+        DEFAULT_PROPAINTER_PYTHON,
+    );
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
+    let qa_script = repo_root.join("tools").join("quality_qa_v4.py");
+    require_file(&python, "ProPainter Python")?;
+    require_file(&qa_script, "Best-quality QA script")?;
+    progress("Re-validating review output", 1, 2);
+    check_cancel(cancel)?;
+    run_quality_qa(
+        &python,
+        &qa_script,
+        project,
+        &profile_path,
+        review_output,
+        cancel,
+    )?;
+
+    let review_stem = review_output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_suffix(".review"))
+        .ok_or_else(|| AppError::InvalidRequest("Review output name is invalid.".to_string()))?;
+    let parent = review_output
+        .parent()
+        .ok_or_else(|| AppError::InvalidRequest("Review output folder is invalid.".to_string()))?;
+    let final_output = collision_safe_final_path(parent, review_stem)?;
+    let review_report = qa_report_path(review_output);
+    let review_sheet = review_output.with_extension("qa.png");
+    fs::rename(review_output, &final_output)?;
+    if review_report.is_file() {
+        fs::rename(review_report, qa_report_path(&final_output))?;
+    }
+    if review_sheet.is_file() {
+        fs::rename(review_sheet, final_output.with_extension("qa.png"))?;
+    }
+    progress("Review output promoted after QA", 2, 2);
+    Ok(final_output)
+}
+
+fn collision_safe_final_path(parent: &Path, stem: &str) -> Result<PathBuf, AppError> {
+    for index in 0..10_000_u32 {
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("_{index}")
+        };
+        let candidate = parent.join(format!("{stem}{suffix}.mp4"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Io(
+        "Unable to allocate a unique promoted output file name.".to_string(),
+    ))
 }
 
 pub fn calibration_metadata(
@@ -428,9 +642,20 @@ pub fn calibration_metadata(
             .get("route")
             .and_then(|value| value.as_str())
             .map(str::to_string),
+        scan_range: profile
+            .get("scanRange")
+            .and_then(|value| serde_json::from_value::<ScanRange>(value.clone()).ok()),
+        trajectory_gate: profile
+            .get("trajectoryGate")
+            .and_then(|value| serde_json::from_value::<TrajectoryGateSummary>(value.clone()).ok()),
         trajectory_model: profile.get("trajectoryModel").cloned(),
         difficult_frames: profile
             .get("difficultFrames")
+            .and_then(|value| value.as_array())
+            .map(|frames| frames.iter().filter_map(|value| value.as_u64()).collect())
+            .unwrap_or_default(),
+        roi_evidence_frames: profile
+            .get("roiEvidenceFrames")
             .and_then(|value| value.as_array())
             .map(|frames| frames.iter().filter_map(|value| value.as_u64()).collect())
             .unwrap_or_default(),
@@ -553,6 +778,13 @@ where
     let detector = repo_root.join("tools").join(FIND_SAMPLES_SCRIPT);
     require_file(&python, "Detector Python")?;
     require_file(&detector, "Learna AI detector")?;
+    let scan_range = normalize_scan_range(project, options.scan_range)?;
+    if options.roi.is_some()
+        && (options.anchor_frame < scan_range.start_frame
+            || options.anchor_frame > scan_range.end_frame)
+    {
+        return Err(AppError::RoiOutsideScanRange);
+    }
     // The detector now evaluates all six stride phases in one process.  Keep
     // the progress contract phase-based so the UI does not appear finished
     // while the remaining phases are still being scanned.
@@ -572,6 +804,11 @@ where
         .arg(serde_json::to_string(options.excluded_frames)?)
         .arg("--exclude-signatures")
         .arg(serde_json::to_string(options.excluded_scene_signatures)?);
+    command
+        .arg("--scan-start-frame")
+        .arg(scan_range.start_frame.to_string())
+        .arg("--scan-end-frame")
+        .arg(scan_range.end_frame.to_string());
     if let Some(roi) = options.roi {
         command
             .arg("--roi-json")
@@ -704,14 +941,24 @@ pub fn create_calibration_profile(
 /// Runs the adaptive Best-quality calibration.  Unlike the legacy sample
 /// route, this searches the full video with the canonical glyph and fits a
 /// trajectory model without assuming the 360-frame prior.
+#[allow(clippy::too_many_arguments)]
 pub fn create_adaptive_calibration_profile(
     project_directory: &Path,
     project: &Project,
     roi: Option<&BoundingBox>,
     roi_frame: Option<u64>,
+    edited_mask_path: Option<&str>,
+    roi_evidence: &[crate::commands::project::RoiEvidence],
+    scan_range: Option<ScanRange>,
     cancel: &AtomicBool,
 ) -> Result<CalibrationProfile, AppError> {
     validate_layout(project)?;
+    let scan_range = normalize_scan_range(project, scan_range)?;
+    if roi_evidence.iter().any(|evidence| {
+        evidence.frame < scan_range.start_frame || evidence.frame > scan_range.end_frame
+    }) {
+        return Err(AppError::RoiOutsideScanRange);
+    }
     let python = configured_path(
         "WATERMARK_STUDIO_PROPAINTER_PYTHON",
         DEFAULT_PROPAINTER_PYTHON,
@@ -726,7 +973,12 @@ pub fn create_adaptive_calibration_profile(
     if let Some(parent) = profile_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let route = if roi.is_some() {
+    // A review may collect several broad ROI evidence frames and then move
+    // the playhead away before starting calibration.  Treat that evidence as
+    // the ROI route even when there is no live selection on the current frame;
+    // otherwise the backend silently falls back to AUTO_GLOBAL_TEMPLATE and
+    // discards the user's additional evidence for the quality gate.
+    let route = if roi.is_some() || !roi_evidence.is_empty() {
         "ROI_FALLBACK"
     } else {
         "AUTO_GLOBAL_TEMPLATE"
@@ -738,11 +990,24 @@ pub fn create_adaptive_calibration_profile(
         .arg(&profile_path)
         .arg("--route")
         .arg(route);
+    command
+        .arg("--scan-start-frame")
+        .arg(scan_range.start_frame.to_string())
+        .arg("--scan-end-frame")
+        .arg(scan_range.end_frame.to_string());
     if let Some(roi) = roi {
         command.arg("--roi-json").arg(serde_json::to_string(roi)?);
     }
     if let Some(frame) = roi_frame {
         command.arg("--roi-frame").arg(frame.to_string());
+    }
+    if let Some(mask) = edited_mask_path {
+        command.arg("--edited-mask").arg(mask);
+    }
+    if !roi_evidence.is_empty() {
+        command
+            .arg("--roi-evidence-json")
+            .arg(serde_json::to_string(roi_evidence)?);
     }
     run_process(&mut command, cancel, "Adaptive Learna AI calibration")?;
     if !profile_path.is_file() {
@@ -751,6 +1016,27 @@ pub fn create_adaptive_calibration_profile(
         ));
     }
     calibration_metadata(project_directory, project)
+}
+
+fn normalize_scan_range(
+    project: &Project,
+    range: Option<ScanRange>,
+) -> Result<ScanRange, AppError> {
+    let last_frame = project.video.frame_count.saturating_sub(1);
+    let resolved = range.unwrap_or(ScanRange {
+        start_frame: 0,
+        end_frame: last_frame,
+    });
+    if project.video.frame_count == 0
+        || resolved.start_frame > resolved.end_frame
+        || resolved.end_frame >= project.video.frame_count
+    {
+        return Err(AppError::InvalidScanRange(format!(
+            "Invalid scan range {}–{}; expected 0–{} with start <= end.",
+            resolved.start_frame, resolved.end_frame, last_frame
+        )));
+    }
+    Ok(resolved)
 }
 
 fn validate_calibration_profile(
@@ -775,6 +1061,18 @@ fn validate_calibration_profile(
         return Err(AppError::InvalidRequest(
             "Calibration is stale or did not pass the V6 quality gate. Regenerate it in Review."
                 .to_string(),
+        ));
+    }
+    let scan_range = metadata.scan_range.ok_or_else(|| {
+        AppError::InvalidRequest(
+            "Calibration profile has no scan range; regenerate it in Review.".to_string(),
+        )
+    })?;
+    if scan_range.start_frame > scan_range.end_frame
+        || scan_range.end_frame >= project.video.frame_count
+    {
+        return Err(AppError::InvalidScanRange(
+            "Calibration profile scan range is outside this source video.".to_string(),
         ));
     }
     let fingerprint = metadata.source_fingerprint.as_ref().ok_or_else(|| {
@@ -1247,13 +1545,23 @@ fn run_process(command: &mut Command, cancel: &AtomicBool, phase: &str) -> Resul
                 if let Some(mut pipe) = child.stderr.take() {
                     let _ = pipe.read_to_string(&mut stderr);
                 }
-                return Err(AppError::FfmpegFailed(format!(
+                let details = format!(
                     "{phase} failed with exit code {}. {}",
                     status
                         .code()
                         .map_or("unknown".to_string(), |code| code.to_string()),
                     stderr.trim()
-                )));
+                );
+                let lower = details.to_ascii_lowercase();
+                if lower.contains("no space left on device")
+                    || lower.contains("libpng error: write error")
+                    || lower.contains("not enough space")
+                {
+                    return Err(AppError::StorageFull(format!(
+                        "{phase} không đủ dung lượng ở workspace tạm. Hãy giải phóng thêm dung lượng ở ổ workspace rồi thử lại."
+                    )));
+                }
+                return Err(AppError::FfmpegFailed(details));
             }
             Ok(None) => thread::sleep(Duration::from_millis(250)),
             Err(error) => {
@@ -1295,6 +1603,55 @@ mod tests {
             profile_sha256(&value).unwrap(),
             "7e23cbf28474f7880dc364f345fd876eef0631aed5e8e6080ec6635f0efd82f8"
         );
+    }
+
+    #[test]
+    fn scan_range_defaults_to_full_video_and_rejects_invalid_bounds() {
+        let project = Project {
+            version: 1,
+            id: "scan-range-test".to_string(),
+            source: crate::project::model::SourceVideo {
+                path: "test.mp4".to_string(),
+                file_name: "test.mp4".to_string(),
+            },
+            video: crate::project::model::VideoMetadata {
+                width: 1080,
+                height: 1920,
+                duration_seconds: 1.0,
+                fps: 30.0,
+                frame_count: 10,
+                codec: None,
+                pixel_format: None,
+            },
+            watermark: Default::default(),
+            calibration: None,
+            anchors: Vec::new(),
+            tracking: None,
+            removal: None,
+        };
+        assert_eq!(
+            normalize_scan_range(&project, None).unwrap(),
+            ScanRange {
+                start_frame: 0,
+                end_frame: 9
+            }
+        );
+        assert!(normalize_scan_range(
+            &project,
+            Some(ScanRange {
+                start_frame: 8,
+                end_frame: 7
+            })
+        )
+        .is_err());
+        assert!(normalize_scan_range(
+            &project,
+            Some(ScanRange {
+                start_frame: 0,
+                end_frame: 10
+            })
+        )
+        .is_err());
     }
 
     #[test]

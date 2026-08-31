@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--start-frame", type=int, default=0)
     prepare.add_argument("--end-frame", type=int, default=903)
     prepare.add_argument("--full-frame", action="store_true")
+    prepare.add_argument(
+        "--mask-dilate",
+        type=int,
+        default=0,
+        help="Expand the validated glyph mask for a bounded QA retry (source pixels).",
+    )
 
     composite = subparsers.add_parser("composite")
     composite.add_argument("project_json", type=Path)
@@ -83,14 +89,14 @@ def prepare(args: argparse.Namespace) -> None:
     if args.profile is not None:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         if (
-            profile.get("version") not in (4, 5, 6)
+            profile.get("version") != 6
             or profile.get("status") != "READY"
-            or profile.get("preset") not in ("LEARNA_AI_PERIODIC", "LEARNA_AI_ADAPTIVE")
+            or profile.get("preset") != "LEARNA_AI_ADAPTIVE"
             or profile.get("qualityGate", {}).get("status") != "PASSED"
         ):
-            raise RuntimeError("Unsupported or incomplete CalibrationProfileV4/V5/V6")
-        if profile.get("version") in (5, 6) and profile.get("trajectoryGate", {}).get("status") != "PASSED":
-            raise RuntimeError(f"CalibrationProfileV{profile.get('version')} trajectory quality gate did not pass")
+            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV6")
+        if profile.get("trajectoryGate", {}).get("status") != "PASSED":
+            raise RuntimeError("CalibrationProfileV6 trajectory quality gate did not pass")
         if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
             raise RuntimeError("Calibration profile frame count does not match the source video")
     mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]
@@ -99,6 +105,14 @@ def prepare(args: argparse.Namespace) -> None:
     if glyph_mask is None:
         raise RuntimeError(f"Unable to read glyph mask: {mask_path}")
     glyph_mask = np.where(glyph_mask >= 64, 255, 0).astype(np.uint8)
+    if args.mask_dilate:
+        if not 0 < args.mask_dilate <= 2:
+            raise RuntimeError("Best-quality mask retry may expand the mask by at most 2 px")
+        kernel_size = 2 * int(args.mask_dilate) + 1
+        glyph_mask = cv2.dilate(
+            glyph_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+        )
 
     if args.workspace.exists():
         shutil.rmtree(args.workspace)

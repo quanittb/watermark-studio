@@ -15,7 +15,10 @@ MIN_CORRELATION = 0.65
 MIN_IOU = 0.55
 MAX_CONTAMINATION = 0.20
 MIN_NEIGHBOURS = 3
-FIRST_FRAME = 48
+# Best-quality sample discovery must not silently skip an already-visible
+# watermark at the start of a clip.  Legacy/Preview may retain its own
+# historical start hint, but the shared detector scans from frame zero.
+FIRST_FRAME = 0
 FRAME_STRIDE = 6
 PADDING = 4
 
@@ -29,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-signatures", default="[]")
     parser.add_argument("--roi-json", default="")
     parser.add_argument("--anchor-frame", type=int, default=0)
+    parser.add_argument("--scan-start-frame", type=int)
+    parser.add_argument("--scan-end-frame", type=int)
     parser.add_argument(
         "--all-phases",
         action="store_true",
@@ -193,10 +198,13 @@ def temporal_gate(
     anchor_frame: int = 0,
     phase_shift: int = 0,
     local_offset: tuple[float, float] = (0.0, 0.0),
+    scan_start: int = 0,
+    scan_end: int | None = None,
 ) -> tuple[int, float]:
     passed = 0
     scores: list[float] = []
-    for neighbour in range(max(FIRST_FRAME, frame_number - 2), min(frame_count, frame_number + 3)):
+    bounded_end = frame_count - 1 if scan_end is None else min(frame_count - 1, scan_end)
+    for neighbour in range(max(scan_start, frame_number - 2), min(bounded_end + 1, frame_number + 3)):
         frame = read_frame(capture, neighbour)
         if frame is None:
             continue
@@ -222,6 +230,12 @@ def main() -> None:
     project = json.loads(args.project_json.read_text(encoding="utf-8-sig"))
     source = Path(project["source"]["path"])
     frame_count = int(project["video"]["frameCount"])
+    scan_start = 0 if args.scan_start_frame is None else int(args.scan_start_frame)
+    scan_end = frame_count - 1 if args.scan_end_frame is None else int(args.scan_end_frame)
+    if scan_start < 0 or scan_end >= frame_count or scan_start > scan_end:
+        raise RuntimeError(
+            f"Invalid scan range {scan_start}–{scan_end}; expected 0–{frame_count - 1} with start <= end"
+        )
     excluded = [int(value) for value in json.loads(args.exclude_frames)]
     excluded_signatures = {str(value) for value in json.loads(args.exclude_signatures)}
     roi = json.loads(args.roi_json) if args.roi_json.strip() else None
@@ -230,7 +244,9 @@ def main() -> None:
         if not required.issubset(roi) or float(roi["width"]) < 8 or float(roi["height"]) < 8:
             raise RuntimeError("ROI hint must contain x, y, width and height of at least 8 pixels")
         roi = {key: float(roi[key]) for key in required}
-    anchor_frame = max(0, min(int(args.anchor_frame), frame_count - 1))
+        if not scan_start <= int(args.anchor_frame) <= scan_end:
+            raise RuntimeError("ROI anchor frame is outside the selected scan range")
+    anchor_frame = max(scan_start, min(int(args.anchor_frame), scan_end))
     phase_shift, _, _ = resolve_trajectory(roi, anchor_frame)
     canonical = load_canonical()
     args.output_directory.mkdir(parents=True, exist_ok=True)
@@ -250,7 +266,8 @@ def main() -> None:
             else [args.scan_round % FRAME_STRIDE]
         )
         for phase in phases:
-            for frame_number in range(FIRST_FRAME + phase, frame_count, FRAME_STRIDE):
+            first = scan_start + ((phase - scan_start) % FRAME_STRIDE)
+            for frame_number in range(first, scan_end + 1, FRAME_STRIDE):
                 if any(abs(frame_number - rejected) < 72 for rejected in excluded):
                     continue
                 frame = read_frame(capture, frame_number)
@@ -260,7 +277,7 @@ def main() -> None:
                 candidate_mask = extract_mask(crop)
                 if correlation < MIN_CORRELATION or iou < MIN_IOU or contamination > MAX_CONTAMINATION or large:
                     continue
-                neighbours, temporal_score = temporal_gate(capture, frame_number, frame_count, canonical, roi, anchor_frame, phase_shift, local_offset)
+                neighbours, temporal_score = temporal_gate(capture, frame_number, frame_count, canonical, roi, anchor_frame, phase_shift, local_offset, scan_start, scan_end)
                 if neighbours < MIN_NEIGHBOURS:
                     continue
                 complexity = background_complexity(crop, canonical)

@@ -14,6 +14,8 @@ pub enum AppError {
     FfprobeFailed(String),
     #[error("ffmpeg failed: {0}")]
     FfmpegFailed(String),
+    #[error("Storage capacity is insufficient: {0}")]
+    StorageFull(String),
     #[error("The watermark bounding box is invalid.")]
     InvalidBoundingBox,
     #[error("Project was not found.")]
@@ -26,6 +28,10 @@ pub enum AppError {
     CalibrationCorrupt(String),
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+    #[error("Invalid scan range: {0}")]
+    InvalidScanRange(String),
+    #[error("ROI evidence is outside the selected scan range.")]
+    RoiOutsideScanRange,
     #[error("Operation cancelled.")]
     OperationCancelled,
     #[error("Quality review is required: {0}")]
@@ -49,6 +55,11 @@ impl From<serde_json::Error> for AppError {
 pub struct AppErrorDto {
     pub code: String,
     pub message: String,
+    /// Stable processing stage for the UI dialog; clients should not need to
+    /// parse the human-readable message to decide where to resume.
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
 }
 
 impl From<AppError> for AppErrorDto {
@@ -59,19 +70,45 @@ impl From<AppError> for AppErrorDto {
             AppError::FfmpegNotFound => "FFMPEG_NOT_FOUND",
             AppError::FfprobeFailed(_) => "FFPROBE_FAILED",
             AppError::FfmpegFailed(_) => "FFMPEG_FAILED",
+            AppError::StorageFull(_) => "STORAGE_FULL",
             AppError::InvalidBoundingBox => "INVALID_BOUNDING_BOX",
             AppError::ProjectNotFound => "PROJECT_NOT_FOUND",
             AppError::Io(_) => "IO_ERROR",
             AppError::Json(_) => "JSON_ERROR",
             AppError::CalibrationCorrupt(_) => "CALIBRATION_CORRUPT",
             AppError::InvalidRequest(_) => "INVALID_REQUEST",
+            AppError::InvalidScanRange(_) => "INVALID_SCAN_RANGE",
+            AppError::RoiOutsideScanRange => "ROI_OUTSIDE_SCAN_RANGE",
             AppError::OperationCancelled => "OPERATION_CANCELLED",
             AppError::QualityNeedsReview(_) => "QUALITY_NEEDS_REVIEW",
         };
 
+        let stage = match &error {
+            AppError::VideoNotFound | AppError::UnsupportedVideo | AppError::FfmpegNotFound => {
+                "VALIDATE_SOURCE"
+            }
+            AppError::FfprobeFailed(_) => "VALIDATE_SOURCE",
+            AppError::InvalidBoundingBox => "REVIEW",
+            AppError::CalibrationCorrupt(_)
+            | AppError::InvalidRequest(_)
+            | AppError::InvalidScanRange(_)
+            | AppError::RoiOutsideScanRange => "CALIBRATION",
+            AppError::FfmpegFailed(message)
+                if message.to_ascii_lowercase().contains("encoding") =>
+            {
+                "ENCODING"
+            }
+            AppError::StorageFull(_) => "STORAGE",
+            AppError::FfmpegFailed(_) => "PROCESSING",
+            AppError::QualityNeedsReview(_) => "VERIFYING",
+            AppError::OperationCancelled => "CANCELED",
+            AppError::ProjectNotFound | AppError::Io(_) | AppError::Json(_) => "STORAGE",
+        };
         Self {
             code: code.to_string(),
             message: error.to_string(),
+            stage: stage.to_string(),
+            artifact_path: None,
         }
     }
 }

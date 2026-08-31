@@ -43,12 +43,23 @@ pub struct CalibrationProfile {
     /// fallback). Kept optional so V1/V2 projects still load.
     #[serde(default)]
     pub route: Option<String>,
+    /// Inclusive frame range scanned for watermark evidence. Frames outside
+    /// this range are intentionally passthrough and never require ROI evidence.
+    #[serde(default)]
+    pub scan_range: Option<ScanRange>,
+    #[serde(default)]
+    pub trajectory_gate: Option<TrajectoryGateSummary>,
     /// Per-video fitted trajectory and residual statistics from the full audit.
     #[serde(default)]
     pub trajectory_model: Option<serde_json::Value>,
     /// Frames selected by calibration/QA for mandatory visual review.
     #[serde(default)]
     pub difficult_frames: Vec<u64>,
+    /// Exact ROI evidence frames retained with the project so Review can
+    /// recognise already-covered ranges after a reload, even if browser
+    /// localStorage has been cleared.
+    #[serde(default)]
+    pub roi_evidence_frames: Vec<u64>,
     #[serde(default)]
     pub contact_sheet_path: Option<String>,
     #[serde(default)]
@@ -57,6 +68,56 @@ pub struct CalibrationProfile {
     pub sample_frame: u64,
     pub frame_count: u64,
     pub quality: CalibrationQuality,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanRange {
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrajectoryGateSummary {
+    pub status: String,
+    #[serde(default)]
+    pub inlier_ratio: Option<f64>,
+    #[serde(default)]
+    pub residual_median: Option<f64>,
+    #[serde(default)]
+    pub residual_p95: Option<f64>,
+    #[serde(default)]
+    pub direct_coverage: Option<f64>,
+    /// Coverage from hard-gated image matches only.  This is intentionally
+    /// separate from provisional graph rows and user ROI anchors.
+    #[serde(default)]
+    pub confirmed_coverage: Option<f64>,
+    #[serde(default)]
+    pub measured_coverage: Option<f64>,
+    #[serde(default)]
+    pub hard_measured_frames: u64,
+    #[serde(default)]
+    pub roi_evidence_frames: u64,
+    #[serde(default)]
+    pub max_interpolation_gap: Option<u64>,
+    #[serde(default)]
+    pub failure_reasons: Vec<String>,
+    /// Actionable active ranges where the user can add a broad ROI hint.
+    /// This is intentionally optional so older V1-V5 projects continue to load.
+    #[serde(default)]
+    pub review_ranges: Vec<TrajectoryReviewRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrajectoryReviewRange {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    #[serde(default)]
+    pub suggested_frames: Vec<u64>,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
