@@ -38,3 +38,5 @@ tools/__pycache__/
 
 # Local full-video regression workspaces (regenerable GPU artifacts)
 .regression-work/
+.tmp_calibration_probe/
+.tmp_frames/
