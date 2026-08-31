@@ -1011,9 +1011,9 @@ def rdp_indices(points: list[tuple[float, float]], epsilon: float) -> list[int]:
 
 def interpolate(keys: list[dict[str, float | int | bool]], frame: int) -> tuple[float, float, float, bool, float]:
     if frame <= int(keys[0]["frame"]):
-        return float(keys[0]["x"]), float(keys[0]["y"]), float(keys[0]["scale"]), frame == int(keys[0]["frame"]), float(keys[0]["score"])
+        return float(keys[0]["x"]), float(keys[0]["y"]), float(keys[0].get("scale", 1.0)), frame == int(keys[0]["frame"]), float(keys[0].get("score", 0.0))
     if frame >= int(keys[-1]["frame"]):
-        return float(keys[-1]["x"]), float(keys[-1]["y"]), float(keys[-1]["scale"]), frame == int(keys[-1]["frame"]), float(keys[-1]["score"])
+        return float(keys[-1]["x"]), float(keys[-1]["y"]), float(keys[-1].get("scale", 1.0)), frame == int(keys[-1]["frame"]), float(keys[-1].get("score", 0.0))
     for left, right in zip(keys, keys[1:]):
         start, end = int(left["frame"]), int(right["frame"])
         if start <= frame <= end:
@@ -1021,11 +1021,11 @@ def interpolate(keys: list[dict[str, float | int | bool]], frame: int) -> tuple[
             return (
                 float(left["x"]) + (float(right["x"]) - float(left["x"])) * ratio,
                 float(left["y"]) + (float(right["y"]) - float(left["y"])) * ratio,
-                float(left["scale"]) + (float(right["scale"]) - float(left["scale"])) * ratio,
+                float(left.get("scale", 1.0)) + (float(right.get("scale", 1.0)) - float(left.get("scale", 1.0))) * ratio,
                 frame in (start, end),
                 min(float(left["score"]), float(right["score"])) * 0.88,
             )
-    return float(keys[-1]["x"]), float(keys[-1]["y"]), float(keys[-1]["scale"]), False, 0.0
+    return float(keys[-1]["x"]), float(keys[-1]["y"]), float(keys[-1].get("scale", 1.0)), False, float(keys[-1].get("score", 0.0))
 
 
 def _path_key_rows(rows: list[dict[str, float | int | bool]], epsilon: float = 2.0) -> list[dict[str, float | int | bool]]:

@@ -39,6 +39,7 @@ diagnostics nhưng không được render final.
 - `cargo fmt --check`: PASS.
 - Clippy `-D warnings`: PASS.
 - Python syntax (`py_compile`): PASS.
+- Python regression: 25 PASS bằng `C:\Python314\python.exe` (OpenCV headless đã có).
 - Tauri executable Windows x64: PASS tại
   `src-tauri/target/release/watermark-studio.exe`.
 - MSI bundling: BLOCKED ở WiX `light.exe`; không ảnh hưởng executable đã build.
@@ -59,7 +60,8 @@ thực tế, cần khởi động lại Computer Use helper trên máy desktop r
 UI.
 
 Runtime backend hiện cũng phát hiện venv ProPainter cũ trỏ tới Python 3.11 đã bị
-xóa. Khi runtime chưa được sửa, app phải giữ trạng thái `MISCONFIGURED` và khóa
+xóa; Python 3.14 chỉ dùng được cho unit test, chưa đủ tương thích để thay thế
+runtime ProPainter. Khi runtime chưa được sửa, app phải giữ trạng thái `MISCONFIGURED` và khóa
 Calibration/Render thay vì tạo output không đáng tin cậy.
 
 ## Kết quả chất lượng
@@ -80,4 +82,3 @@ runtime chưa sẵn sàng. Khi hai blocker được xử lý, mỗi video phải
    `clip_test` → `(117)` → `(121)`; lưu output và QA artifacts vào báo cáo này.
 3. Chỉ sau khi cả ba QA pass mới tạo commit nghiệm thu cuối
    `feat: complete validated Learna AI multi-trajectory pipeline`.
-

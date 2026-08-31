@@ -35,7 +35,9 @@ class CalibrationV6ReviewTests(unittest.TestCase):
             row["refined"] = True
         result = CALIBRATION.holdout_metrics(rows)
         self.assertGreaterEqual(int(result["count"]), 10)
-        self.assertLessEqual(float(result["p95"]), 1e-6)
+        # RDP compacts the training path with a 2 px tolerance; held-out
+        # points should remain within that validated tolerance.
+        self.assertLessEqual(float(result["p95"]), 2.0)
         self.assertGreaterEqual(float(result["inlierRatio"]), 0.80)
 
     def test_v7_holdout_rejects_overfit_path(self) -> None:
