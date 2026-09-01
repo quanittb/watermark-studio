@@ -179,10 +179,36 @@ def assert_finite_json(value: object, path: str = "$") -> None:
             assert_finite_json(child, f"{path}[{index}]")
 
 
+def normalize_json_value(value: object) -> object:
+    """Convert NumPy scalars and unavailable metrics to strict JSON values.
+
+    A failed fit is a calibration result, not a process crash.  OpenCV can
+    legitimately produce NaN/Inf for a zero-energy crop; preserve that fact as
+    JSON ``null`` so Rust can open the diagnostics and keep the profile
+    fail-closed in NEEDS_REVIEW.  NumPy integer/bool values are also converted
+    because ``json.dumps`` does not serialize every scalar implementation.
+    """
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, dict):
+        return {str(key): normalize_json_value(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [normalize_json_value(child) for child in value]
+    if isinstance(value, np.ndarray):
+        return normalize_json_value(value.tolist())
+    return value
+
+
 def write_strict_json(path: Path, value: object) -> None:
     """Write and reparse a strict JSON artifact atomically enough for readers."""
-    assert_finite_json(value)
-    encoded = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+    normalized = normalize_json_value(value)
+    assert_finite_json(normalized)
+    encoded = json.dumps(normalized, ensure_ascii=False, indent=2, allow_nan=False)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(encoded, encoding="utf-8")
     json.loads(temporary.read_text(encoding="utf-8"))
