@@ -166,7 +166,10 @@ def canonical_json_sha(value: dict) -> str:
 
 def assert_finite_json(value: object, path: str = "$") -> None:
     """Reject non-standard JSON numbers before they reach serde_json."""
-    if isinstance(value, float) and not math.isfinite(value):
+    # ``numpy`` scalars can be produced by OpenCV/NumPy even when callers
+    # explicitly cast most values to ``float``.  Treat them exactly like
+    # native JSON numbers so a bad match is reported with its real path.
+    if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
         raise ValueError(f"Non-finite JSON number at {path}")
     if isinstance(value, dict):
         for key, child in value.items():
@@ -184,6 +187,22 @@ def write_strict_json(path: Path, value: object) -> None:
     temporary.write_text(encoded, encoding="utf-8")
     json.loads(temporary.read_text(encoding="utf-8"))
     temporary.replace(path)
+
+
+def finite_candidate_row(row: dict[str, object]) -> bool:
+    """Return whether a detector row is safe to persist and fit.
+
+    OpenCV's masked ``TM_CCORR_NORMED`` is allowed to return NaN when the
+    sampled patch/template has zero energy (common on a fully blurred frame).
+    Such a row must be discarded before it reaches the cache or trajectory
+    fitter; serializing it as ``Infinity`` would make Rust reject the whole
+    calibration profile.
+    """
+    for value in row.values():
+        if isinstance(value, (float, np.floating)):
+            if not math.isfinite(float(value)):
+                return False
+    return True
 
 
 def parse_roi(raw: str) -> dict[str, float] | None:
@@ -389,7 +408,17 @@ def evaluate_box(
         return 0.55 * binary_correlation + 0.45 * soft_correlation, iou, contamination, large
 
     metrics = [score_contrast(np.maximum(gray - smooth, 0.0)), score_contrast(np.maximum(smooth - gray, 0.0))]
-    return max(metrics, key=lambda item: item[0] + 0.35 * item[1] - 0.40 * item[2] - (0.15 if item[3] else 0.0))
+    finite_metrics = [
+        item
+        for item in metrics
+        if all(math.isfinite(float(value)) for value in item[:3])
+    ]
+    if not finite_metrics:
+        return 0.0, 0.0, 1.0, False
+    return max(
+        finite_metrics,
+        key=lambda item: item[0] + 0.35 * item[1] - 0.40 * item[2] - (0.15 if item[3] else 0.0),
+    )
 
 
 def top_matches(response: np.ndarray, width: int, height: int, limit: int = MAX_CANDIDATES_PER_FRAME) -> list[tuple[float, tuple[int, int]]]:
@@ -403,7 +432,9 @@ def top_matches(response: np.ndarray, width: int, height: int, limit: int = MAX_
     radius_y = max(2, height // 3)
     for _ in range(limit):
         _, score, _, location = cv2.minMaxLoc(work)
-        if score < MIN_RAW_SCORE:
+        # A zero-energy masked match can yield NaN on some OpenCV builds.
+        # Never admit that value into a candidate row or the persistent cache.
+        if not math.isfinite(float(score)) or score < MIN_RAW_SCORE:
             break
         matches.append((float(score), (int(location[0]), int(location[1]))))
         left = max(0, location[0] - radius_x)
@@ -498,27 +529,27 @@ def candidate_rows(
             local_quality = 0.45 * max(0.0, min(1.0, raw_score)) + 0.35 * correlation + 0.20 * iou
             if large:
                 local_quality *= 0.85
-            rows.append(
-                {
-                    "frame": frame_number,
-                    "x": float(x),
-                    "y": float(y),
-                    "width": float(width),
-                    "height": float(height),
-                    # Store the effective source scale.  The renderer works
-                    # in source pixels, so retaining only the canonical
-                    # variant (for example .75) is wrong for a 720p fixture.
-                    "scale": float(base_scale * scale),
-                    "templateScale": float(scale),
-                    "rawScore": float(raw_score),
-                    "glyphCorrelation": float(correlation),
-                    "glyphIou": float(iou),
-                    "contamination": float(contamination),
-                    "largeOutsideComponent": bool(large),
-                    "baseScale": float(base_scale),
-                    "score": float(local_quality),
-                }
-            )
+            row = {
+                "frame": frame_number,
+                "x": float(x),
+                "y": float(y),
+                "width": float(width),
+                "height": float(height),
+                # Store the effective source scale.  The renderer works
+                # in source pixels, so retaining only the canonical
+                # variant (for example .75) is wrong for a 720p fixture.
+                "scale": float(base_scale * scale),
+                "templateScale": float(scale),
+                "rawScore": float(raw_score),
+                "glyphCorrelation": float(correlation),
+                "glyphIou": float(iou),
+                "contamination": float(contamination),
+                "largeOutsideComponent": bool(large),
+                "baseScale": float(base_scale),
+                "score": float(local_quality),
+            }
+            if finite_candidate_row(row):
+                rows.append(row)
     rows.sort(key=lambda row: float(row["score"]), reverse=True)
     selected: list[dict[str, float | int | bool]] = []
     for row in rows:
@@ -584,6 +615,8 @@ def periodic_prior_candidate(
                     continue
                 corr, iou, contamination, large = metrics
                 rank = corr + 0.35 * iou - 0.40 * contamination - (0.15 if large else 0.0)
+                if not all(math.isfinite(float(value)) for value in (corr, iou, contamination, rank)):
+                    continue
                 item = (rank, base_x + dx, base_y + dy, corr, iou, contamination, large, variant)
                 if best is None or rank > best[0]:
                     best = item
@@ -594,7 +627,7 @@ def periodic_prior_candidate(
     # independent global seeds remain mandatory before this route is usable.
     if corr < 0.35 or iou < 0.15 or contamination > 0.85:
         return None
-    return {
+    row = {
         "frame": frame_number,
         "x": float(x),
         "y": float(y),
@@ -611,6 +644,7 @@ def periodic_prior_candidate(
         "score": float(max(0.0, min(1.0, 0.50 * corr + 0.25 * iou + 0.25 * (1.0 - contamination)))),
         "periodicPrior": True,
     }
+    return row if finite_candidate_row(row) else None
 
 
 def write_contact_sheet(
@@ -1136,6 +1170,8 @@ def refine_local_path(
                         corr, iou, contamination, large = metrics
                         distance = math.hypot(dx, dy)
                         rank = corr + 0.35 * iou - 0.40 * contamination - 0.015 * distance - (0.15 if large else 0.0)
+                        if not all(math.isfinite(float(value)) for value in (corr, iou, contamination, rank)):
+                            continue
                         if best is None or rank > best[0]:
                             best = (rank, x, y, scale, corr, iou, large)
                             best_contamination = contamination
@@ -1147,24 +1183,24 @@ def refine_local_path(
                 # Local refinement is accepted only with structural evidence;
                 # path continuity alone cannot manufacture a glyph.
                 if corr >= 0.42 and iou >= 0.22 and contamination <= 0.55 and rank >= 0.20:
-                    refined.append(
-                        {
-                            "frame": frame_number,
-                            "x": float(x),
-                            "y": float(y),
-                            "width": float(refined_width),
-                            "height": float(refined_height),
-                            "scale": float(scale),
-                            "score": float(max(0.0, min(1.0, rank))),
-                            "glyphCorrelation": float(corr),
-                            "glyphIou": float(iou),
-                            "contamination": float(contamination),
-                            "largeOutsideComponent": bool(large),
-                            "refined": True,
-                            "positionSource": "LOCAL_NCC",
-                            "predictedScore": float(predicted_score),
-                        }
-                    )
+                    row = {
+                        "frame": frame_number,
+                        "x": float(x),
+                        "y": float(y),
+                        "width": float(refined_width),
+                        "height": float(refined_height),
+                        "scale": float(scale),
+                        "score": float(max(0.0, min(1.0, rank))),
+                        "glyphCorrelation": float(corr),
+                        "glyphIou": float(iou),
+                        "contamination": float(contamination),
+                        "largeOutsideComponent": bool(large),
+                        "refined": True,
+                        "positionSource": "LOCAL_NCC",
+                        "predictedScore": float(predicted_score),
+                    }
+                    if finite_candidate_row(row):
+                        refined.append(row)
             targets.remove(frame_number)
             frame_number += 1
     finally:
@@ -1618,6 +1654,14 @@ def main() -> None:
             frame_number += 1
     finally:
         capture.release()
+    # Drop any non-finite rows defensively before cache serialization and
+    # before trajectory selection.  This is the final guard for OpenCV builds
+    # that return NaN from masked template matching on zero-energy patches.
+    all_candidates = {
+        frame: [row for row in rows if finite_candidate_row(row)]
+        for frame, rows in all_candidates.items()
+    }
+    all_candidates = {frame: rows for frame, rows in all_candidates.items() if rows}
     write_strict_json(
         candidate_cache_path,
         {
@@ -1629,6 +1673,7 @@ def main() -> None:
                 str(frame): [
                     {key: value for key, value in row.items() if key != "userRoi"}
                     for row in rows
+                    if finite_candidate_row(row)
                 ]
                 for frame, rows in sorted(all_candidates.items())
             },
