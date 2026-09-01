@@ -14,6 +14,8 @@ diagnostics nhưng không được render final.
 - Commit QA/retry: `926571fe5cfcd18df68c1658036bd841f2af865e`.
 - Commit regression: `0292f6bcb6a292713671ea7d6117772343f41499`.
 - Commit workspace hygiene mới nhất: `cea0e7faabff62728616da1b8082d8dfd0d9ee47`.
+- Commit chống crash JSON candidate: `94d17ae`.
+- Commit chuẩn hóa metric không đo được thành `null`: `ff14757`.
 - Không tạo branch mới, không reset/rebase/pull và không stage cache tạm.
 
 ## Thay đổi đã thực hiện
@@ -50,39 +52,45 @@ diagnostics nhưng không được render final.
 
 ## Kiểm thử UI và ba video yêu cầu
 
-Đã chuẩn bị executable để chạy các case:
+Đã mở Watermark Studio bằng Computer Use và chạy flow thật trên executable
+`D:\\rustProject\\watermark-studio\\src-tauri\\target\\debug\\watermark-studio.exe`
+cho các case:
 
 - `C:\Users\quant\Dropbox\PC\Downloads\14\_7 (117).mp4`
 - `C:\Users\quant\Dropbox\PC\Downloads\14\_7 (121).mp4`
 - `C:\Users\quant\Dropbox\PC\Downloads\clip\_test.mp4`
 
-Computer Use không khởi tạo được trong môi trường hiện tại, lỗi lặp lại:
-`failed to write kernel assets: The system cannot find the path specified (os error 3)`.
-Vì vậy chưa có thao tác click/import/calibration/queue nào được ghi nhận là test UI
-thành công; không dùng script để giả lập kết quả output. Đây là blocker kiểm thử
-thực tế, cần khởi động lại Computer Use helper trên máy desktop rồi chạy đúng flow
-UI.
+Kết quả UI (không dùng script để giả lập output):
 
-Runtime backend hiện cũng phát hiện venv ProPainter cũ trỏ tới Python 3.11 đã bị
-xóa; Python 3.14 chỉ dùng được cho unit test, chưa đủ tương thích để thay thế
-runtime ProPainter. Khi runtime chưa được sửa, app phải giữ trạng thái `MISCONFIGURED` và khóa
-Calibration/Render thay vì tạo output không đáng tin cậy.
+- `(117)`: import thành công (2473 frame). Auto calibration hoàn tất không crash
+  JSON nhưng bị `NEEDS_REVIEW`: 213 hard-direct, 100% sampled path, residual p95
+  6,33 px; còn 3 cụm ROI và holdout/inlier gate chưa đạt. Queue bị khóa.
+- `(121)`: import thành công (4582 frame). Auto calibration hoàn tất không crash
+  JSON nhưng bị `NEEDS_REVIEW`: 138 hard-direct, 89% evidence, residual p95
+  57,16 px; còn 6 cụm ROI, trajectory/holdout gate chưa đạt. Queue bị khóa.
+- `clip_test`: chạy lại V7 trên 904 frame, kết quả `NEEDS_REVIEW`: 37 hard-direct,
+  36% evidence, residual p95 2,32 px; holdout p95 77,77 px và coverage refined
+  chưa đạt. Queue bị khóa.
+
+Các project và trạng thái được giữ lại khi mở lại app. Không có video final mới
+được tạo vì pipeline fail-closed; đây là hành vi đúng khi profile V7 chưa vượt
+quality gate. Runtime health trong Settings hiển thị `READY` (Python 3.11.9,
+cv2/numpy/torch, CUDA GTX 1650 4 GB, model và FFmpeg sẵn sàng).
 
 ## Kết quả chất lượng
 
-Chưa tuyên bố output final cho ba video vì chưa vượt được hai điều kiện bắt buộc:
-(1) Computer Use UI regression chưa chạy do helper lỗi; (2) Python 3.11/cv2/torch
-runtime chưa sẵn sàng. Khi hai blocker được xử lý, mỗi video phải sinh draft
+Chưa tuyên bố output final cho ba video vì cả ba calibration V7 đều chưa vượt
+quality gate holdout/trajectory/refined coverage. Do đó UI không cho Queue/Render
+và không sinh draft giả. Khi gate đạt, mỗi video phải sinh draft
 `.review.mp4`, `*.qa.v7.json`, `*.qa.v7.png` và chỉ promote final nếu
 `maskApplicationCoverageInRange = 1.0`, `residualPassCoverageInRange = 1.0`,
 `failedFrames = []`, `unmeasurableFrames = []`.
 
 ## Bước tiếp theo
 
-1. Khôi phục Python 3.11 tương thích với venv hoặc cấu hình runtime mới có đủ
-   `cv2`, `numpy`, `torch` và model ProPainter; xác nhận trong Settings → Processing
-   đến khi Runtime `READY`.
-2. Khởi động lại Computer Use helper, chạy UI regression ba video theo thứ tự
-   `clip_test` → `(117)` → `(121)`; lưu output và QA artifacts vào báo cáo này.
+1. Trong Review, xử lý các cụm ROI V7 còn thiếu theo thứ tự ưu tiên; mỗi video
+   vẫn bị giới hạn tối đa ba ROI mới trước khi chuyển `NEEDS_REVIEW` có cấu trúc.
+2. Sau khi profile V7 đạt holdout/refined-coverage gate, Queue render qua UI và
+   lưu draft, QA report/contact sheet; hiện chưa có output final mới.
 3. Chỉ sau khi cả ba QA pass mới tạo commit nghiệm thu cuối
    `feat: complete validated Learna AI multi-trajectory pipeline`.
