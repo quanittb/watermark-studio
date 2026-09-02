@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { AppError, BoundingBox, FrameResult, RemovalConfig, RoiEvidenceRecord, ScanRange, WatermarkProject } from '../types/project';
+import type { CalibrationProfileV9 } from '../types/project';
 
 export type BestQualitySample = {
   frame: number;
@@ -147,6 +148,18 @@ export function autoCalibrateBestQuality(projectId: string, roi: RoiHint | null 
     .map((item) => ({ frame: item.frame, bbox: { x: item.x, y: item.y, width: item.width, height: item.height } }));
   return invoke<WatermarkProject>('auto_calibrate_best_quality', { request: { projectId, roi, editedMaskPath, roiEvidence: evidence, scanRange } });
 }
+export function startAutoCalibrationV9(projectId: string, scanRange: ScanRange | null = null): Promise<WatermarkProject> {
+  return invoke<WatermarkProject>('start_auto_calibration_v9', { request: { projectId, roi: null, editedMaskPath: null, roiEvidence: [], scanRange } });
+}
+export function validateCalibrationV9(projectId: string): Promise<CalibrationProfileV9> {
+  return invoke<CalibrationProfileV9>('validate_calibration_v9', { projectId });
+}
+export function enqueueHybridV9(projectId: string, outputRoot: string | null, outputName: string | null, replacement: BestQualityReplacement | null, allowReviewDraft = true): Promise<JobRecord> {
+  return invoke<JobRecord>('enqueue_hybrid_v9', { request: { projectId, outputRoot, outputName, replacement, allowReviewDraft } });
+}
+export function revalidateOutputV9(jobId: string): Promise<JobRecord> {
+  return invoke<JobRecord>('revalidate_output_v9', { jobId });
+}
 
 export function persistedRoiEvidence(project: WatermarkProject | null): Array<RoiHint & { frame: number }> {
   // V8 stores evidence at project level.  Older V7 projects may only have it
@@ -192,12 +205,12 @@ export function getErrorMessage(error: unknown): string {
       case 'STORAGE_FULL': return `${compact(error.message)} Hãy giải phóng dung lượng ở ổ workspace rồi chạy lại.${stage}`;
       case 'RUNTIME_NOT_READY': return `${compact(error.message)} Mở Settings → Processing để sửa runtime trước khi chạy.${stage}`;
       case 'OPERATION_CANCELLED': return 'Tác vụ đã được hủy.';
-      case 'CALIBRATION_CORRUPT': return `${error.message} Hãy mở Review và chạy lại Calibration V8.`;
+      case 'CALIBRATION_CORRUPT': return `${error.message} Hãy mở Review và chạy lại Calibration V9.`;
       case 'INVALID_SCAN_RANGE': return `${error.message} Hãy chọn lại phạm vi frame hợp lệ trong Review.`;
       case 'ROI_OUTSIDE_SCAN_RANGE': return 'ROI evidence nằm ngoài phạm vi quét hiện tại. Hãy mở rộng phạm vi hoặc chọn ROI trong khoảng đã đặt.';
       case 'INVALID_REQUEST': {
         if (/stale|quality gate/i.test(error.message)) return `${error.message} Profile chưa READY; hãy xem diagnostics và chạy lại Auto-find & calibrate.`;
-        if (/profile hash|mask hash|fingerprint/i.test(error.message)) return `${error.message} Không dùng lại profile sau khi source/mask thay đổi; hãy regenerate V8.`;
+        if (/profile hash|mask hash|fingerprint/i.test(error.message)) return `${error.message} Không dùng lại profile sau khi source/mask thay đổi; hãy regenerate V9.`;
         return error.message;
       }
       case 'QUALITY_NEEDS_REVIEW': return `${error.message} Draft và QA vẫn được giữ để mở lại trong History.`;

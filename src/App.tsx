@@ -501,7 +501,7 @@ export default function App() {
     return labels[problem] ?? problem;
   };
   const dialogSteps = operationDialog?.task === "calibrating"
-    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V8"]
+    ? ["Runtime/source", "Activity map", "Candidate cache", "Temporal graph", "Dense refine 1", "Dense refine 2", "Trajectory/holdout", "Consensus masks", "Save V9"]
     : operationDialog?.task === "sampling"
       ? ["Read source", "Scan candidates", "Score glyph", "Build contact sheet"]
       : ["Prepare profile", "ProPainter FP32", "Encode output", "Verify QA"];
@@ -857,7 +857,7 @@ export default function App() {
       ]);
       activateProject(nextProject);
       setMessage(
-        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V8.",
+        "Video loaded. Run automatic V9 calibration to create a verified profile.",
       );
     } catch (openError) {
       setError(getErrorMessage(openError));
@@ -1284,16 +1284,7 @@ export default function App() {
   const queueBestQuality = async () => {
     if (!project || isBusy || !project.calibration?.scanRange) return;
     const ready = project.calibration.quality.status === "READY";
-    // Older persisted metadata can expose the terminal draft outcome one
-    // render behind.  Once the V8 budget is exhausted, a NEEDS_REVIEW
-    // profile is still explicitly eligible for a review draft; this does
-    // not weaken the backend final-quality gate.
-    const reviewDraft = project.calibration.outcome === "NEEDS_REVIEW_DRAFT"
-      || (project.calibration.quality.status === "NEEDS_REVIEW"
-        && Math.max(
-          project.calibration.roiBudgetUsed ?? 0,
-          project.calibration.roiEvidenceFrames?.length ?? 0,
-        ) >= ROI_BUDGET_MAX);
+    const reviewDraft = !ready && project.calibration.outcome === "NEEDS_REVIEW_DRAFT";
     if (!ready && !reviewDraft) return;
     try {
       const job = await enqueueBestQualityJob(project.id, outputRoot || null, outputName || null, bestReplacement, reviewDraft);
@@ -1304,8 +1295,8 @@ export default function App() {
       navigate("queue");
       setMessage(
         reviewDraft
-          ? `Đã xếp hàng review draft cho ${project.source.fileName}; final vẫn khóa cho đến khi QA đạt.`
-          : `Queued ${project.source.fileName} for sequential Best-quality rendering.`,
+          ? `Đã xếp review draft V9 cho ${project.source.fileName}; hệ thống sẽ che QuanPH nếu QA phát hiện residual.`
+          : `Queued ${project.source.fileName} for sequential V9 hybrid rendering.`,
       );
     } catch (queueError) {
       setError(getErrorMessage(queueError));
@@ -1350,8 +1341,8 @@ export default function App() {
         setSelection(null);
         setRoiEvidence([]);
         window.localStorage.removeItem(roiEvidenceStorageKey(updatedProject.id));
-        setMessage(`CalibrationProfileV8 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
-        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V8 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
+        setMessage(`CalibrationProfileV9 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
+        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V9 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
       } else {
         const reasons = updatedProject.calibration?.trajectoryGate?.failureReasons?.join(", ") || "TRAJECTORY_UNDERCONSTRAINED";
         const gate = updatedProject.calibration?.trajectoryGate;
@@ -1727,7 +1718,7 @@ export default function App() {
       });
       const editedMaskPath = await saveCalibrationMaskEdit(project.id, Array.from(new Uint8Array(await blob.arrayBuffer())));
       // The sample editor is only an evidence/descriptor step.  Always finish
-      // through the same V8 adaptive calibration service used by the main
+      // through the same V9 adaptive calibration service used by the main
       // Best-quality button so a legacy profile can never reach Queue.
       const updatedProject = await autoCalibrateBestQuality(
         project.id,
@@ -1746,8 +1737,8 @@ export default function App() {
       setInspectionMode(false);
       setMessage(
         updatedProject.calibration?.quality.status === "READY"
-          ? "CalibrationProfileV8 đã vượt quality gate; có thể đưa job vào hàng đợi."
-          : "Mask đã lưu. Calibration V8 chưa vượt quality gate; hãy chạy tiếp refine hoặc đưa review draft vào Queue.",
+          ? "CalibrationProfileV9 đã vượt quality gate; có thể đưa job vào hàng đợi."
+          : "Mask đã lưu. Calibration V9 chưa vượt quality gate; hãy chạy calibration tự động hoặc đưa review draft vào Queue.",
       );
     } catch (saveError) {
       setError(getErrorMessage(saveError));
@@ -1874,12 +1865,7 @@ export default function App() {
                   disabled={
                     (!project?.calibration?.scanRange
                       || (project.calibration.quality.status !== "READY"
-                        && project.calibration.outcome !== "NEEDS_REVIEW_DRAFT"
-                        && !(project.calibration.quality.status === "NEEDS_REVIEW"
-                          && Math.max(
-                            project.calibration.roiBudgetUsed ?? 0,
-                            project.calibration.roiEvidenceFrames?.length ?? 0,
-                          ) >= ROI_BUDGET_MAX))
+                        && project.calibration.outcome !== "NEEDS_REVIEW_DRAFT")
                       || isBusy)
                   }
                 >
@@ -1980,7 +1966,7 @@ export default function App() {
                     <div><span>FFmpeg</span><strong>{runtimeHealth?.ffmpegPath && runtimeHealth?.ffprobePath ? "✓ Ready" : "✗ Missing"}</strong><small>{runtimeHealth?.workspaceRoot ?? "—"}</small></div>
                   </div>
                   {runtimeHealth && runtimeHealth.problems.length > 0 && <div className="runtime-problems"><strong>{language === "vi" ? "Cần xử lý trước khi Calibration/Render:" : "Fix before Calibration/Render:"}</strong><ul>{runtimeHealth.problems.map((problem) => <li key={problem}>{runtimeProblemLabel(problem)}</li>)}</ul></div>}
-              {runtimeHealth?.status === "READY" && <small className="runtime-ready-note">{language === "vi" ? "Runtime đạt preflight; Queue chỉ mở khi profile V8 cũng vượt quality gate." : "Runtime preflight passed; Queue also requires a V8 profile that passes the quality gate."}</small>}
+              {runtimeHealth?.status === "READY" && <small className="runtime-ready-note">{language === "vi" ? "Runtime đạt preflight; Queue chỉ mở khi profile V9 cũng vượt quality gate." : "Runtime preflight passed; Queue also requires a V9 profile that passes the quality gate."}</small>}
                 </div>
                 <small className="settings-note">{language === "vi" ? "GPU mạnh hơn sẽ tăng resolution/context. Mỗi GPU vẫn chỉ chạy một job ProPainter để giữ chất lượng và tránh OOM." : "A stronger GPU increases resolution/context. Each GPU still runs one ProPainter job to preserve quality and avoid OOM."}</small>
               </>}
@@ -2643,7 +2629,7 @@ export default function App() {
                   <span className="eyebrow">FINAL PATH · VERIFIED LAYOUT</span>
                   <strong>Best-quality AI render</strong>
                   <small>
-                    FP32 ProPainter theo chunk + context, chỉ blend glyph mask.
+                    V9 tự tìm Learna AI toàn khung, fit quỹ đạo riêng rồi chạy FP32 ProPainter theo crop động; nếu frame còn residual sẽ che kín bằng badge QuanPH.
                     Profile:{" "}
                     {project?.calibration?.quality.status ??
                       "CALIBRATION PENDING"}{" "}
@@ -2651,7 +2637,7 @@ export default function App() {
                   </small>
                   {project?.calibration?.version && project.calibration.version >= 5 && (
                     <small className="review-queue">
-                      Trajectory: {project.calibration.quality.reliableFrames} measured · {project.calibration.quality.lowConfidenceFrames} inferred
+                      Trajectory: {project.calibration.quality.reliableFrames} measured · {project.calibration.quality.lowConfidenceFrames} inferred · V9
                     </small>
                   )}
                   {project?.calibration?.scanRange && (
@@ -2729,7 +2715,20 @@ export default function App() {
                     ) : null}
                   </div>
                 )}
-                <div className="best-quality-samples">
+                <div className="best-quality-auto-card">
+                  <span className="eyebrow">ONE-CLICK BEST-QUALITY</span>
+                  <strong>{language === "vi" ? "Tự động tìm, hiệu chỉnh và kiểm chứng" : "Automatically detect, calibrate and verify"}</strong>
+                  <small>
+                    {language === "vi"
+                      ? "Không cần chọn sample hoặc khoanh ROI trong Best-quality. Hệ thống quét toàn khung, tự refine hai lượt và chỉ tạo final khi QA độc lập không còn Learna AI. Nếu ProPainter không đủ sạch, badge QuanPH opaque sẽ được áp dụng trên đúng frame lỗi."
+                      : "No sample picking or ROI drawing is required in Best-quality. The system scans the full frame, runs two refinement passes and only creates final after independent QA finds no Learna AI. An opaque QuanPH badge covers exact residual frames when ProPainter is insufficient."}
+                  </small>
+                  <div className="best-quality-auto-status">
+                    <span className={project?.calibration?.quality.status === "READY" ? "status-ok" : "status-pending"} />
+                    <span>{project?.calibration?.quality.status === "READY" ? (language === "vi" ? "Calibration V9 sẵn sàng" : "V9 calibration ready") : project?.calibration?.outcome === "NEEDS_REVIEW_DRAFT" ? (language === "vi" ? "Review draft an toàn · Final chờ QA" : "Safe review draft · Final awaits QA") : (language === "vi" ? "Chưa calibration · bấm nút tự động ở phía trên" : "Not calibrated · use the automatic button above")}</span>
+                  </div>
+                </div>
+                <div className="best-quality-samples legacy-best-quality-tools">
                   <span className="eyebrow">
                     1. FIND · 2. INSPECT · 3. CONFIRM
                   </span>
@@ -2782,9 +2781,9 @@ export default function App() {
                   ) : (
                     loadingTask !== "sampling" && loadingTask !== "calibrating" && (<>
                       {project?.calibration?.quality.status === "READY" && project.calibration.scanRange ? (
-                        <small className="calibration-ready-note">Calibration V8 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
+                        <small className="calibration-ready-note">Calibration V9 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
                       ) : project?.calibration?.quality.status === "READY" ? (
-                        <small className="scan-range-caution">Profile cũ chưa có phạm vi quét hoặc chưa được V8 xác thực; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
+                        <small className="scan-range-caution">Profile cũ chưa có phạm vi quét hoặc chưa được V9 xác thực; hãy chạy lại calibration tự động trước khi Queue.</small>
                       ) : <small>{t("noValidSample")}</small>}
                       {roiFallbackArmed && <small className="review-queue">{t("roiFallbackActive")}</small>}
                       {(roiEvidence.length < ROI_BUDGET_MAX || roiEvidence.some((item) => item.frame === currentFrame)) ? (
@@ -2810,7 +2809,7 @@ export default function App() {
                       onClick={() => void saveBestQualitySample()}
                       disabled={isBusy || !maskEditorReady}
                     >
-                      Save mask & run Calibration V8
+                      Save mask & run Calibration V9
                     </button>
                     </div>
                   )}

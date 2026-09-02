@@ -1355,6 +1355,47 @@ h2 {
   gap: 8px;
   background: #101117;
 }
+.legacy-best-quality-tools {
+  /* Sample picking and brush ROI remain available to legacy diagnostics, but
+     the Best-quality path is intentionally one-click and zero-touch. */
+  display: none;
+}
+.best-quality-auto-card {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  padding: 13px;
+  border: 1px solid #5d4c91;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #17132a, #11131d);
+}
+.best-quality-auto-card strong {
+  color: #eee9ff;
+  font-size: 13px;
+}
+.best-quality-auto-card small {
+  color: #b6afd0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.best-quality-auto-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #d7cfff;
+  font-size: 10px;
+}
+.best-quality-auto-status > span:first-child {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8976c9;
+  box-shadow: 0 0 0 3px rgba(137, 118, 201, 0.14);
+}
+.best-quality-auto-status > .status-ok {
+  background: #57d08c;
+  box-shadow: 0 0 0 3px rgba(87, 208, 140, 0.14);
+}
 .best-quality-samples small {
   color: #9691a8;
   font-size: 10px;

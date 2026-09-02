@@ -12,8 +12,8 @@ import numpy as np
 from render_periodic_dewatermark import aligned_positions, bounds_for_position, periodic_position
 
 
-CROP_WIDTH = 320
-CROP_HEIGHT = 160
+CROP_WIDTH = 512
+CROP_HEIGHT = 288
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--start-frame", type=int, default=0)
     prepare.add_argument("--end-frame", type=int, default=903)
     prepare.add_argument("--full-frame", action="store_true")
+    prepare.add_argument("--dynamic-crop", action="store_true", help="Use a fixed-size crop centered on each per-frame calibrated bbox.")
+    prepare.add_argument("--crop-width", type=int, default=CROP_WIDTH)
+    prepare.add_argument("--crop-height", type=int, default=CROP_HEIGHT)
     prepare.add_argument(
         "--mask-dilate",
         type=int,
@@ -60,15 +63,18 @@ def parse_args() -> argparse.Namespace:
     composite.add_argument("--replacement-fixed-y", type=float, default=0.0)
     composite.add_argument("--replacement-scale", type=float, default=1.0)
     composite.add_argument("--replacement-opacity", type=float, default=1.0)
+    composite.add_argument("--badge-image", type=Path, help="Optional opaque fallback badge applied by a later hybrid pass.")
     return parser.parse_args()
 
 
-def crop_origin(x: float, y: float, frame_width: int, frame_height: int) -> tuple[int, int]:
+def crop_origin(x: float, y: float, frame_width: int, frame_height: int, crop_width: int, crop_height: int) -> tuple[int, int]:
     x0, y0, x1, y1 = bounds_for_position(x, y, frame_width, frame_height)
     center_x = (x0 + x1) // 2
     center_y = (y0 + y1) // 2
-    left = int(np.clip(center_x - CROP_WIDTH // 2, 0, frame_width - CROP_WIDTH))
-    top = int(np.clip(center_y - CROP_HEIGHT // 2, 0, frame_height - CROP_HEIGHT))
+    crop_width = min(crop_width, frame_width)
+    crop_height = min(crop_height, frame_height)
+    left = int(np.clip(center_x - crop_width // 2, 0, frame_width - crop_width))
+    top = int(np.clip(center_y - crop_height // 2, 0, frame_height - crop_height))
     return left, top
 
 
@@ -90,16 +96,16 @@ def prepare(args: argparse.Namespace) -> None:
     profile = None
     if args.profile is not None:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
-        draft_allowed = profile.get("outcome") == "NEEDS_REVIEW_DRAFT"
+        draft_allowed = profile.get("version") == 9 and profile.get("outcome") == "NEEDS_REVIEW_DRAFT"
         if (
-            profile.get("version") != 8
+            profile.get("version") != 9
             or (profile.get("status") != "READY" and not draft_allowed)
             or profile.get("preset") != "LEARNA_AI_ADAPTIVE"
             or (profile.get("qualityGate", {}).get("status") != "PASSED" and not draft_allowed)
         ):
-            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV8 or a bounded review draft")
+            raise RuntimeError("Best-quality preparation requires CalibrationProfileV9 or its terminal review draft")
         if profile.get("trajectoryGate", {}).get("status") != "PASSED" and not draft_allowed:
-            raise RuntimeError("CalibrationProfileV8 trajectory quality gate did not pass")
+            raise RuntimeError("CalibrationProfileV9 trajectory quality gate did not pass")
         if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
             raise RuntimeError("Calibration profile frame count does not match the source video")
     mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]
@@ -182,28 +188,27 @@ def prepare(args: argparse.Namespace) -> None:
                 x = periodic_x + offsets_x[frame_number]
                 y = periodic_y + offsets_y[frame_number]
                 visible = True
+            crop_width = min(max(64, int(args.crop_width)), frame_width)
+            crop_height = min(max(64, int(args.crop_height)), frame_height)
             if args.full_frame:
                 left, top = 0, 0
                 crop_width, crop_height = frame_width, frame_height
             else:
-                left, top = crop_origin(x, y, frame_width, frame_height)
-                crop_width, crop_height = CROP_WIDTH, CROP_HEIGHT
+                left, top = crop_origin(x, y, frame_width, frame_height, crop_width, crop_height)
             crop = frame[top : top + crop_height, left : left + crop_width]
             local_mask = np.zeros((crop_height, crop_width), dtype=np.uint8)
-            if profile is not None:
+            if profile is not None and visible:
                 box_x0, box_y0, box_x1, box_y1 = profile_bounds(bbox, frame_width, frame_height)
-            else:
+            elif profile is None:
                 box_x0, box_y0, box_x1, box_y1 = bounds_for_position(
                     x, y, frame_width, frame_height
                 )
-            resized_mask = cv2.resize(
-                glyph_mask,
-                (box_x1 - box_x0, box_y1 - box_y0),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            local_x = box_x0 - left
-            local_y = box_y0 - top
-            if visible:
+            else:
+                box_x0 = box_y0 = box_x1 = box_y1 = 0
+            resized_mask = cv2.resize(glyph_mask, (box_x1 - box_x0, box_y1 - box_y0), interpolation=cv2.INTER_NEAREST) if visible else np.zeros((0, 0), dtype=np.uint8)
+            local_x = box_x0 - left if visible else 0
+            local_y = box_y0 - top if visible else 0
+            if visible and local_x >= 0 and local_y >= 0 and local_x + resized_mask.shape[1] <= crop_width and local_y + resized_mask.shape[0] <= crop_height:
                 local_mask[
                     local_y : local_y + resized_mask.shape[0],
                     local_x : local_x + resized_mask.shape[1],
@@ -218,8 +223,10 @@ def prepare(args: argparse.Namespace) -> None:
                     "top": top,
                     "boxX": local_x,
                     "boxY": local_y,
-                    "boxWidth": resized_mask.shape[1],
-                    "boxHeight": resized_mask.shape[0],
+                    "boxWidth": int(resized_mask.shape[1]),
+                    "boxHeight": int(resized_mask.shape[0]),
+                    "maskApplied": bool(visible and np.any(local_mask)),
+                    "disposition": "INPAINT" if visible else "PASSTHROUGH",
                     "cropWidth": crop_width,
                     "cropHeight": crop_height,
                 }
@@ -361,7 +368,7 @@ def composite(args: argparse.Namespace) -> None:
             if not ok:
                 break
             row = by_frame.get(frame_number)
-            if row is not None:
+            if row is not None and bool(row.get("maskApplied", False)):
                 index = frame_number - int(manifest[0]["frame"])
                 restored = cv2.imread(str(args.inpaint_frames / f"{index:04d}.png"))
                 mask = cv2.imread(
@@ -399,6 +406,12 @@ def composite(args: argparse.Namespace) -> None:
     exit_code = process.wait()
     if exit_code != 0:
         raise RuntimeError(f"ffmpeg exited with code {exit_code}")
+    render_manifest = {"version": 1, "frames": manifest}
+    (args.workspace / "render_manifest.json").write_text(json.dumps(render_manifest, indent=2), encoding="utf-8")
+    # The workspace is disposable after a job.  Keep a sidecar next to the
+    # review output so V9 QA can verify actual mask application rather than
+    # inferring it from confidence values in the calibration profile.
+    args.output.with_suffix(".render-manifest.json").write_text(json.dumps(render_manifest, indent=2), encoding="utf-8")
     print(args.output)
 
 

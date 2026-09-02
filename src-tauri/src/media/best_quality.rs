@@ -26,11 +26,12 @@ const DEFAULT_PROPAINTER_PYTHON: &str = r"D:\propainter-watermark-venv\Scripts\p
 const DEFAULT_PROPAINTER_ROOT: &str = r"D:\propainter-watermark-work";
 const DEFAULT_WORK_ROOT: &str = r"D:\watermark-studio-ai-work";
 const CALIBRATION_SCRIPT: &str = "calibrate_best_quality.py";
-const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v8.py";
+const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v9.py";
 const FIND_SAMPLES_SCRIPT: &str = "find_learna_samples.py";
 const AUDIT_SCRIPT: &str = "audit_watermark_detection.py";
 const MIN_MASK_COVERAGE: u64 = 350;
-const QUALITY_QA_SCRIPT: &str = "quality_qa_v8.py";
+const QUALITY_QA_SCRIPT: &str = "quality_qa_v9.py";
+const OPAQUE_BADGE_SCRIPT: &str = "apply_opaque_badge.py";
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -323,7 +324,7 @@ pub fn render_best_quality<F>(
     replacement: Option<&BestQualityReplacement>,
     output_root: Option<&str>,
     output_name: Option<&str>,
-    allow_review_draft: bool,
+    _allow_review_draft: bool,
     cancel: &AtomicBool,
     mut progress: F,
 ) -> Result<PathBuf, AppError>
@@ -363,20 +364,11 @@ where
     validate_replacement(replacement)?;
 
     let profile_path =
-        validate_calibration_profile(project_directory, project, allow_review_draft)?;
-    let profile_value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&profile_path)?).map_err(|error| {
-            AppError::InvalidRequest(format!("Calibration profile is invalid JSON: {error}"))
-        })?;
-    let first_frame = profile_value
-        .get("firstWatermarkFrame")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0)
-        .min(project.video.frame_count.saturating_sub(1));
-    let last_profile_frame = profile_value
-        .get("lastWatermarkFrame")
-        .and_then(|value| value.as_u64())
-        .unwrap_or_else(|| project.video.frame_count.saturating_sub(1));
+        validate_calibration_profile(project_directory, project, _allow_review_draft)?;
+    // V9 frameData is complete for the source; inactive ranges are explicit
+    // passthrough rows, therefore rendering keeps all source frames.
+    let first_frame = 0;
+    let last_profile_frame = project.video.frame_count.saturating_sub(1);
     let hardware = detect_hardware();
     if !hardware.supported {
         return Err(AppError::InvalidRequest(
@@ -431,41 +423,54 @@ where
         &draft,
         cancel,
     ) {
-        let report = qa_report_path(&draft);
-        let retry_range =
-            quality_failed_range(&report, first_frame, last_profile_frame.min(last_frame));
-        if !quality_retry_allowed(&report) || retry_range.is_none() {
-            return Err(first_qa_error);
-        }
-        let (retry_start, retry_end) = retry_range.expect("checked above");
-        let retry_input = draft.with_file_name(format!("{output_stem}.retry-input.mp4"));
-        fs::copy(&draft, &retry_input)?;
+        // A failed inpaint is not silently promoted.  Instead perform one
+        // deterministic, opaque badge pass over the exact frames identified
+        // by the independent full-frame QA.  This guarantees that gaps
+        // between glyphs cannot reveal Learna AI underneath.
         progress(
-            "QA phát hiện residual glyph; đang retry đúng difficult range với mask mở rộng 2 px",
+            "QA còn residual Learna AI; đang che kín các frame lỗi bằng badge QuanPH",
             4,
             5,
         );
-        let retry_result = render_attempt(
-            &python_runtime,
-            &pipeline,
-            &chunks,
-            &project_json,
-            &profile_path,
-            &workspace,
-            &result_root,
-            &propainter_root,
-            &hardware,
-            retry_start,
-            retry_end,
-            &draft,
-            replacement,
-            cancel,
-            2,
-            Some(&retry_input),
-            &mut progress,
-        );
-        let _ = fs::remove_file(&retry_input);
-        retry_result?;
+        let report = qa_report_path(&draft);
+        let badge_script = repo_root.join("tools").join(OPAQUE_BADGE_SCRIPT);
+        let badge_asset = repo_root.join("assets").join("quanph_watermark_v1.png");
+        require_file(&badge_script, "opaque QuanPH fallback")?;
+        let hybrid = output.with_file_name(format!("{output_stem}.hybrid.review.mp4"));
+        let mut badge = python_command(&python_runtime);
+        badge
+            .arg(&badge_script)
+            .arg(&project.source.path)
+            .arg(&draft)
+            .arg(&profile_path)
+            .arg(&report)
+            .arg(&hybrid)
+            .arg("--badge")
+            .arg(&badge_asset);
+        run_process(&mut badge, cancel, "Applying opaque QuanPH fallback")?;
+        if !hybrid.is_file() {
+            return Err(first_qa_error);
+        }
+        let draft_manifest =
+            draft.with_file_name(format!("{output_stem}.review.render-manifest.json"));
+        let hybrid_manifest =
+            hybrid.with_file_name(format!("{output_stem}.hybrid.review.render-manifest.json"));
+        if draft_manifest.is_file() {
+            fs::copy(&draft_manifest, &hybrid_manifest)?;
+        }
+        fs::remove_file(&draft)?;
+        fs::rename(&hybrid, &draft)?;
+        let _ = fs::remove_file(&draft_manifest);
+        if hybrid_manifest.is_file() {
+            fs::rename(hybrid_manifest, draft_manifest)?;
+        }
+        let hybrid_badge_manifest =
+            hybrid.with_file_name(format!("{output_stem}.hybrid.review.badge-manifest.json"));
+        let draft_badge_manifest =
+            draft.with_file_name(format!("{output_stem}.review.badge-manifest.json"));
+        if hybrid_badge_manifest.is_file() {
+            fs::rename(hybrid_badge_manifest, draft_badge_manifest)?;
+        }
         ffmpeg::verify_video_decode(&draft)?;
         run_quality_qa(
             &python_runtime,
@@ -484,6 +489,17 @@ where
     }
     if draft_sheet.is_file() {
         fs::rename(draft_sheet, qa_contact_sheet_path(&output))?;
+    }
+    let draft_manifest = draft.with_file_name(format!("{output_stem}.review.render-manifest.json"));
+    let final_manifest = output.with_file_name(format!("{output_stem}.render-manifest.json"));
+    if draft_manifest.is_file() {
+        fs::rename(draft_manifest, final_manifest)?;
+    }
+    let draft_badge_manifest =
+        draft.with_file_name(format!("{output_stem}.review.badge-manifest.json"));
+    let final_badge_manifest = output.with_file_name(format!("{output_stem}.badge-manifest.json"));
+    if draft_badge_manifest.is_file() {
+        fs::rename(draft_badge_manifest, final_badge_manifest)?;
     }
 
     progress("Best-quality render complete", 5, 5);
@@ -534,7 +550,11 @@ fn render_attempt(
         .arg(first_frame.to_string())
         .arg("--end-frame")
         .arg(last_frame.to_string())
-        .arg("--full-frame");
+        .arg("--dynamic-crop")
+        .arg("--crop-width")
+        .arg("512")
+        .arg("--crop-height")
+        .arg("288");
     if let Some(video) = source_override {
         prepare.arg("--video").arg(video);
     }
@@ -598,69 +618,12 @@ fn render_attempt(
     Ok(())
 }
 
-/// A retry is safe only when QA identifies residual glyph energy.  Expanding
-/// a mask cannot repair a seam, patch or temporal-flicker defect and would
-/// risk altering valid background pixels, so those failures remain review-only.
-fn quality_retry_allowed(report: &Path) -> bool {
-    let Ok(body) = fs::read_to_string(report) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return false;
-    };
-    let Some(reasons) = value
-        .get("metrics")
-        .and_then(|metrics| metrics.get("failureReasons"))
-    else {
-        return false;
-    };
-    let Some(object) = reasons.as_object() else {
-        return false;
-    };
-    let mut saw_residual = false;
-    for row_reasons in object.values() {
-        let Some(items) = row_reasons.as_array() else {
-            return false;
-        };
-        for item in items {
-            let Some(reason) = item.as_str() else {
-                return false;
-            };
-            if reason == "residual_correlation" || reason == "glyph_energy_ratio" {
-                saw_residual = true;
-            } else {
-                return false;
-            }
-        }
-    }
-    saw_residual
-}
-
-fn quality_failed_range(report: &Path, lower: u64, upper: u64) -> Option<(u64, u64)> {
-    let body = fs::read_to_string(report).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let frames = value.get("metrics")?.get("failedFrames")?.as_array()?;
-    let mut values = frames
-        .iter()
-        .filter_map(|item| item.as_u64())
-        .filter(|frame| *frame >= lower && *frame <= upper)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_unstable();
-    Some((
-        values[0].saturating_sub(2).max(lower),
-        values[values.len() - 1].saturating_add(2).min(upper),
-    ))
-}
-
 pub fn qa_report_path(output: &Path) -> PathBuf {
     let stem = output
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    output.with_file_name(format!("{stem}.qa.v8.json"))
+    output.with_file_name(format!("{stem}.qa.v9.json"))
 }
 
 pub fn qa_contact_sheet_path(output: &Path) -> PathBuf {
@@ -668,7 +631,7 @@ pub fn qa_contact_sheet_path(output: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    output.with_file_name(format!("{stem}.qa.v8.png"))
+    output.with_file_name(format!("{stem}.qa.v9.png"))
 }
 
 /// Re-checks an existing `.review.mp4` with the current QA implementation and
@@ -742,6 +705,19 @@ where
     if review_sheet.is_file() {
         fs::rename(review_sheet, qa_contact_sheet_path(&final_output))?;
     }
+    let review_manifest =
+        review_output.with_file_name(format!("{}.review.render-manifest.json", review_stem));
+    let final_manifest = final_output.with_file_name(format!("{review_stem}.render-manifest.json"));
+    if review_manifest.is_file() {
+        fs::rename(review_manifest, final_manifest)?;
+    }
+    let review_badge_manifest =
+        review_output.with_file_name(format!("{review_stem}.review.badge-manifest.json"));
+    let final_badge_manifest =
+        final_output.with_file_name(format!("{review_stem}.badge-manifest.json"));
+    if review_badge_manifest.is_file() {
+        fs::rename(review_badge_manifest, final_badge_manifest)?;
+    }
     progress("Review output promoted after QA", 2, 2);
     Ok(final_output)
 }
@@ -771,7 +747,7 @@ pub fn calibration_metadata(
     let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path)?)
         .map_err(|error| {
             AppError::CalibrationCorrupt(format!(
-            "non-standard JSON value or truncated write; regenerate CalibrationProfileV8 ({error})"
+            "non-standard JSON value or truncated write; regenerate CalibrationProfileV9 ({error})"
         ))
         })?;
     let profile_frame_count = profile
@@ -792,14 +768,14 @@ pub fn calibration_metadata(
         .get("version")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    let trajectory_ready = !matches!(profile_version, 5..=8)
+    let trajectory_ready = !matches!(profile_version, 5..=9)
         || (profile
             .get("trajectoryGate")
             .and_then(|value| value.get("status"))
             .and_then(|value| value.as_str())
             == Some("PASSED")
             && profile.get("trajectoryModel").is_some());
-    let is_ready = profile_version == 8
+    let is_ready = profile_version == 9
         && profile_frame_count == project.video.frame_count
         && mask_pixels >= MIN_MASK_COVERAGE
         && profile.get("status").and_then(|value| value.as_str()) == Some("READY")
@@ -1325,29 +1301,31 @@ fn normalize_scan_range(
 fn validate_calibration_profile(
     project_directory: &Path,
     project: &Project,
-    allow_review_draft: bool,
+    _allow_review_draft: bool,
 ) -> Result<PathBuf, AppError> {
     let profile_path = project_directory.join("calibration").join("profile.json");
     if !profile_path.is_file() {
         return Err(AppError::InvalidRequest(
-            "Best-quality render requires a confirmed CalibrationProfileV8. Run Auto-find & calibrate in Review first."
+            "Best-quality render requires a confirmed CalibrationProfileV9. Run automatic calibration in Review first."
                 .to_string(),
         ));
     }
     let body = fs::read_to_string(&profile_path)?;
     let mut profile: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         AppError::CalibrationCorrupt(format!(
-            "non-standard JSON numbers or truncated write; regenerate V8 ({error})"
+            "non-standard JSON numbers or truncated write; regenerate V9 ({error})"
         ))
     })?;
     let metadata = calibration_metadata(project_directory, project)?;
     let review_draft =
         profile.get("outcome").and_then(|value| value.as_str()) == Some("NEEDS_REVIEW_DRAFT");
-    let status_allowed =
-        metadata.quality.status == CalibrationStatus::Ready || (allow_review_draft && review_draft);
-    if metadata.version != 8 || !status_allowed {
+    // A terminal draft may be rendered for QA/fallback inspection, but the
+    // output is promoted only after the independent V9 QA gate passes.
+    let status_allowed = metadata.quality.status == CalibrationStatus::Ready
+        || (_allow_review_draft && review_draft);
+    if metadata.version != 9 || !status_allowed {
         return Err(AppError::InvalidRequest(
-            "Calibration is stale or did not pass the V8 quality gate. Regenerate it in Review."
+            "Calibration is stale or did not pass the V9 quality gate. Regenerate it in Review."
                 .to_string(),
         ));
     }

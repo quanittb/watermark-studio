@@ -3,8 +3,9 @@ use crate::jobs::{self, JobRecord, JobStatus};
 use crate::media::{best_quality, ffmpeg, ffprobe};
 use crate::media::{mask, render};
 use crate::project::model::{
-    AnchorFrame, AnchorType, BoundingBox, FrameResult, ManualAnchor, Project, RemovalConfig,
-    RoiEvidenceRecord, ScanRange, TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
+    AnchorFrame, AnchorType, BoundingBox, CalibrationProfile, FrameResult, ManualAnchor, Project,
+    RemovalConfig, RoiEvidenceRecord, ScanRange, TemplatePaths, TrackingFrame, TrackingStatus,
+    WatermarkConfig,
 };
 use crate::project::service;
 use crate::tracking;
@@ -606,6 +607,54 @@ pub async fn auto_calibrate_best_quality(
     })
     .await
     .map_err(|error| AppError::Io(format!("Adaptive calibration task failed: {error}")))?
+    .map_err(Into::into)
+}
+
+/// V9-named IPC aliases keep the new one-click flow explicit while older
+/// frontends can continue using `auto_calibrate_best_quality` unchanged.
+#[tauri::command]
+pub async fn start_auto_calibration_v9(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: AdaptiveCalibrationRequest,
+) -> Result<Project, AppErrorDto> {
+    auto_calibrate_best_quality(app, state, request).await
+}
+
+#[tauri::command]
+pub async fn enqueue_hybrid_v9(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: EnqueueBestQualityRequest,
+) -> Result<JobRecord, AppErrorDto> {
+    enqueue_best_quality_job(app, state, request).await
+}
+
+#[tauri::command]
+pub async fn revalidate_output_v9(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<JobRecord, AppErrorDto> {
+    revalidate_review_job(app, state, job_id).await
+}
+
+#[tauri::command]
+pub async fn validate_calibration_v9(
+    app: AppHandle,
+    project_id: String,
+) -> Result<CalibrationProfile, AppErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let project = service::load_project(&app_data_dir, &project_id)?;
+        let directory = service::project_directory(&app_data_dir, &project.id)?;
+        best_quality::validate_calibration(&directory, &project)
+    })
+    .await
+    .map_err(|error| AppError::Io(format!("V9 validation failed: {error}")))?
     .map_err(Into::into)
 }
 
@@ -1332,14 +1381,7 @@ pub async fn revalidate_review_job(
                 .to_string(),
         );
         updated.contact_sheet_path = Some(
-            output
-                .with_file_name(format!(
-                    "{}.qa.v8.png",
-                    output
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("output")
-                ))
+            best_quality::qa_contact_sheet_path(&output)
                 .to_string_lossy()
                 .to_string(),
         );
@@ -1361,6 +1403,9 @@ pub async fn enqueue_best_quality_job(
     state: State<'_, AppState>,
     request: EnqueueBestQualityRequest,
 ) -> Result<JobRecord, AppErrorDto> {
+    // Retained for IPC compatibility with older clients; V9 deliberately
+    // ignores the legacy draft-queue flag.
+    let _ = request.allow_review_draft;
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -1376,7 +1421,12 @@ pub async fn enqueue_best_quality_job(
             .calibration
             .as_ref()
             .and_then(|profile| profile.outcome.as_deref())
-            == Some("NEEDS_REVIEW_DRAFT");
+            == Some("NEEDS_REVIEW_DRAFT")
+        && project
+            .calibration
+            .as_ref()
+            .map(|profile| profile.version == 9)
+            .unwrap_or(false);
     if !calibration_ready && !review_draft_allowed {
         best_quality::validate_calibration(&project_directory, &project)
             .map_err(AppErrorDto::from)?;
@@ -1414,6 +1464,8 @@ pub async fn enqueue_best_quality_job(
         .transpose()
         .map_err(AppError::from)
         .map_err(AppErrorDto::from)?;
+    // V9 review drafts are inspection artifacts only and never enter the
+    // final GPU queue.
     record.allow_review_draft = review_draft_allowed;
     records.push(record.clone());
     jobs::save(&app_data_dir, &records).map_err(AppErrorDto::from)?;
@@ -1685,14 +1737,14 @@ fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
                             job.status = JobStatus::NeedsReview;
                             job.stage = "Quality review required".to_string();
                             job.output_path = report
-                                .strip_suffix(".qa.v8.json")
+                                .strip_suffix(".qa.v9.json")
                                 .or_else(|| report.strip_suffix(".qa.json"))
                                 .map(|value| format!("{value}.mp4"));
                             job.qa_report_path = Some(report.clone());
                             job.contact_sheet_path = report
-                                .strip_suffix(".qa.v8.json")
+                                .strip_suffix(".qa.v9.json")
                                 .or_else(|| report.strip_suffix(".qa.json"))
-                                .map(|value| format!("{value}.qa.v8.png"));
+                                .map(|value| format!("{value}.qa.v9.png"));
                             job.error_code = Some("QUALITY_NEEDS_REVIEW".to_string());
                             job.error = Some(format!("Review QA report: {report}"));
                         }

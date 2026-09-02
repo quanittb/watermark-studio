@@ -41,6 +41,16 @@ export interface ScanRange {
   startFrame: number;
   endFrame: number;
 }
+export type RenderPolicy = 'REMOVE_THEN_COVER' | 'COVER_ALL_FAST' | 'REMOVE_ONLY';
+export type FrameDisposition = 'INPAINT' | 'COVER_BADGE' | 'PASSTHROUGH';
+export interface CalibrationProfileV9 {
+  sourceFingerprint: { sha256: string; sizeBytes: number; frameCount: number; width: number; height: number };
+  activeIntervals: Array<{ startFrame: number; endFrame: number }>;
+  frameData: Array<{ frame: number; bbox: BoundingBox; maskRequired: boolean; positionSource: string; uncertaintyPx?: number }>;
+  detectorVersion: string;
+  profileSha256: string;
+  status: 'READY' | 'NEEDS_REVIEW';
+}
 export interface CalibrationProfile {
   version: number;
   preset: CalibrationPreset;
@@ -87,6 +97,8 @@ export interface CalibrationProfile {
     positionSource: string;
     scale: number;
     opacity: number;
+    uncertaintyPx?: number;
+    sceneId?: number;
   }>;
   trajectoryGate?: {
     status: 'PASSED' | 'FAILED';
