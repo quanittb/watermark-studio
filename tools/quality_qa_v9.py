@@ -76,16 +76,15 @@ def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | No
     best: dict[str, Any] | None = None
     for polarity in ("positive", "negative"):
         feature, ax, ay, base = v6.feature_negative(frame) if polarity == "negative" else v6.feature(frame)
-        # QA remains full-frame/full-frame-count, but uses a compact scale
-        # pyramid.  The canonical Learna asset is handled at 0.70/0.95/1.25;
-        # a candidate outside these bands is still caught by the source-vs-
-        # output energy/manifest gates and can trigger the opaque fallback.
-        for scale in (0.70, 0.95, 1.25):
+        # QA remains full-frame/full-count, but uses a compact scale pyramid
+        # that includes the known small (roughly 0.75x) Learna rendering. A
+        # single coarse scale can rank a background texture above the glyph.
+        for scale in (0.62, 0.70, 0.78, 0.95, 1.20, 1.35):
             template, mask = v6.template_feature(canonical, scale, base, ax, ay)
             if feature.shape[0] < template.shape[0] or feature.shape[1] < template.shape[1]:
                 continue
             response = cv2.matchTemplate(feature, template, cv2.TM_CCORR_NORMED, mask=mask)
-            for raw, (tx, ty) in v6.top_matches(response, template.shape[1], template.shape[0], 1):
+            for raw, (tx, ty) in v6.top_matches(response, template.shape[1], template.shape[0], 4):
                 x = tx / ax + v6.MASK_BORDER_X * base * scale
                 y = ty / ay + v6.MASK_BORDER_Y * base * scale
                 width = v6.CANONICAL_WIDTH * base * scale
@@ -117,6 +116,31 @@ def crop_ssim(source: np.ndarray, output: np.ndarray, row: dict[str, Any]) -> fl
     cov = float(np.mean((a[valid] - mean_a) * (b[valid] - mean_b)))
     c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
     return float(((2 * mean_a * mean_b + c1) * (2 * cov + c2)) / ((mean_a * mean_a + mean_b * mean_b + c1) * (va + vb + c2)))
+
+
+def detections_match(source_row: dict[str, Any] | None, output_row: dict[str, Any] | None) -> bool:
+    """Require output residual evidence to be spatially tied to source WTM.
+
+    Full-frame scanning must not turn an unrelated subtitle/texture into a
+    residual failure.  At a fixed frame the old watermark cannot teleport;
+    requiring centre distance/IoU agreement preserves detection of a missed
+    mask while rejecting an independent background peak.
+    """
+    if not source_row or not output_row:
+        return False
+    sx = float(source_row.get("x", 0.0)); sy = float(source_row.get("y", 0.0))
+    sw = float(source_row.get("width", 0.0)); sh = float(source_row.get("height", 0.0))
+    ox = float(output_row.get("x", 0.0)); oy = float(output_row.get("y", 0.0))
+    ow = float(output_row.get("width", 0.0)); oh = float(output_row.get("height", 0.0))
+    if min(sw, sh, ow, oh) <= 0:
+        return False
+    sx2, sy2, ox2, oy2 = sx + sw, sy + sh, ox + ow, oy + oh
+    ix0, iy0, ix1, iy1 = max(sx, ox), max(sy, oy), min(sx2, ox2), min(sy2, oy2)
+    intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    union = sw * sh + ow * oh - intersection
+    iou = intersection / union if union > 0 else 0.0
+    distance = float(np.hypot((sx + sx2 - ox - ox2) * 0.5, (sy + sy2 - oy - oy2) * 0.5))
+    return iou >= 0.08 or distance <= max(48.0, 0.65 * max(sw, ow, sh, oh))
 
 
 def panel(frame: int, source: np.ndarray, output: np.ndarray, source_row: dict[str, Any] | None, output_row: dict[str, Any] | None, active: bool) -> np.ndarray:
@@ -164,6 +188,15 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     samples: list[tuple[int, np.ndarray, np.ndarray, dict[str, Any] | None, dict[str, Any] | None, bool]] = []
     previous_output: np.ndarray | None = None
+    previous_badge = False
+    badge_manifest_path = a.output.with_suffix(".badge-manifest.json")
+    badge_frames: set[int] = set()
+    if badge_manifest_path.is_file():
+        try:
+            badge_payload = json.loads(badge_manifest_path.read_text(encoding="utf-8"))
+            badge_frames = {int(value) for value in badge_payload.get("appliedFrames", [])}
+        except (OSError, ValueError, TypeError):
+            badge_frames = set()
     decoded = 0
     try:
         for frame in range(frame_count):
@@ -181,13 +214,18 @@ def main() -> None:
             # that frame inactive.  Frames outside the range remain explicit
             # passthrough and are reported as unchecked by policy.
             in_scan = start <= frame <= end
-            residual = bool(in_scan and source_present and output_row and output_row["geometryScore"] >= RESIDUAL_GEOMETRY and output_row["rawScore"] >= RESIDUAL_RAW)
-            ssim = crop_ssim(source, output, source_row or frame_data[frame].get("bbox", {})) if active else 1.0
+            residual = bool(in_scan and source_present and detections_match(source_row, output_row) and output_row["geometryScore"] >= RESIDUAL_GEOMETRY and output_row["rawScore"] >= RESIDUAL_RAW)
+            badge_applied = frame in badge_frames
+            # The opaque badge is an intentional replacement plate. It must be
+            # excluded from the inpaint outside-mask similarity/flicker gate;
+            # the independent residual detector remains a hard gate there.
+            ssim = 1.0 if badge_applied else (crop_ssim(source, output, source_row or frame_data[frame].get("bbox", {})) if active else 1.0)
             flicker = 0.0
-            if previous_output is not None and previous_output.shape == output.shape:
+            if not badge_applied and not previous_badge and previous_output is not None and previous_output.shape == output.shape:
                 flicker = float(np.mean(np.abs(output.astype(np.float32) - previous_output.astype(np.float32))) / 255.0)
             previous_output = output.copy()
-            row = {"frame": frame, "active": active, "maskRequired": bool(frame_data[frame].get("maskRequired", False)), "sourceDetection": source_row, "outputDetection": output_row, "sourcePresent": source_present, "residual": residual, "outsideMaskSsim": ssim, "temporalFlicker": flicker, "maskApplied": bool(frame_data[frame].get("maskRequired", False))}
+            previous_badge = badge_applied
+            row = {"frame": frame, "active": active, "maskRequired": bool(frame_data[frame].get("maskRequired", False)), "sourceDetection": source_row, "outputDetection": output_row, "sourcePresent": source_present, "residual": residual, "outsideMaskSsim": ssim, "temporalFlicker": flicker, "maskApplied": bool(frame_data[frame].get("maskRequired", False)), "badgeApplied": badge_applied}
             rows.append(row)
             if residual or (active and frame in {start, end}) or (active and frame % 60 == 0):
                 samples.append((frame, source.copy(), output.copy(), source_row, output_row, active))
@@ -202,14 +240,6 @@ def main() -> None:
     # historical false-pass where a wrong trajectory excluded the true glyph
     # from both the QA denominator and the fallback cover.
     required = [row for row in rows if row["active"] or (row["sourcePresent"] and start <= int(row["frame"]) <= end)]
-    badge_manifest_path = a.output.with_suffix(".badge-manifest.json")
-    badge_frames: set[int] = set()
-    if badge_manifest_path.is_file():
-        try:
-            badge_payload = json.loads(badge_manifest_path.read_text(encoding="utf-8"))
-            badge_frames = {int(value) for value in badge_payload.get("appliedFrames", [])}
-        except (OSError, ValueError, TypeError):
-            badge_frames = set()
     for row in required:
         row["maskApplied"] = bool(row["maskApplied"] or int(row["frame"]) in badge_frames)
     failed = [row for row in required if row["residual"] or row["outsideMaskSsim"] < MIN_OUTSIDE_SSIM or row["temporalFlicker"] > MAX_FLICKER or not row["maskApplied"]]

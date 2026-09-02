@@ -1811,12 +1811,13 @@ fn run_process(command: &mut Command, cancel: &AtomicBool, phase: &str) -> Resul
                 if let Some(mut pipe) = child.stderr.take() {
                     let _ = pipe.read_to_string(&mut stderr);
                 }
+                let stderr_summary = summarize_process_stderr(&stderr);
                 let details = format!(
                     "{phase} failed with exit code {}. {}",
                     status
                         .code()
                         .map_or("unknown".to_string(), |code| code.to_string()),
-                    stderr.trim()
+                    stderr_summary
                 );
                 let lower = details.to_ascii_lowercase();
                 if lower.contains("no space left on device")
@@ -1837,6 +1838,42 @@ fn run_process(command: &mut Command, cancel: &AtomicBool, phase: &str) -> Resul
             }
         }
     }
+}
+
+/// Python/OpenCV tools often emit a several-hundred-line traceback.  Exposing
+/// that whole buffer in a modal hides the actionable reason and can make the
+/// UI appear frozen. Keep the structured error code/last exception while
+/// retaining a short diagnostic tail for support logs.
+fn summarize_process_stderr(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "no diagnostic output".to_string();
+    }
+    let mut selected: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.contains("INVALID_")
+                || line.contains("NO_VALID_")
+                || line.contains("RuntimeError")
+                || line.contains("ValueError")
+                || line.contains("FileNotFoundError")
+                || line.contains("CUDA")
+                || line.contains("out of memory")
+                || line.contains("libpng")
+        })
+        .collect();
+    if selected.is_empty() {
+        selected = lines.iter().rev().take(2).copied().collect();
+        selected.reverse();
+    } else if selected.len() > 3 {
+        selected = selected.split_off(selected.len() - 3);
+    }
+    selected.join(" | ")
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), AppError> {

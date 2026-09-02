@@ -10,10 +10,16 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import quality_qa_v9 as qa  # noqa: E402
 
 
 def args() -> argparse.Namespace:
@@ -113,6 +119,7 @@ def main() -> None:
     frame_count = int(profile.get("frameCount", 0))
     target_frames = expanded_frames(failed, frame_count)
     frame_data = profile.get("frameData", [])
+    canonical = qa.v6.load_canonical()
     badge_path = a.badge if a.badge is not None else Path(__file__).resolve().parents[1] / "assets" / "quanph_watermark_v1.png"
     a.output.parent.mkdir(parents=True, exist_ok=True)
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
@@ -138,8 +145,16 @@ def main() -> None:
                 # stale trajectory can miss the glyph by hundreds of pixels;
                 # using that stale box for the cover would reproduce the old
                 # transparent-badge failure.
-                detected = report_rows.get(frame, {}).get("outputDetection")
-                if isinstance(detected, dict) and float(detected.get("width", 0) or 0) > 0:
+                # Re-scan the source at fallback time.  QA intentionally keeps
+                # only the best candidate, which can be a background peak when
+                # the watermark is heavily blurred.  A fresh full-frame V9
+                # search at the target frame recovers the true location and
+                # prevents a plate being drawn around the wrong trajectory box.
+                source_detected = qa.detect_fast(source, canonical)
+                detected = report_row.get("outputDetection")
+                if isinstance(source_detected, dict) and float(source_detected.get("geometryScore", 0) or 0) >= qa.MIN_SOURCE_GEOMETRY:
+                    bbox = source_detected
+                elif isinstance(detected, dict) and float(detected.get("width", 0) or 0) > 0:
                     bbox = detected
                 # A stale/under-inclusive activity interval must not prevent
                 # the safety cover.  QA has already found a source/output

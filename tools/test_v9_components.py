@@ -45,6 +45,13 @@ class V9ComponentTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertFalse(details["frameCountMatches"])
 
+    def test_quality_residual_must_match_source_location(self) -> None:
+        source = {"x": 700, "y": 1400, "width": 230, "height": 70}
+        same = {"x": 704, "y": 1402, "width": 230, "height": 70}
+        background = {"x": 80, "y": 300, "width": 230, "height": 70}
+        self.assertTrue(qa.detections_match(source, same))
+        self.assertFalse(qa.detections_match(source, background))
+
     def test_strict_profile_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
