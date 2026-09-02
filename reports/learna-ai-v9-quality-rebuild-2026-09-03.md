@@ -6,6 +6,8 @@
 - Checkpoint trước sửa: `a026b0b4cbb4e13241cd57d7d4b13364142e5915`
 - Milestone detector: `b8cab4f`
 - QA độc lập/full-frame: `5f5e425`
+- UI acceptance + QA reuse: `cf935da`
+- UI wording polish: `3ad7ec1`
 - Không push remote; source video và golden output không bị ghi đè.
 
 ## Thay đổi đã thực hiện
