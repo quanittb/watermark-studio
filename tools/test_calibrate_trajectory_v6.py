@@ -122,7 +122,15 @@ class CalibrationV6ReviewTests(unittest.TestCase):
     def test_roi_review_stops_after_evidence_saturation(self) -> None:
         self.assertTrue(
             CALIBRATION.should_suppress_roi_review(
-                48, 0.18, 0.72, 15.60, 3.0, 55
+                6, 0.18, 0.72, 15.60, 3.0, 55
+            )
+        )
+
+    def test_roi_review_uses_explicit_evidence_count_not_accepted_rows(self) -> None:
+        """Weak ROI image scores must not restart the manual-ROI loop."""
+        self.assertTrue(
+            CALIBRATION.should_suppress_roi_review(
+                6, 0.24, 0.97, 9.31, 3.0, 450
             )
         )
 

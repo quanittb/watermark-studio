@@ -74,12 +74,15 @@ MAX_GAP = 18
 REVIEW_MERGE_GAP = 72
 REVIEW_MAX_CLUSTER_SPAN = 360
 MAX_REVIEW_RANGES = 8
-# Once enough independent ROI anchors cover the motion, repeatedly asking the
-# user for more anchors is not useful: a high residual then indicates that the
-# fitted path itself needs refinement.  Keep these thresholds deliberately
-# conservative so this is only a UX/convergence guard; it never relaxes the
-# trajectory or render quality gates.
-ROI_SATURATION_MIN_EVIDENCE = 24
+# Once a handful of independent ROI anchors cover the motion, repeatedly asking
+# the user for more anchors is not useful: a high residual then indicates that
+# the fitted path itself needs refinement.  The old value (24) counted only
+# ROI rows that happened to survive the image gate, so a user could draw many
+# valid ROIs and still receive the same review list forever.  Count explicit
+# user evidence for this UX/convergence guard; it never relaxes trajectory or
+# render quality gates.  Six anchors cover the usual Learna motion phases while
+# keeping sparse projects actionable.
+ROI_SATURATION_MIN_EVIDENCE = 6
 ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15
 ROI_SATURATION_MIN_PATH_COVERAGE = 0.70
 # V7 changes the acceptance contract: the selected path must be locally
@@ -2036,7 +2039,11 @@ def main() -> None:
     # 15 px), so expose that diagnosis and leave the profile fail-closed until
     # the automatic refinement stage brings the residual below the gate.
     roi_review_saturated = should_suppress_roi_review(
-        len(roi_measured),
+        # Saturation is based on the evidence the user supplied, not only the
+        # subset that happened to pass the provisional image gate.  A broad ROI
+        # is intentionally a location hint, so its image score may be weak on
+        # a blurred/occluded frame even when it is useful to the trajectory.
+        len(roi_evidence),
         confirmed_coverage,
         measured_coverage,
         # Use the raw candidate residual to decide whether more ROI hints are
@@ -2191,7 +2198,8 @@ def main() -> None:
                 "confirmedCoverage": confirmed_coverage,
                 "measuredCoverage": measured_coverage,
                 "hardMeasuredCount": len(hard_measured),
-                "roiEvidenceCount": len(roi_measured),
+                "roiEvidenceCount": len(roi_evidence),
+                "acceptedRoiEvidenceCount": len(roi_measured),
                 "globalSpanRatio": global_span_ratio,
                 "activeIntervals": active_intervals,
                 "periodicPriorUsed": periodic_transform is not None,
@@ -2357,7 +2365,8 @@ def main() -> None:
             "confirmedCoverage": confirmed_coverage,
             "measuredCoverage": measured_coverage,
             "hardMeasuredFrames": len(hard_measured),
-            "roiEvidenceFrames": len(roi_measured),
+            "roiEvidenceFrames": len(roi_evidence),
+            "acceptedRoiEvidenceFrames": len(roi_measured),
             "globalSpanRatio": global_span_ratio,
             "maxInterpolationGap": 6 if periodic_transform is not None else max_gap,
             "failureReasons": failure_reasons,

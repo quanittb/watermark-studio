@@ -102,7 +102,10 @@ const defaultRemoval: RemovalConfig = {
 // Match the calibration convergence guard in calibrate_trajectory_v6.py.  It
 // is intentionally only a review-hint guard: a saturated but inaccurate path
 // remains NEEDS_REVIEW and cannot be queued or rendered.
-const ROI_SATURATION_MIN_EVIDENCE = 24;
+// Six explicit anchors are enough to cover the normal Learna motion phases.
+// Saturation stops an endless ROI loop; it never unlocks a profile that fails
+// trajectory/holdout/refinement gates.
+const ROI_SATURATION_MIN_EVIDENCE = 6;
 const ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15;
 const ROI_SATURATION_MIN_PATH_COVERAGE = 0.70;
 const defaultBestReplacement: BestQualityReplacement = {
@@ -417,7 +420,13 @@ export default function App() {
     ...roiEvidence.map((item) => item.frame),
   ]);
   const calibrationGate = project?.calibration?.trajectoryGate;
-  const calibrationRoiCount = calibrationGate?.roiEvidenceFrames ?? calibrationEvidenceFrames.size;
+  // Prefer the union of profile and local evidence.  The backend also exposes
+  // accepted-vs-input counts; using only accepted rows made a weak but valid
+  // ROI disappear from the saturation calculation and reappear as a new task.
+  const calibrationRoiCount = Math.max(
+    calibrationGate?.roiEvidenceFrames ?? 0,
+    calibrationEvidenceFrames.size,
+  );
   const calibrationConfirmedCoverage = calibrationGate?.confirmedCoverage ?? 0;
   const calibrationMeasuredCoverage = calibrationGate?.measuredCoverage ?? 0;
   const calibrationResidualP95 = calibrationGate?.residualP95 ?? null;
@@ -1312,7 +1321,6 @@ export default function App() {
         setMessage(`CalibrationProfileV7 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
         setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V7 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
       } else {
-        setMessage("Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.");
         const reasons = updatedProject.calibration?.trajectoryGate?.failureReasons?.join(", ") || "TRAJECTORY_UNDERCONSTRAINED";
         const gate = updatedProject.calibration?.trajectoryGate;
         const measured = updatedProject.calibration?.quality.reliableFrames ?? 0;
@@ -1326,7 +1334,11 @@ export default function App() {
           ),
         );
         const reviewRanges = formatCalibrationReviewRanges(actionableRanges);
-        const roiCount = gate?.roiEvidenceFrames ?? roiEvidence.length;
+        const roiCount = Math.max(
+          gate?.roiEvidenceFrames ?? 0,
+          evidence.length,
+          roiEvidence.length,
+        );
         const refinementRequired = gate?.failureReasons?.includes("TRAJECTORY_REFINEMENT_REQUIRED")
           || Boolean(
             roiCount >= ROI_SATURATION_MIN_EVIDENCE
@@ -1344,6 +1356,11 @@ export default function App() {
           : roiCount >= 12
             ? "Bạn đã cung cấp đủ ROI evidence đại diện; không cần khoanh thêm. Quỹ đạo còn cần bước refine tự động trước khi được phép render."
             : "Profile này chưa chứa reviewRanges (lần quét cũ hoặc chưa gửi ROI evidence). Hãy đóng dialog, thêm ROI ở vài đoạn watermark còn nhìn thấy rồi chạy lại để hệ thống tính gợi ý chính xác.";
+        setMessage(
+          refinementRequired
+            ? "Đã đủ ROI evidence đại diện; không yêu cầu khoanh thêm. Hệ thống sẽ giữ profile NEEDS_REVIEW cho đến khi refine quỹ đạo và holdout đạt."
+            : "Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.",
+        );
         const hardMeasured = gate?.hardMeasuredFrames ?? 0;
         const confirmedCoverage = gate?.confirmedCoverage;
         const measuredCoverage = gate?.measuredCoverage;
