@@ -30,6 +30,7 @@ RESIDUAL_RAW = 0.52
 MIN_SOURCE_GEOMETRY = 0.42
 MIN_OUTSIDE_SSIM = 0.965
 MAX_FLICKER = 0.16
+_QA_TEMPLATE_CACHE: dict[tuple[int, float, float, float], list[tuple[float, np.ndarray, np.ndarray]]] = {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,34 +72,84 @@ def metadata_gate(source: dict[str, Any], output: dict[str, Any], expected: int)
     return passed, {"sourceVideo": sv, "outputVideo": ov, "sourceHasAudio": sa, "outputHasAudio": oa, "frameCountMatches": frames_ok, "durationDeltaSeconds": duration_delta, "passed": passed}
 
 
+def _qa_features(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+    """Build positive/negative high-pass maps with one resize/blur pass."""
+    source_height, source_width = frame.shape[:2]
+    scale = min(1.0, v6.ANALYSIS_LONG_EDGE / max(source_width, source_height))
+    analysis_width = max(32, int(round(source_width * scale)))
+    analysis_height = max(32, int(round(source_height * scale)))
+    analysis = cv2.resize(frame, (analysis_width, analysis_height), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(analysis, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    smooth = cv2.GaussianBlur(gray, (0, 0), 2.2)
+    base = min(source_width / v6.REFERENCE_WIDTH, source_height / v6.REFERENCE_HEIGHT)
+    ax, ay = analysis_width / source_width, analysis_height / source_height
+    return np.maximum(gray - smooth, 0.0), np.maximum(smooth - gray, 0.0), ax, ay, base
+
+
+def _qa_templates(canonical: np.ndarray, base: float, ax: float, ay: float) -> list[tuple[float, np.ndarray, np.ndarray]]:
+    key = (id(canonical), round(base, 6), round(ax, 6), round(ay, 6))
+    cached = _QA_TEMPLATE_CACHE.get(key)
+    if cached is None:
+        cached = []
+        for scale in (0.62, 0.70, 0.78, 0.95, 1.20, 1.35):
+            template, mask = v6.template_feature(canonical, scale, base, ax, ay)
+            cached.append((scale, template, mask))
+        _QA_TEMPLATE_CACHE[key] = cached
+    return cached
+
+
 def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | None:
-    """Search the whole frame at analysis resolution and refine only peaks."""
+    """Search the whole frame at a bounded analysis resolution and refine peaks.
+
+    QA still reads every source/output frame and evaluates each selected box at
+    source resolution.  The proposal pass uses the same 405x720 analysis
+    resolution as calibration so small, blurred glyphs are not lost during a
+    second resize; the bounded five-scale pyramid is the performance limit.
+    """
     best: dict[str, Any] | None = None
-    for polarity in ("positive", "negative"):
-        feature, ax, ay, base = v6.feature_negative(frame) if polarity == "negative" else v6.feature(frame)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    positive_feature, negative_feature, ax, ay, base = _qa_features(frame)
+    templates = _qa_templates(canonical, base, ax, ay)
+    for polarity, feature in (("positive", positive_feature), ("negative", negative_feature)):
         # QA remains full-frame/full-count, but uses a compact scale pyramid
         # that includes the known small (roughly 0.75x) Learna rendering. A
         # single coarse scale can rank a background texture above the glyph.
-        for scale in (0.62, 0.70, 0.78, 0.95, 1.20, 1.35):
-            template, mask = v6.template_feature(canonical, scale, base, ax, ay)
+        for scale, template, mask in templates:
             if feature.shape[0] < template.shape[0] or feature.shape[1] < template.shape[1]:
                 continue
             response = cv2.matchTemplate(feature, template, cv2.TM_CCORR_NORMED, mask=mask)
+            # Keep enough spatially distinct peaks for a faint glyph to
+            # survive a stronger subtitle/texture peak at the same scale.
+            # The analysis pyramid is bounded, so four peaks remains cheaper
+            # than the former full-resolution twelve-scale scan.
             for raw, (tx, ty) in v6.top_matches(response, template.shape[1], template.shape[0], 4):
                 x = tx / ax + v6.MASK_BORDER_X * base * scale
                 y = ty / ay + v6.MASK_BORDER_Y * base * scale
                 width = v6.CANONICAL_WIDTH * base * scale
                 height = v6.CANONICAL_HEIGHT * base * scale
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 metrics = v6.evaluate_box(gray, x, y, width, height, canonical)
                 if metrics is None:
                     continue
                 corr, iou, contamination, large = metrics
-                score = float(corr + 0.95 * iou - 0.55 * contamination - (0.18 if large else 0.0))
+                # Give canonical glyph overlap more weight than raw response.
+                # A high-contrast background edge can win CCORR while having
+                # virtually zero glyph IoU; QA must prefer the candidate whose
+                # actual letter geometry agrees with Learna AI.
+                score = float(corr + 2.0 * iou - 0.55 * contamination - (0.18 if large else 0.0))
                 candidate = {"x": float(x), "y": float(y), "width": float(width), "height": float(height), "rawScore": float(raw), "glyphCorrelation": float(corr), "glyphIou": float(iou), "contamination": float(contamination), "geometryScore": score, "polarity": polarity}
                 if best is None or (candidate["geometryScore"] + candidate["rawScore"] * 0.2) > (best["geometryScore"] + best["rawScore"] * 0.2):
                     best = candidate
     return best
+
+
+def _ssim_valid(a: np.ndarray, b: np.ndarray, valid: np.ndarray) -> float:
+    if not np.any(valid):
+        return 1.0
+    mean_a, mean_b = float(a[valid].mean()), float(b[valid].mean())
+    va, vb = float(a[valid].var()), float(b[valid].var())
+    cov = float(np.mean((a[valid] - mean_a) * (b[valid] - mean_b)))
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    return float(((2 * mean_a * mean_b + c1) * (2 * cov + c2)) / ((mean_a * mean_a + mean_b * mean_b + c1) * (va + vb + c2)))
 
 
 def crop_ssim(
@@ -129,6 +180,20 @@ def crop_ssim(
     try:
         glyph_width = max(1, int(round(float(row.get("width", 0)))))
         glyph_height = max(1, int(round(float(row.get("height", 0)))))
+        if exclude_padding >= 16:
+            # Badge mode intentionally changes the entire opaque plate.  A
+            # glyph-only exclusion would still score the plate's rounded
+            # corners as an unrelated background edit.
+            px = int(exclude_padding)
+            rx0 = max(0, int(round(float(row.get("x", 0)) - x0 - px)))
+            ry0 = max(0, int(round(float(row.get("y", 0)) - y0 - px)))
+            rx1 = min(valid.shape[1], int(round(float(row.get("x", 0)) - x0 + float(row.get("width", 0)) + px)))
+            ry1 = min(valid.shape[0], int(round(float(row.get("y", 0)) - y0 + float(row.get("height", 0)) + px)))
+            if rx1 > rx0 and ry1 > ry0:
+                valid[ry0:ry1, rx0:rx1] = False
+            if not np.any(valid):
+                return 1.0
+            return _ssim_valid(a, b, valid)
         glyph = cv2.resize(canonical, (glyph_width, glyph_height), interpolation=cv2.INTER_AREA)
         glyph = glyph >= 16
         if exclude_padding > 0:
@@ -149,11 +214,7 @@ def crop_ssim(
         valid = np.ones(a.shape, dtype=bool)
     if not np.any(valid):
         return 1.0
-    mean_a, mean_b = float(a[valid].mean()), float(b[valid].mean())
-    va, vb = float(a[valid].var()), float(b[valid].var())
-    cov = float(np.mean((a[valid] - mean_a) * (b[valid] - mean_b)))
-    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
-    return float(((2 * mean_a * mean_b + c1) * (2 * cov + c2)) / ((mean_a * mean_a + mean_b * mean_b + c1) * (va + vb + c2)))
+    return _ssim_valid(a, b, valid)
 
 
 def detections_match(source_row: dict[str, Any] | None, output_row: dict[str, Any] | None) -> bool:
@@ -244,7 +305,10 @@ def main() -> None:
     if not source_capture.isOpened() or not output_capture.isOpened():
         raise RuntimeError("Unable to open source/output for V9 QA")
     rows: list[dict[str, Any]] = []
-    samples: list[tuple[int, np.ndarray, np.ndarray, dict[str, Any] | None, dict[str, Any] | None, bool]] = []
+    # Store only the already downscaled contact-sheet strip.  Keeping full
+    # 1080x1920 source/output pairs for every sample made a long QA run retain
+    # hundreds of megabytes and could terminate before the report was written.
+    samples: list[np.ndarray] = []
     previous_output: np.ndarray | None = None
     previous_badge = False
     badge_manifest_path = a.output.with_suffix(".badge-manifest.json")
@@ -282,7 +346,11 @@ def main() -> None:
                 output,
                 source_row or frame_data[frame].get("bbox", {}),
                 canonical,
-                exclude_padding=16 if badge_applied else 3,
+                # The opaque plate includes the glyph plus its own rounded
+                # 10px margin.  Exclude the complete intentional plate (not
+                # only the glyph) from outside-mask SSIM; residual detection
+                # and the badge manifest remain hard gates for that region.
+                exclude_padding=32 if badge_applied else 3,
             ) if active else 1.0)
             flicker = 0.0
             if not badge_applied and not previous_badge and previous_output is not None and previous_output.shape == output.shape:
@@ -298,7 +366,7 @@ def main() -> None:
             # still records every frame in ``rows``; the visual sheet only
             # needs a representative, deterministic sample.
             if len(samples) < 35 and (residual or (active and frame in {start, end}) or (active and frame % 60 == 0)):
-                samples.append((frame, source.copy(), output.copy(), source_row, output_row, active))
+                samples.append(panel(frame, source, output, source_row, output_row, active))
             decoded += 1
     finally:
         source_capture.release(); output_capture.release()
@@ -344,7 +412,7 @@ def main() -> None:
     json.loads(temp.read_text(encoding="utf-8")); temp.replace(a.report)
     a.contact_sheet.parent.mkdir(parents=True, exist_ok=True)
     if samples:
-        cv2.imwrite(str(a.contact_sheet), np.concatenate([panel(*item) for item in samples], axis=0))
+        cv2.imwrite(str(a.contact_sheet), np.concatenate(samples, axis=0))
     else:
         cv2.imwrite(str(a.contact_sheet), np.zeros((120, 1280, 3), dtype=np.uint8))
     print(json.dumps({"status": report["status"], "report": str(a.report), "failedFrames": len(failed_frames), "activeFrames": len(required)}, ensure_ascii=False), flush=True)
