@@ -247,7 +247,13 @@ def main() -> None:
             previous_badge = badge_applied
             row = {"frame": frame, "active": active, "maskRequired": bool(frame_data[frame].get("maskRequired", False)), "sourceDetection": source_row, "outputDetection": output_row, "sourcePresent": source_present, "residual": residual, "outsideMaskSsim": ssim, "temporalFlicker": flicker, "maskApplied": bool(frame_data[frame].get("maskRequired", False)), "badgeApplied": badge_applied}
             rows.append(row)
-            if residual or (active and frame in {start, end}) or (active and frame % 60 == 0):
+            # Keep contact-sheet source/output pixels bounded.  A bad render
+            # can legitimately flag every active frame; retaining every full
+            # 1080x1920 pair here grows into multiple gigabytes and makes QA
+            # look hung or crash before the report is written.  The report
+            # still records every frame in ``rows``; the visual sheet only
+            # needs a representative, deterministic sample.
+            if len(samples) < 35 and (residual or (active and frame in {start, end}) or (active and frame % 60 == 0)):
                 samples.append((frame, source.copy(), output.copy(), source_row, output_row, active))
             decoded += 1
     finally:
