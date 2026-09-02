@@ -479,7 +479,68 @@ where
             &profile_path,
             &draft,
             cancel,
-        )?;
+        )
+        .or_else(|second_qa_error| {
+            // The first safety pass is driven by the initial QA report.  A
+            // frame can still fail the independent QA after that pass for a
+            // non-residual defect (for example an outside-mask SSIM drop or
+            // a seam).  Cover those exact failed frames once more with the
+            // same opaque plate, then perform one final QA.  This is bounded
+            // to two badge passes so a bad profile cannot create an endless
+            // retry loop, while ensuring a frame that cannot be cleanly
+            // inpainted is never promoted with the old watermark exposed.
+            progress(
+                "QA còn frame không đạt; đang phủ kín lần cuối bằng badge QuanPH",
+                4,
+                5,
+            );
+            let report = qa_report_path(&draft);
+            let hybrid = output.with_file_name(format!("{output_stem}.hybrid2.review.mp4"));
+            let mut badge = python_command(&python_runtime);
+            badge
+                .arg(&badge_script)
+                .arg(&project.source.path)
+                .arg(&draft)
+                .arg(&profile_path)
+                .arg(&report)
+                .arg(&hybrid)
+                .arg("--badge")
+                .arg(&badge_asset);
+            run_process(&mut badge, cancel, "Applying final opaque QuanPH fallback")?;
+            if !hybrid.is_file() {
+                return Err(second_qa_error);
+            }
+            let draft_manifest =
+                draft.with_file_name(format!("{output_stem}.review.render-manifest.json"));
+            let hybrid_manifest =
+                hybrid.with_file_name(format!("{output_stem}.hybrid2.review.render-manifest.json"));
+            if draft_manifest.is_file() {
+                fs::copy(&draft_manifest, &hybrid_manifest)?;
+            }
+            fs::remove_file(&draft)?;
+            fs::rename(&hybrid, &draft)?;
+            let _ = fs::remove_file(&draft_manifest);
+            if hybrid_manifest.is_file() {
+                fs::rename(hybrid_manifest, &draft_manifest)?;
+            }
+            let hybrid_badge_manifest =
+                hybrid.with_file_name(format!("{output_stem}.hybrid2.review.badge-manifest.json"));
+            let draft_badge_manifest =
+                draft.with_file_name(format!("{output_stem}.review.badge-manifest.json"));
+            if hybrid_badge_manifest.is_file() {
+                let _ = fs::remove_file(&draft_badge_manifest);
+                fs::rename(hybrid_badge_manifest, draft_badge_manifest)?;
+            }
+            ffmpeg::verify_video_decode(&draft)?;
+            run_quality_qa(
+                &python_runtime,
+                &qa_script,
+                project,
+                &profile_path,
+                &draft,
+                cancel,
+            )
+        })?;
     }
     let draft_report = qa_report_path(&draft);
     let draft_sheet = qa_contact_sheet_path(&draft);
@@ -676,22 +737,71 @@ where
     let qa_script = repo_root.join("tools").join(QUALITY_QA_SCRIPT);
     require_file(&python, "ProPainter Python")?;
     require_file(&qa_script, "Best-quality QA script")?;
+    let review_stem = review_output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_suffix(".review"))
+        .ok_or_else(|| AppError::InvalidRequest("Review output name is invalid.".to_string()))?;
     progress("Re-validating review output", 1, 2);
     check_cancel(cancel)?;
-    run_quality_qa(
+    if let Err(first_qa_error) = run_quality_qa(
         &python_runtime,
         &qa_script,
         project,
         &profile_path,
         review_output,
         cancel,
-    )?;
-
-    let review_stem = review_output
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .and_then(|value| value.strip_suffix(".review"))
-        .ok_or_else(|| AppError::InvalidRequest("Review output name is invalid.".to_string()))?;
+    ) {
+        // History revalidation must use the same bounded opaque fallback as
+        // the queue path.  Otherwise a draft that still has a seam/SSIM
+        // failure could never be promoted even though a plate can safely
+        // cover the exact failed frames.
+        progress(
+            "QA còn frame không đạt; đang phủ kín bằng badge QuanPH",
+            1,
+            2,
+        );
+        let report = qa_report_path(review_output);
+        let badge_script = repo_root.join("tools").join(OPAQUE_BADGE_SCRIPT);
+        let badge_asset = repo_root.join("assets").join("quanph_watermark_v1.png");
+        require_file(&badge_script, "opaque QuanPH fallback")?;
+        let fallback =
+            review_output.with_file_name(format!("{review_stem}.revalidated.review.mp4"));
+        let mut badge = python_command(&python_runtime);
+        badge
+            .arg(&badge_script)
+            .arg(&project.source.path)
+            .arg(review_output)
+            .arg(&profile_path)
+            .arg(&report)
+            .arg(&fallback)
+            .arg("--badge")
+            .arg(&badge_asset);
+        run_process(&mut badge, cancel, "Applying revalidation QuanPH fallback")?;
+        if !fallback.is_file() {
+            return Err(first_qa_error);
+        }
+        fs::remove_file(review_output)?;
+        fs::rename(&fallback, review_output)?;
+        let fallback_badge = fallback.with_file_name(format!(
+            "{review_stem}.revalidated.review.badge-manifest.json"
+        ));
+        let review_badge =
+            review_output.with_file_name(format!("{review_stem}.review.badge-manifest.json"));
+        if fallback_badge.is_file() {
+            let _ = fs::remove_file(&review_badge);
+            fs::rename(fallback_badge, review_badge)?;
+        }
+        ffmpeg::verify_video_decode(review_output)?;
+        run_quality_qa(
+            &python_runtime,
+            &qa_script,
+            project,
+            &profile_path,
+            review_output,
+            cancel,
+        )?;
+    }
     let parent = review_output
         .parent()
         .ok_or_else(|| AppError::InvalidRequest("Review output folder is invalid.".to_string()))?;

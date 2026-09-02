@@ -101,7 +101,22 @@ def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | No
     return best
 
 
-def crop_ssim(source: np.ndarray, output: np.ndarray, row: dict[str, Any]) -> float:
+def crop_ssim(
+    source: np.ndarray,
+    output: np.ndarray,
+    row: dict[str, Any],
+    canonical: np.ndarray,
+    exclude_padding: int = 3,
+) -> float:
+    """Measure similarity only outside the glyph (or opaque replacement plate).
+
+    The previous implementation compared the complete watermark crop.  That
+    made a successful removal look like a bad outside-mask edit because the
+    pixels that are intentionally changed were included in SSIM.  Build the
+    exclusion mask in source coordinates from the canonical glyph geometry so
+    the metric measures the pixels that must remain unchanged.  A badge pass
+    uses a larger padding to exclude its intentional opaque plate as well.
+    """
     x0 = max(0, int(round(float(row.get("x", 0)) - 24)))
     y0 = max(0, int(round(float(row.get("y", 0)) - 12)))
     x1 = min(source.shape[1], int(round(float(row.get("x", 0)) + float(row.get("width", 0)) + 24)))
@@ -111,6 +126,29 @@ def crop_ssim(source: np.ndarray, output: np.ndarray, row: dict[str, Any]) -> fl
     a = cv2.cvtColor(source[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float64)
     b = cv2.cvtColor(output[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float64)
     valid = np.ones(a.shape, dtype=bool)
+    try:
+        glyph_width = max(1, int(round(float(row.get("width", 0)))))
+        glyph_height = max(1, int(round(float(row.get("height", 0)))))
+        glyph = cv2.resize(canonical, (glyph_width, glyph_height), interpolation=cv2.INTER_AREA)
+        glyph = glyph >= 16
+        if exclude_padding > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (exclude_padding * 2 + 1, exclude_padding * 2 + 1),
+            )
+            glyph = cv2.dilate(glyph.astype(np.uint8), kernel) > 0
+        gx0 = max(0, int(round(float(row.get("x", 0)) - x0)))
+        gy0 = max(0, int(round(float(row.get("y", 0)) - y0)))
+        gx1 = min(valid.shape[1], gx0 + glyph.shape[1])
+        gy1 = min(valid.shape[0], gy0 + glyph.shape[0])
+        if gx1 > gx0 and gy1 > gy0:
+            valid[gy0:gy1, gx0:gx1] &= ~glyph[:gy1 - gy0, :gx1 - gx0]
+    except (TypeError, ValueError, cv2.error):
+        # A malformed detection must not make QA crash; fall back to the
+        # conservative bounding-box comparison for this individual row.
+        valid = np.ones(a.shape, dtype=bool)
+    if not np.any(valid):
+        return 1.0
     mean_a, mean_b = float(a[valid].mean()), float(b[valid].mean())
     va, vb = float(a[valid].var()), float(b[valid].var())
     cov = float(np.mean((a[valid] - mean_a) * (b[valid] - mean_b)))
@@ -239,7 +277,13 @@ def main() -> None:
             # The opaque badge is an intentional replacement plate. It must be
             # excluded from the inpaint outside-mask similarity/flicker gate;
             # the independent residual detector remains a hard gate there.
-            ssim = 1.0 if badge_applied else (crop_ssim(source, output, source_row or frame_data[frame].get("bbox", {})) if active else 1.0)
+            ssim = (crop_ssim(
+                source,
+                output,
+                source_row or frame_data[frame].get("bbox", {}),
+                canonical,
+                exclude_padding=16 if badge_applied else 3,
+            ) if active else 1.0)
             flicker = 0.0
             if not badge_applied and not previous_badge and previous_output is not None and previous_output.shape == output.shape:
                 flicker = float(np.mean(np.abs(output.astype(np.float32) - previous_output.astype(np.float32))) / 255.0)

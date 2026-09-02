@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 import calibrate_trajectory_v9 as v9
@@ -51,6 +52,15 @@ class V9ComponentTests(unittest.TestCase):
         background = {"x": 80, "y": 300, "width": 230, "height": 70}
         self.assertTrue(qa.detections_match(source, same))
         self.assertFalse(qa.detections_match(source, background))
+
+    def test_outside_mask_ssim_excludes_removed_glyph(self) -> None:
+        canonical = qa.v6.load_canonical()
+        source = np.zeros((180, 360, 3), dtype=np.uint8)
+        output = source.copy()
+        row = {"x": 60, "y": 70, "width": 245, "height": 75}
+        glyph = cv2.resize(canonical, (245, 75), interpolation=cv2.INTER_NEAREST)
+        source[70:145, 60:305][glyph > 16] = 255
+        self.assertGreaterEqual(qa.crop_ssim(source, output, row, canonical), 0.99)
 
     def test_strict_profile_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
