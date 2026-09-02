@@ -16,6 +16,7 @@ diagnostics nhưng không được render final.
 - Commit workspace hygiene mới nhất: `cea0e7faabff62728616da1b8082d8dfd0d9ee47`.
 - Commit chống crash JSON candidate: `94d17ae`.
 - Commit chuẩn hóa metric không đo được thành `null`: `ff14757`.
+- Commit chặn vòng lặp ROI sau khi đủ evidence: `c7cc503`.
 - Không tạo branch mới, không reset/rebase/pull và không stage cache tạm.
 
 ## Thay đổi đã thực hiện
@@ -44,11 +45,15 @@ diagnostics nhưng không được render final.
 - `cargo fmt --check`: PASS.
 - Clippy `-D warnings`: PASS.
 - Python syntax (`py_compile`): PASS.
-- Python regression: 25 PASS bằng `C:\Python314\python.exe` (OpenCV headless đã có).
+- Python syntax: PASS bằng `C:\Python314\python.exe`; Python regression hiện bị chặn
+  vì interpreter hệ thống không có `cv2`, còn venv ProPainter trỏ tới Python 3.11
+  đã bị xóa. Runtime trong app vẫn báo `READY` và đã được kiểm tra riêng qua UI.
 - Tauri executable Windows x64: PASS tại
   `src-tauri/target/release/watermark-studio.exe`.
 - MSI bundling: BLOCKED ở WiX `light.exe`; không ảnh hưởng executable đã build.
 - Executable đã được rebuild sau khi đổi artifact QA sang đuôi `.qa.v7.*`.
+- Executable debug đã rebuild sau commit `c7cc503`; MSI vẫn bị WiX `light.exe`
+  chặn, nhưng `.exe` chạy được để kiểm thử UI.
 
 ## Kiểm thử UI và ba video yêu cầu
 
@@ -77,6 +82,12 @@ Các project và trạng thái được giữ lại khi mở lại app. Không c
 quality gate. Runtime health trong Settings hiển thị `READY` (Python 3.11.9,
 cv2/numpy/torch, CUDA GTX 1650 4 GB, model và FFmpeg sẵn sàng).
 
+Sau khi áp dụng `c7cc503`, mở lại `(117)` bằng UI cho thấy trạng thái
+`Evidence saturated; trajectory refinement required` và không còn danh sách ROI
+lặp lại trong Review. Điều này xác nhận saturation được tính theo evidence người
+dùng đã nhập (không chỉ số ROI trùng hard gate). Profile vẫn `NEEDS_REVIEW` và
+Queue vẫn khóa đúng nguyên tắc fail-closed.
+
 ## Kết quả chất lượng
 
 Chưa tuyên bố output final cho ba video vì cả ba calibration V7 đều chưa vượt
@@ -88,8 +99,8 @@ và không sinh draft giả. Khi gate đạt, mỗi video phải sinh draft
 
 ## Bước tiếp theo
 
-1. Trong Review, xử lý các cụm ROI V7 còn thiếu theo thứ tự ưu tiên; mỗi video
-   vẫn bị giới hạn tối đa ba ROI mới trước khi chuyển `NEEDS_REVIEW` có cấu trúc.
+1. Không yêu cầu thêm ROI sau khi profile đã saturated; phần còn lại là refine
+   quỹ đạo tự động hoặc mở diagnostics, không lặp thao tác thủ công.
 2. Sau khi profile V7 đạt holdout/refined-coverage gate, Queue render qua UI và
    lưu draft, QA report/contact sheet; hiện chưa có output final mới.
 3. Chỉ sau khi cả ba QA pass mới tạo commit nghiệm thu cuối
