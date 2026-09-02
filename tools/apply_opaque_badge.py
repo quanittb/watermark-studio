@@ -145,17 +145,20 @@ def main() -> None:
                 # stale trajectory can miss the glyph by hundreds of pixels;
                 # using that stale box for the cover would reproduce the old
                 # transparent-badge failure.
-                # Re-scan the source at fallback time.  QA intentionally keeps
-                # only the best candidate, which can be a background peak when
-                # the watermark is heavily blurred.  A fresh full-frame V9
-                # search at the target frame recovers the true location and
-                # prevents a plate being drawn around the wrong trajectory box.
-                source_detected = qa.detect_fast(source, canonical)
-                detected = report_row.get("outputDetection")
-                if isinstance(source_detected, dict) and float(source_detected.get("geometryScore", 0) or 0) >= qa.MIN_SOURCE_GEOMETRY:
-                    bbox = source_detected
-                elif isinstance(detected, dict) and float(detected.get("width", 0) or 0) > 0:
+                # Reuse the source-side full-frame detection already produced
+                # by QA.  This keeps the safety pass deterministic and avoids
+                # running the expensive multi-scale detector a second time for
+                # every failed frame.  A fresh scan remains the guarded
+                # fallback when an older/diagnostic report has no source row.
+                detected = report_row.get("sourceDetection")
+                if not (isinstance(detected, dict) and float(detected.get("geometryScore", 0) or 0) >= qa.MIN_SOURCE_GEOMETRY):
+                    detected = report_row.get("outputDetection")
+                if isinstance(detected, dict) and float(detected.get("width", 0) or 0) > 0:
                     bbox = detected
+                elif not report_row:
+                    source_detected = qa.detect_fast(source, canonical)
+                    if isinstance(source_detected, dict) and float(source_detected.get("geometryScore", 0) or 0) >= qa.MIN_SOURCE_GEOMETRY:
+                        bbox = source_detected
                 # A stale/under-inclusive activity interval must not prevent
                 # the safety cover.  QA has already found a source/output
                 # residual in this exact frame; in that case the independent

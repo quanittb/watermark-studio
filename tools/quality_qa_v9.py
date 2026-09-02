@@ -182,6 +182,26 @@ def main() -> None:
     def active_for(frame: int) -> bool:
         return bool(frame_data[frame].get("maskRequired", False)) and any(int(item["startFrame"]) <= frame <= int(item["endFrame"]) for item in intervals)
     canonical = v6.load_canonical()
+    # A fallback badge pass invokes QA a second time on the same source.  The
+    # first report already contains the authoritative full-frame source-side
+    # detections; reusing them avoids repeating the most expensive half of the
+    # detector while the output-side scan still runs independently.  Reuse is
+    # guarded by the exact source path and frame count so a stale report cannot
+    # leak detections into another job.
+    prior_source_rows: dict[int, dict[str, Any]] = {}
+    if a.report.is_file():
+        try:
+            previous = json.loads(a.report.read_text(encoding="utf-8-sig"))
+            if (str(previous.get("source", "")) == str(a.source)
+                    and int(previous.get("metrics", {}).get("decodedFrames", -1)) == frame_count):
+                prior_source_rows = {
+                    int(item["frame"]): item["sourceDetection"]
+                    for item in previous.get("rows", [])
+                    if isinstance(item, dict) and item.get("frame") is not None
+                    and isinstance(item.get("sourceDetection"), dict)
+                }
+        except (OSError, ValueError, TypeError, KeyError):
+            prior_source_rows = {}
     source_capture, output_capture = cv2.VideoCapture(str(a.source)), cv2.VideoCapture(str(a.output))
     if not source_capture.isOpened() or not output_capture.isOpened():
         raise RuntimeError("Unable to open source/output for V9 QA")
@@ -205,7 +225,7 @@ def main() -> None:
             if not ok_s or not ok_o:
                 break
             active = active_for(frame)
-            source_row = detect_fast(source, canonical)
+            source_row = prior_source_rows.get(frame) or detect_fast(source, canonical)
             output_row = detect_fast(output, canonical)
             source_present = bool(source_row and source_row["geometryScore"] >= MIN_SOURCE_GEOMETRY and source_row["rawScore"] >= RESIDUAL_RAW)
             # A trajectory/activity miss must not hide a real watermark from
