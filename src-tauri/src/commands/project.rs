@@ -4,7 +4,7 @@ use crate::media::{best_quality, ffmpeg, ffprobe};
 use crate::media::{mask, render};
 use crate::project::model::{
     AnchorFrame, AnchorType, BoundingBox, FrameResult, ManualAnchor, Project, RemovalConfig,
-    ScanRange, TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
+    RoiEvidenceRecord, ScanRange, TemplatePaths, TrackingFrame, TrackingStatus, WatermarkConfig,
 };
 use crate::project::service;
 use crate::tracking;
@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 const PROJECT_VERSION: u32 = 1;
 const DEFAULT_TEMPLATE_PADDING: u32 = 4;
+/// New projects get one bounded ROI batch.  Migrated evidence is preserved,
+/// but newly submitted evidence can never silently grow the list forever.
+const ROI_EVIDENCE_BUDGET: usize = 3;
 
 #[derive(Default)]
 pub struct AppState {
@@ -38,6 +41,8 @@ pub struct EnqueueBestQualityRequest {
     pub output_root: Option<String>,
     pub output_name: Option<String>,
     pub replacement: Option<BestQualityReplacement>,
+    #[serde(default)]
+    pub allow_review_draft: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -80,6 +85,8 @@ pub struct BestQualityRenderRequest {
     pub replacement: Option<BestQualityReplacement>,
     pub output_root: Option<String>,
     pub output_name: Option<String>,
+    #[serde(default)]
+    pub allow_review_draft: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -448,13 +455,144 @@ pub async fn auto_calibrate_best_quality(
                 .as_ref()
                 .and_then(|profile| profile.scan_range)
         });
+        let resolved_scan_range = scan_range.unwrap_or(ScanRange {
+            start_frame: 0,
+            end_frame: project.video.frame_count.saturating_sub(1),
+        });
+        if project.video.frame_count == 0
+            || resolved_scan_range.start_frame > resolved_scan_range.end_frame
+            || resolved_scan_range.end_frame >= project.video.frame_count
+        {
+            return Err(AppError::InvalidScanRange(format!(
+                "Invalid scan range {}–{}; expected 0–{} with start <= end.",
+                resolved_scan_range.start_frame,
+                resolved_scan_range.end_frame,
+                project.video.frame_count.saturating_sub(1)
+            )));
+        }
+        // New evidence is an explicit request and must be rejected if it is
+        // outside the selected range.  Persisted evidence from an earlier
+        // wider range is retained for migration, but is filtered below so a
+        // range edit never traps the user in an ROI error loop.
+        let incoming_roi_outside = request.roi_evidence.iter().any(|item| {
+            item.frame < resolved_scan_range.start_frame
+                || item.frame > resolved_scan_range.end_frame
+        }) || request
+            .roi_frame
+            .map(|frame| {
+                frame < resolved_scan_range.start_frame || frame > resolved_scan_range.end_frame
+            })
+            .unwrap_or(false);
+        if incoming_roi_outside {
+            return Err(AppError::RoiOutsideScanRange);
+        }
+        // Merge persistent project evidence with this request.  The previous
+        // implementation kept bbox data only in browser localStorage, so a
+        // reload/retry silently lost anchors and restarted the ROI loop.
+        let mut persisted_records = project.roi_evidence.clone();
+        let mut persisted_evidence = persisted_records
+            .iter()
+            .map(|item| RoiEvidence {
+                frame: item.frame,
+                bbox: item.bbox.clone(),
+            })
+            .collect::<Vec<_>>();
+        // Migrate evidence persisted only inside a V7 calibration profile.
+        // Geometry is retained as a seed; V8 will revalidate it against the
+        // current source instead of counting it as independent proof.
+        if persisted_evidence.is_empty() {
+            if let Some(profile) = project.calibration.as_ref() {
+                persisted_records = profile.roi_evidence.clone();
+                persisted_evidence.extend(profile.roi_evidence.iter().map(|item| RoiEvidence {
+                    frame: item.frame,
+                    bbox: item.bbox.clone(),
+                }));
+            }
+        }
+        let all_persisted_records = persisted_records.clone();
+        let mut records_by_frame = persisted_records
+            .drain(..)
+            .map(|record| (record.frame, record))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        persisted_evidence.retain(|item| {
+            item.frame >= resolved_scan_range.start_frame
+                && item.frame <= resolved_scan_range.end_frame
+        });
+        records_by_frame.retain(|frame, _| {
+            *frame >= resolved_scan_range.start_frame && *frame <= resolved_scan_range.end_frame
+        });
+        let mut by_frame = std::collections::BTreeMap::new();
+        for evidence in persisted_evidence {
+            by_frame.insert(evidence.frame, evidence);
+        }
+        // Existing/migrated evidence is never deleted.  For a new project,
+        // however, accept at most three distinct new frames in this and all
+        // subsequent calls.  Re-submitting an existing frame updates its
+        // geometry, while excess frames are deliberately ignored rather than
+        // restarting an unbounded ROI review loop.
+        let mut new_frame_budget = if by_frame.len() >= ROI_EVIDENCE_BUDGET {
+            0
+        } else {
+            ROI_EVIDENCE_BUDGET - by_frame.len()
+        };
+        let mut incoming = request.roi_evidence.to_vec();
+        if let (Some(frame), Some(bbox)) = (request.roi_frame, request.roi.as_ref()) {
+            incoming.push(RoiEvidence {
+                frame,
+                bbox: bbox.clone(),
+            });
+        }
+        for evidence in incoming {
+            match by_frame.entry(evidence.frame) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.insert(evidence);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) if new_frame_budget > 0 => {
+                    entry.insert(evidence);
+                    new_frame_budget -= 1;
+                }
+                std::collections::btree_map::Entry::Vacant(_) => {}
+            }
+        }
+        let merged_evidence = by_frame.into_values().collect::<Vec<_>>();
+        let mut updated_records = all_persisted_records
+            .into_iter()
+            .filter(|record| {
+                record.frame < resolved_scan_range.start_frame
+                    || record.frame > resolved_scan_range.end_frame
+            })
+            .collect::<Vec<_>>();
+        updated_records.extend(
+            merged_evidence
+                .iter()
+                .map(|item| {
+                    let mut record =
+                        records_by_frame
+                            .remove(&item.frame)
+                            .unwrap_or_else(|| RoiEvidenceRecord {
+                                id: format!("roi-{}", item.frame),
+                                frame: item.frame,
+                                bbox: item.bbox.clone(),
+                                source: "USER".to_string(),
+                                created_at: jobs::chrono_like_now(),
+                                attempt_id: Uuid::new_v4().to_string(),
+                                accepted_by_detector: false,
+                                rejection_reason: None,
+                            });
+                    record.frame = item.frame;
+                    record.bbox = item.bbox.clone();
+                    record
+                })
+                .collect::<Vec<_>>(),
+        );
+        project.roi_evidence = updated_records;
         let calibration = best_quality::create_adaptive_calibration_profile(
             &directory,
             &project,
             request.roi.as_ref(),
             request.roi_frame,
             request.edited_mask_path.as_deref(),
-            &request.roi_evidence,
+            &merged_evidence,
             scan_range,
             &cancel,
         )?;
@@ -545,6 +683,7 @@ fn open_video_sync(app: &AppHandle, path: &str) -> Result<Project, AppError> {
         anchors: Vec::new(),
         tracking: None,
         removal: None,
+        roi_evidence: Vec::new(),
     };
 
     let app_data_dir = app
@@ -1050,6 +1189,7 @@ pub async fn render_best_quality_video(
             request.replacement.as_ref(),
             request.output_root.as_deref(),
             request.output_name.as_deref(),
+            request.allow_review_draft,
             &cancel,
             |phase, current, total| {
                 let progress = OperationProgress {
@@ -1193,7 +1333,13 @@ pub async fn revalidate_review_job(
         );
         updated.contact_sheet_path = Some(
             output
-                .with_extension("qa.png")
+                .with_file_name(format!(
+                    "{}.qa.v8.png",
+                    output
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("output")
+                ))
                 .to_string_lossy()
                 .to_string(),
         );
@@ -1223,7 +1369,18 @@ pub async fn enqueue_best_quality_job(
         service::load_project(&app_data_dir, &request.project_id).map_err(AppErrorDto::from)?;
     let project_directory =
         service::project_directory(&app_data_dir, &project.id).map_err(AppErrorDto::from)?;
-    best_quality::validate_calibration(&project_directory, &project).map_err(AppErrorDto::from)?;
+    let calibration_ready =
+        best_quality::validate_calibration(&project_directory, &project).is_ok();
+    let review_draft_allowed = request.allow_review_draft
+        && project
+            .calibration
+            .as_ref()
+            .and_then(|profile| profile.outcome.as_deref())
+            == Some("NEEDS_REVIEW_DRAFT");
+    if !calibration_ready && !review_draft_allowed {
+        best_quality::validate_calibration(&project_directory, &project)
+            .map_err(AppErrorDto::from)?;
+    }
     let hardware = best_quality::detect_hardware();
     if !hardware.supported {
         return Err(AppError::InvalidRequest(
@@ -1257,6 +1414,7 @@ pub async fn enqueue_best_quality_job(
         .transpose()
         .map_err(AppError::from)
         .map_err(AppErrorDto::from)?;
+    record.allow_review_draft = review_draft_allowed;
     records.push(record.clone());
     jobs::save(&app_data_dir, &records).map_err(AppErrorDto::from)?;
     drop(_store_guard);
@@ -1425,6 +1583,7 @@ fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
                     replacement.as_ref(),
                     records[index].output_root.as_deref(),
                     records[index].output_name.as_deref(),
+                    records[index].allow_review_draft,
                     &render_cancel,
                     |phase, current, total| {
                         if let Ok(_store_guard) = store_lock.lock() {
@@ -1511,8 +1670,7 @@ fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
                                     .to_string(),
                             );
                             job.contact_sheet_path = Some(
-                                output
-                                    .with_extension("qa.png")
+                                best_quality::qa_contact_sheet_path(&output)
                                     .to_string_lossy()
                                     .to_string(),
                             );
@@ -1527,12 +1685,14 @@ fn start_job_worker(app: AppHandle, state: State<'_, AppState>) {
                             job.status = JobStatus::NeedsReview;
                             job.stage = "Quality review required".to_string();
                             job.output_path = report
-                                .strip_suffix(".qa.json")
+                                .strip_suffix(".qa.v8.json")
+                                .or_else(|| report.strip_suffix(".qa.json"))
                                 .map(|value| format!("{value}.mp4"));
                             job.qa_report_path = Some(report.clone());
                             job.contact_sheet_path = report
-                                .strip_suffix(".qa.json")
-                                .map(|value| format!("{value}.qa.png"));
+                                .strip_suffix(".qa.v8.json")
+                                .or_else(|| report.strip_suffix(".qa.json"))
+                                .map(|value| format!("{value}.qa.v8.png"));
                             job.error_code = Some("QUALITY_NEEDS_REVIEW".to_string());
                             job.error = Some(format!("Review QA report: {report}"));
                         }

@@ -154,6 +154,7 @@ mod tests {
             anchors: Vec::new(),
             tracking: None,
             removal: None,
+            roi_evidence: Vec::new(),
         }
     }
 

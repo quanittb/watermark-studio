@@ -18,6 +18,29 @@ pub struct Project {
     pub tracking: Option<TrackingData>,
     #[serde(default)]
     pub removal: Option<RemovalConfig>,
+    /// Persistent broad ROI evidence.  This survives reloads and calibration
+    /// retries; it is a location seed, never a fixed render rectangle.
+    #[serde(default)]
+    pub roi_evidence: Vec<RoiEvidenceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoiEvidenceRecord {
+    #[serde(default)]
+    pub id: String,
+    pub frame: u64,
+    pub bbox: BoundingBox,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub accepted_by_detector: bool,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +83,14 @@ pub struct CalibrationProfile {
     /// localStorage has been cleared.
     #[serde(default)]
     pub roi_evidence_frames: Vec<u64>,
+    #[serde(default)]
+    pub roi_evidence: Vec<RoiEvidenceRecord>,
+    #[serde(default)]
+    pub roi_budget_used: u32,
+    #[serde(default)]
+    pub roi_budget_max: u32,
+    #[serde(default)]
+    pub outcome: Option<String>,
     #[serde(default)]
     pub contact_sheet_path: Option<String>,
     #[serde(default)]

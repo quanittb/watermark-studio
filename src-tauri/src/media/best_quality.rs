@@ -3,7 +3,7 @@ use crate::error::AppError;
 use crate::media::ffmpeg;
 use crate::project::model::{
     BoundingBox, CalibrationPreset, CalibrationProfile, CalibrationQuality, CalibrationStatus,
-    Project, ScanRange, SourceFingerprint, TrajectoryGateSummary,
+    Project, RoiEvidenceRecord, ScanRange, SourceFingerprint, TrajectoryGateSummary,
 };
 use sha2::{Digest, Sha256};
 use std::env;
@@ -26,11 +26,11 @@ const DEFAULT_PROPAINTER_PYTHON: &str = r"D:\propainter-watermark-venv\Scripts\p
 const DEFAULT_PROPAINTER_ROOT: &str = r"D:\propainter-watermark-work";
 const DEFAULT_WORK_ROOT: &str = r"D:\watermark-studio-ai-work";
 const CALIBRATION_SCRIPT: &str = "calibrate_best_quality.py";
-const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v7.py";
+const ADAPTIVE_CALIBRATION_SCRIPT: &str = "calibrate_trajectory_v8.py";
 const FIND_SAMPLES_SCRIPT: &str = "find_learna_samples.py";
 const AUDIT_SCRIPT: &str = "audit_watermark_detection.py";
 const MIN_MASK_COVERAGE: u64 = 350;
-const QUALITY_QA_SCRIPT: &str = "quality_qa_v7.py";
+const QUALITY_QA_SCRIPT: &str = "quality_qa_v8.py";
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +106,67 @@ pub struct RuntimeImports {
     pub torch: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PythonRuntime {
+    executable: PathBuf,
+    site_packages: Option<PathBuf>,
+}
+
+/// Resolve a usable interpreter even when a copied Windows venv launcher has
+/// become stale.  The project machine keeps the 3.11 packages in
+/// `D:\propainter-watermark-venv\Lib\site-packages`, while the venv
+/// `Scripts\python.exe` can fail to start after its original Python install
+/// moved.  Running the matching base interpreter with that site-packages
+/// directory is equivalent for this read-only processing runtime and avoids a
+/// misleading `PYTHON_IMPORT_FAILED` preflight result.
+fn resolve_python_runtime() -> PythonRuntime {
+    let configured = configured_path(
+        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
+        DEFAULT_PROPAINTER_PYTHON,
+    );
+    let venv_root = configured
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    if let Some(root) = venv_root {
+        let cfg = root.join("pyvenv.cfg");
+        if let Ok(contents) = fs::read_to_string(&cfg) {
+            let home = contents
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("home ="))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            if let Some(home) = home {
+                let base = if cfg!(windows) {
+                    home.join("python.exe")
+                } else {
+                    home.join("bin").join("python")
+                };
+                let packages = root.join("Lib").join("site-packages");
+                if base.is_file() && packages.is_dir() {
+                    return PythonRuntime {
+                        executable: base,
+                        site_packages: Some(packages),
+                    };
+                }
+            }
+        }
+    }
+    PythonRuntime {
+        executable: configured,
+        site_packages: None,
+    }
+}
+
+fn python_command(runtime: &PythonRuntime) -> Command {
+    let mut command = Command::new(&runtime.executable);
+    if let Some(site_packages) = runtime.site_packages.as_ref() {
+        command.env("PYTHONPATH", site_packages);
+    }
+    command
+}
+
 fn find_binary(name: &str) -> Option<String> {
     Command::new("where")
         .arg(name)
@@ -125,10 +186,8 @@ fn find_binary(name: &str) -> Option<String> {
 /// Performs a side-effect-free preflight so calibration/render failures are
 /// actionable instead of surfacing later as a generic child-process error.
 pub fn detect_runtime_health() -> RuntimeHealth {
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    let runtime = resolve_python_runtime();
+    let python = runtime.executable.clone();
     let propainter_root =
         configured_path("WATERMARK_STUDIO_PROPAINTER_ROOT", DEFAULT_PROPAINTER_ROOT);
     let workspace_root = configured_path("WATERMARK_STUDIO_WORK_ROOT", DEFAULT_WORK_ROOT);
@@ -142,7 +201,7 @@ pub fn detect_runtime_health() -> RuntimeHealth {
     if !python.is_file() {
         problems.push("PYTHON_RUNTIME_MISSING".to_string());
     } else {
-        let probe = Command::new(&python)
+        let probe = python_command(&runtime)
             .args(["-c", "import sys, json; mods={m: __import__(m) is not None for m in ('cv2','numpy','torch')}; print(json.dumps({'version':sys.version.split()[0], 'mods':mods}))"])
             .output();
         match probe {
@@ -257,12 +316,14 @@ pub fn detect_hardware() -> HardwareProfile {
 /// Runs the verified full-frame ProPainter path for the known repeating Learna
 /// AI watermark. This deliberately has a narrow compatibility contract: an
 /// unsupported watermark must fail before it can modify unrelated pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn render_best_quality<F>(
     project_directory: &Path,
     project: &Project,
     replacement: Option<&BestQualityReplacement>,
     output_root: Option<&str>,
     output_name: Option<&str>,
+    allow_review_draft: bool,
     cancel: &AtomicBool,
     mut progress: F,
 ) -> Result<PathBuf, AppError>
@@ -270,17 +331,15 @@ where
     F: FnMut(&str, u64, u64),
 {
     validate_project(project_directory, project)?;
-    let runtime = detect_runtime_health();
-    if runtime.status != "READY" {
+    let runtime_health = detect_runtime_health();
+    if runtime_health.status != "READY" {
         return Err(AppError::RuntimeNotReady(format!(
             "{}; configure Python/FFmpeg/CUDA in Settings before starting Best-quality",
-            runtime.problems.join(", ")
+            runtime_health.problems.join(", ")
         )));
     }
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    let python_runtime = resolve_python_runtime();
+    let python = python_runtime.executable.clone();
     let propainter_root =
         configured_path("WATERMARK_STUDIO_PROPAINTER_ROOT", DEFAULT_PROPAINTER_ROOT);
     let workspace_root = configured_path("WATERMARK_STUDIO_WORK_ROOT", DEFAULT_WORK_ROOT);
@@ -303,7 +362,8 @@ where
     require_file(&qa_script, "Best-quality QA script")?;
     validate_replacement(replacement)?;
 
-    let profile_path = validate_calibration_profile(project_directory, project)?;
+    let profile_path =
+        validate_calibration_profile(project_directory, project, allow_review_draft)?;
     let profile_value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&profile_path)?).map_err(|error| {
             AppError::InvalidRequest(format!("Calibration profile is invalid JSON: {error}"))
@@ -342,7 +402,7 @@ where
     progress("Validating best-quality render", 0, 5);
     check_cancel(cancel)?;
     render_attempt(
-        &python,
+        &python_runtime,
         &pipeline,
         &chunks,
         &project_json,
@@ -363,9 +423,14 @@ where
     progress("Decoding final output for QA", 4, 5);
     check_cancel(cancel)?;
     ffmpeg::verify_video_decode(&draft)?;
-    if let Err(first_qa_error) =
-        run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)
-    {
+    if let Err(first_qa_error) = run_quality_qa(
+        &python_runtime,
+        &qa_script,
+        project,
+        &profile_path,
+        &draft,
+        cancel,
+    ) {
         let report = qa_report_path(&draft);
         let retry_range =
             quality_failed_range(&report, first_frame, last_profile_frame.min(last_frame));
@@ -381,7 +446,7 @@ where
             5,
         );
         let retry_result = render_attempt(
-            &python,
+            &python_runtime,
             &pipeline,
             &chunks,
             &project_json,
@@ -402,7 +467,14 @@ where
         let _ = fs::remove_file(&retry_input);
         retry_result?;
         ffmpeg::verify_video_decode(&draft)?;
-        run_quality_qa(&python, &qa_script, project, &profile_path, &draft, cancel)?;
+        run_quality_qa(
+            &python_runtime,
+            &qa_script,
+            project,
+            &profile_path,
+            &draft,
+            cancel,
+        )?;
     }
     let draft_report = qa_report_path(&draft);
     let draft_sheet = qa_contact_sheet_path(&draft);
@@ -430,7 +502,7 @@ impl Drop for WorkspaceCleanup {
 
 #[allow(clippy::too_many_arguments)]
 fn render_attempt(
-    python: &Path,
+    python_runtime: &PythonRuntime,
     pipeline: &Path,
     chunks: &Path,
     project_json: &Path,
@@ -449,7 +521,7 @@ fn render_attempt(
     progress: &mut impl FnMut(&str, u64, u64),
 ) -> Result<(), AppError> {
     progress("Preparing full-resolution AI masks", 1, 5);
-    let mut prepare = Command::new(python);
+    let mut prepare = python_command(python_runtime);
     prepare
         .arg(pipeline)
         .arg("prepare")
@@ -473,7 +545,7 @@ fn render_attempt(
 
     progress("Running temporal AI restoration", 2, 5);
     if let Err(error) = run_propainter_chunks(
-        python,
+        python_runtime,
         chunks,
         workspace,
         result_root,
@@ -493,7 +565,7 @@ fn render_attempt(
             5,
         );
         run_propainter_chunks(
-            python,
+            python_runtime,
             chunks,
             workspace,
             result_root,
@@ -505,7 +577,7 @@ fn render_attempt(
     }
 
     progress("Encoding final full-resolution video", 3, 5);
-    let mut composite = Command::new(python);
+    let mut composite = python_command(python_runtime);
     composite
         .arg(pipeline)
         .arg("composite")
@@ -588,15 +660,15 @@ pub fn qa_report_path(output: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    output.with_file_name(format!("{stem}.qa.v7.json"))
+    output.with_file_name(format!("{stem}.qa.v8.json"))
 }
 
-fn qa_contact_sheet_path(output: &Path) -> PathBuf {
+pub fn qa_contact_sheet_path(output: &Path) -> PathBuf {
     let stem = output
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    output.with_file_name(format!("{stem}.qa.v7.png"))
+    output.with_file_name(format!("{stem}.qa.v8.png"))
 }
 
 /// Re-checks an existing `.review.mp4` with the current QA implementation and
@@ -629,11 +701,12 @@ where
             "Only a .review.mp4 draft can be promoted after QA.".to_string(),
         ));
     }
-    let profile_path = validate_calibration_profile(project_directory, project)?;
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    // A review draft is intentionally eligible for QA re-validation.  The
+    // normal render/queue path remains fail-closed, while this history action
+    // must be able to promote a draft after a later QA rule or artifact fix.
+    let profile_path = validate_calibration_profile(project_directory, project, true)?;
+    let python_runtime = resolve_python_runtime();
+    let python = python_runtime.executable.clone();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
@@ -643,7 +716,7 @@ where
     progress("Re-validating review output", 1, 2);
     check_cancel(cancel)?;
     run_quality_qa(
-        &python,
+        &python_runtime,
         &qa_script,
         project,
         &profile_path,
@@ -698,7 +771,7 @@ pub fn calibration_metadata(
     let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path)?)
         .map_err(|error| {
             AppError::CalibrationCorrupt(format!(
-            "non-standard JSON value or truncated write; regenerate CalibrationProfileV7 ({error})"
+            "non-standard JSON value or truncated write; regenerate CalibrationProfileV8 ({error})"
         ))
         })?;
     let profile_frame_count = profile
@@ -719,14 +792,14 @@ pub fn calibration_metadata(
         .get("version")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    let trajectory_ready = !matches!(profile_version, 5..=7)
+    let trajectory_ready = !matches!(profile_version, 5..=8)
         || (profile
             .get("trajectoryGate")
             .and_then(|value| value.get("status"))
             .and_then(|value| value.as_str())
             == Some("PASSED")
             && profile.get("trajectoryModel").is_some());
-    let is_ready = profile_version == 7
+    let is_ready = profile_version == 8
         && profile_frame_count == project.video.frame_count
         && mask_pixels >= MIN_MASK_COVERAGE
         && profile.get("status").and_then(|value| value.as_str()) == Some("READY")
@@ -845,6 +918,22 @@ pub fn calibration_metadata(
             .and_then(|value| value.as_array())
             .map(|frames| frames.iter().filter_map(|value| value.as_u64()).collect())
             .unwrap_or_default(),
+        roi_evidence: profile
+            .get("roiEvidence")
+            .and_then(|value| serde_json::from_value::<Vec<RoiEvidenceRecord>>(value.clone()).ok())
+            .unwrap_or_default(),
+        roi_budget_used: profile
+            .get("roiBudgetUsed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32,
+        roi_budget_max: profile
+            .get("roiBudgetMax")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(3) as u32,
+        outcome: profile
+            .get("outcome")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         contact_sheet_path: profile
             .get("contactSheetPath")
             .and_then(|value| value.as_str())
@@ -895,7 +984,7 @@ pub fn calibration_metadata(
 }
 
 fn run_quality_qa(
-    python: &Path,
+    python_runtime: &PythonRuntime,
     qa_script: &Path,
     project: &Project,
     profile_path: &Path,
@@ -905,7 +994,7 @@ fn run_quality_qa(
     let report = qa_report_path(output);
     let contact_sheet = qa_contact_sheet_path(output);
     check_cancel(cancel)?;
-    let result = Command::new(python)
+    let result = python_command(python_runtime)
         .arg(qa_script)
         .arg(&project.source.path)
         .arg(output)
@@ -954,10 +1043,8 @@ where
         options.scan_round
     ));
     fs::create_dir_all(&candidates_directory)?;
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    let python_runtime = resolve_python_runtime();
+    let python = python_runtime.executable.clone();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
@@ -975,7 +1062,7 @@ where
     // the progress contract phase-based so the UI does not appear finished
     // while the remaining phases are still being scanned.
     progress(0, 6);
-    let mut command = Command::new(&python);
+    let mut command = python_command(&python_runtime);
     command
         .arg(&detector)
         .arg(project_directory.join("project.json"))
@@ -1054,10 +1141,8 @@ pub fn create_calibration_profile(
             "The selected sample did not pass the Learna AI hard gate.".to_string(),
         ));
     }
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    let python_runtime = resolve_python_runtime();
+    let python = python_runtime.executable.clone();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
@@ -1075,7 +1160,7 @@ pub fn create_calibration_profile(
         .join("trajectory-audit");
     fs::create_dir_all(&audit_directory)?;
     let phase_shift = sample.trajectory_phase_offset.rem_euclid(360);
-    let mut audit = Command::new(&python);
+    let mut audit = python_command(&python_runtime);
     audit
         .arg(&audit_script)
         .arg(project_directory.join("project.json"))
@@ -1093,7 +1178,7 @@ pub fn create_calibration_profile(
         "Analyzing the full-video watermark trajectory",
     )?;
     let audit_path = audit_directory.join("all-matches.json");
-    let mut command = Command::new(&python);
+    let mut command = python_command(&python_runtime);
     command
         .arg(&calibration_script)
         .arg(project_directory.join("project.json"))
@@ -1159,10 +1244,8 @@ pub fn create_adaptive_calibration_profile(
     }) {
         return Err(AppError::RoiOutsideScanRange);
     }
-    let python = configured_path(
-        "WATERMARK_STUDIO_PROPAINTER_PYTHON",
-        DEFAULT_PROPAINTER_PYTHON,
-    );
+    let python_runtime = resolve_python_runtime();
+    let python = python_runtime.executable.clone();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| AppError::Io("Unable to locate the application workspace.".to_string()))?;
@@ -1183,7 +1266,7 @@ pub fn create_adaptive_calibration_profile(
     } else {
         "AUTO_GLOBAL_TEMPLATE"
     };
-    let mut command = Command::new(&python);
+    let mut command = python_command(&python_runtime);
     command
         .arg(&script)
         .arg(project_directory.join("project.json"))
@@ -1242,24 +1325,29 @@ fn normalize_scan_range(
 fn validate_calibration_profile(
     project_directory: &Path,
     project: &Project,
+    allow_review_draft: bool,
 ) -> Result<PathBuf, AppError> {
     let profile_path = project_directory.join("calibration").join("profile.json");
     if !profile_path.is_file() {
         return Err(AppError::InvalidRequest(
-            "Best-quality render requires a confirmed CalibrationProfileV7. Run Auto-find & calibrate in Review first."
+            "Best-quality render requires a confirmed CalibrationProfileV8. Run Auto-find & calibrate in Review first."
                 .to_string(),
         ));
     }
     let body = fs::read_to_string(&profile_path)?;
     let mut profile: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         AppError::CalibrationCorrupt(format!(
-            "non-standard JSON numbers or truncated write; regenerate V7 ({error})"
+            "non-standard JSON numbers or truncated write; regenerate V8 ({error})"
         ))
     })?;
     let metadata = calibration_metadata(project_directory, project)?;
-    if metadata.version != 7 || metadata.quality.status != CalibrationStatus::Ready {
+    let review_draft =
+        profile.get("outcome").and_then(|value| value.as_str()) == Some("NEEDS_REVIEW_DRAFT");
+    let status_allowed =
+        metadata.quality.status == CalibrationStatus::Ready || (allow_review_draft && review_draft);
+    if metadata.version != 8 || !status_allowed {
         return Err(AppError::InvalidRequest(
-            "Calibration is stale or did not pass the V7 quality gate. Regenerate it in Review."
+            "Calibration is stale or did not pass the V8 quality gate. Regenerate it in Review."
                 .to_string(),
         ));
     }
@@ -1360,7 +1448,7 @@ pub fn validate_calibration(
     project_directory: &Path,
     project: &Project,
 ) -> Result<CalibrationProfile, AppError> {
-    validate_calibration_profile(project_directory, project)?;
+    validate_calibration_profile(project_directory, project, false)?;
     calibration_metadata(project_directory, project)
 }
 
@@ -1400,7 +1488,7 @@ fn lower_hardware_profile(current: &HardwareProfile) -> Option<HardwareProfile> 
 
 #[allow(clippy::too_many_arguments)]
 fn run_propainter_chunks(
-    python: &Path,
+    python_runtime: &PythonRuntime,
     chunks: &Path,
     workspace: &Path,
     result_root: &Path,
@@ -1409,12 +1497,12 @@ fn run_propainter_chunks(
     cancel: &AtomicBool,
     progress: &mut impl FnMut(&str, u64, u64),
 ) -> Result<(), AppError> {
-    let mut child = Command::new(python)
+    let mut child = python_command(python_runtime)
         .arg(chunks)
         .arg(workspace)
         .arg(result_root)
         .arg(propainter_root)
-        .arg(python)
+        .arg(&python_runtime.executable)
         .arg("--width")
         .arg(hardware.width.to_string())
         .arg("--height")
@@ -1828,6 +1916,7 @@ mod tests {
             anchors: Vec::new(),
             tracking: None,
             removal: None,
+            roi_evidence: Vec::new(),
         };
         assert_eq!(
             normalize_scan_range(&project, None).unwrap(),
@@ -1890,6 +1979,7 @@ mod tests {
             anchors: Vec::new(),
             tracking: None,
             removal: None,
+            roi_evidence: Vec::new(),
         };
         let first = next_output_path(&project, None, None).unwrap();
         fs::create_dir_all(first.parent().unwrap()).unwrap();

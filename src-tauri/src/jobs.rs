@@ -67,6 +67,8 @@ pub struct JobRecord {
     pub contact_sheet_path: Option<String>,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub allow_review_draft: bool,
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -239,6 +241,7 @@ pub fn new_record(
         qa_report_path: None,
         contact_sheet_path: None,
         error_code: None,
+        allow_review_draft: false,
         error: None,
         created_at: now.clone(),
         updated_at: now,

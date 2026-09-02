@@ -53,16 +53,22 @@ MASK_BORDER_Y = (MASK_CANVAS_HEIGHT - CANONICAL_HEIGHT) / 2.0
 # the hard gate even when the glyph is plainly visible.
 # A compact coarse pyramid keeps calibration practical on a 4 GB machine;
 # fine alignment still evaluates every hit at source resolution.
-SCALES = (0.60, 0.68, 0.75, 0.82, 0.90, 0.98, 1.06, 1.15, 1.28, 1.40, 1.50)
+SCALES = (0.60, 0.68, 0.75, 0.85, 0.95, 1.00, 1.08, 1.20, 1.35, 1.50)
 MAX_CANDIDATES_PER_FRAME = 20
 # Keep enough hypotheses across scale levels for the graph, but do not run a
 # source-resolution crop evaluation for every low-ranked local maximum.  The
 # previous 12-per-scale × 5×5 loop performed nearly a million crop analyses on
 # a 58-second clip and made the UI appear frozen.
-# Busy shots can contain a face, subtitle or UI edge that scores above the
-# faint translucent watermark. Retain more raw peaks so the real glyph is not
-# discarded before source-resolution refinement; final NMS still caps rows.
-RAW_PEAKS_PER_SCALE = 8
+# Keep the normal pass light on a 4 GB machine.  Difficult shots get a wider
+# peak budget at a sparse cadence below; this preserves the true low-contrast
+# glyph without making every frame pay the full multi-scale cost.
+RAW_PEAKS_PER_SCALE = 4
+DEEP_RAW_PEAKS_PER_SCALE = 12
+# Deep peaks are deliberately sparse.  The ordinary six-frame cache remains
+# useful for motion continuity; every ~2 seconds we rescan with a wider peak
+# budget so a translucent glyph hidden behind a high-contrast foreground is
+# recovered without evaluating 12 peaks on every frame.
+DEEP_SCAN_STRIDE = SAMPLE_STRIDE * 10
 MIN_RAW_SCORE = 0.10
 MIN_MEASURED_SCORE = 0.35
 MAX_GAP = 18
@@ -74,26 +80,32 @@ MAX_GAP = 18
 REVIEW_MERGE_GAP = 72
 REVIEW_MAX_CLUSTER_SPAN = 360
 MAX_REVIEW_RANGES = 8
-# Once a handful of independent ROI anchors cover the motion, repeatedly asking
-# the user for more anchors is not useful: a high residual then indicates that
-# the fitted path itself needs refinement.  The old value (24) counted only
-# ROI rows that happened to survive the image gate, so a user could draw many
-# valid ROIs and still receive the same review list forever.  Count explicit
-# user evidence for this UX/convergence guard; it never relaxes trajectory or
-# render quality gates.  Six anchors cover the usual Learna motion phases while
-# keeping sparse projects actionable.
-ROI_SATURATION_MIN_EVIDENCE = 6
+# ROI is a bounded hint, not an iterative annotation workflow.  Once the
+# three-slot batch has been supplied, remaining failures are algorithmic and
+# must terminate as a review draft rather than producing another ROI list.
+ROI_SATURATION_MIN_EVIDENCE = 3
 ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15
 ROI_SATURATION_MIN_PATH_COVERAGE = 0.70
 # V7 changes the acceptance contract: the selected path must be locally
 # refined and validated on held-out observations.  Never reuse a V6 cache for
 # final calibration, even when its source and mask hashes match.
-CANDIDATE_CACHE_VERSION = 3
-CALIBRATION_VERSION = 7
+CANDIDATE_CACHE_VERSION = 5
+CALIBRATION_VERSION = 8
 MIN_INLIER_RATIO = 0.80
-LOCAL_REFINE_STRIDE = 2
-LOCAL_REFINE_RADIUS = 12
-LOCAL_REFINE_STEP = 3
+# Refine a representative frame every ~0.4s.  The global detector already
+# supplies direct observations at the denser six-frame cadence; the remaining
+# frames receive a trajectory transform and are validated by the QA pass.  A
+# four-frame stride made 1080x1920 H.264 calibration spend minutes evaluating
+# thousands of full-resolution Gaussian/resize crops on a 4 GB GPU machine.
+LOCAL_REFINE_STRIDE = 12
+LOCAL_REFINE_RADIUS = 16
+LOCAL_REFINE_STEP = 8
+ROI_BUDGET_MAX = 3
+
+# Reused by every source-resolution crop evaluation in one calibration run.
+# Recomputing the blurred canonical alpha mask for each candidate dominated
+# CPU time on long portrait clips.
+_EVAL_ALPHA_CACHE: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
 
 def should_suppress_roi_review(
@@ -120,6 +132,16 @@ def should_suppress_roi_review(
         or (residual_p95 is not None and residual_p95 > residual_p95_tolerance)
     )
     return enough_evidence and needs_path_refinement
+
+
+def roi_batch_is_terminal(roi_evidence_count: int) -> bool:
+    """Return whether the one-shot manual ROI batch has been submitted.
+
+    A non-empty batch is terminal even when it contains fewer than three
+    entries: asking for a second list is the loop this pipeline explicitly
+    prevents.  The automatic passes and draft fallback handle the remainder.
+    """
+    return roi_evidence_count > 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -379,6 +401,27 @@ def roi_allows(x: float, y: float, width: float, height: float, roi: dict[str, f
     return center_inside or overlap_ratio >= 0.35
 
 
+def roi_overlap_ratio(
+    x: float, y: float, width: float, height: float, roi: dict[str, float] | None
+) -> float:
+    """Return candidate-area overlap with a broad user ROI.
+
+    ``roi_allows`` intentionally accepts a tolerant intersection because the
+    user is not expected to draw a pixel-tight box.  Selection still needs a
+    deterministic tie-breaker, however: a high-contrast background patch can
+    otherwise beat the actual glyph while remaining just inside the hint.
+    """
+    if roi is None:
+        return 0.0
+    roi_x1 = float(roi["x"])
+    roi_y1 = float(roi["y"])
+    roi_x2 = roi_x1 + float(roi["width"])
+    roi_y2 = roi_y1 + float(roi["height"])
+    overlap_width = max(0.0, min(x + width, roi_x2) - max(x, roi_x1))
+    overlap_height = max(0.0, min(y + height, roi_y2) - max(y, roi_y1))
+    return float(overlap_width * overlap_height / max(1.0, width * height))
+
+
 def evaluate_box(
     frame: np.ndarray,
     x: float,
@@ -388,6 +431,11 @@ def evaluate_box(
     canonical: np.ndarray,
 ) -> tuple[float, float, float, bool] | None:
     """Measure a source-resolution box against the canonical glyph mask."""
+    global _EVAL_ALPHA_CACHE
+    if _EVAL_ALPHA_CACHE is None or _EVAL_ALPHA_CACHE[0] is not canonical:
+        alpha = cv2.GaussianBlur((canonical.astype(np.float32) / 255.0), (0, 0), 0.75)
+        _EVAL_ALPHA_CACHE = (canonical, alpha, alpha >= 0.08)
+    _, alpha, active = _EVAL_ALPHA_CACHE
     # Match the same padded mask canvas used by the canonical descriptor.
     # Evaluating only the tight glyph box shifts the letters against the
     # descriptor and makes clear evidence score as a weak match.
@@ -406,17 +454,16 @@ def evaluate_box(
     if box is None:
         return None
     x0, y0, x1, y1 = box
-    crop = frame[y0:y1, x0:x1]
+    source_gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    crop = source_gray[y0:y1, x0:x1]
     normalized = cv2.resize(crop, (canonical.shape[1], canonical.shape[0]), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = normalized.astype(np.float32)
     # Evaluate both bright-on-dark and dark-on-light polarity.  A gray
     # Learna glyph is sometimes darker than a white robot face; considering
     # only positive contrast made those real observations disappear.  Each
     # polarity is scored independently and the stronger structural evidence
     # wins, while contamination/connected-component penalties remain active.
     smooth = cv2.GaussianBlur(gray, (0, 0), 8.0)
-    alpha = cv2.GaussianBlur((canonical.astype(np.float32) / 255.0), (0, 0), 0.75)
-    active = alpha >= 0.08
 
     def score_contrast(contrast: np.ndarray) -> tuple[float, float, float, bool]:
         # A threshold around 7 suppresses low-amplitude texture while keeping
@@ -480,7 +527,9 @@ def candidate_rows(
     canonical: np.ndarray,
     roi: dict[str, float] | None,
     polarity: str = "positive",
+    peak_limit: int | None = None,
 ) -> list[dict[str, float | int | bool]]:
+    source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     if polarity == "negative":
         image_feature, analysis_x, analysis_y, base_scale = feature_negative(frame)
     else:
@@ -516,7 +565,12 @@ def candidate_rows(
         response = cv2.matchTemplate(search_feature, template, cv2.TM_CCORR_NORMED, mask=template_mask)
         template_width = template.shape[1]
         template_height = template.shape[0]
-        for raw_score, (ax, ay) in top_matches(response, template_width, template_height, RAW_PEAKS_PER_SCALE):
+        for raw_score, (ax, ay) in top_matches(
+            response,
+            template_width,
+            template_height,
+            RAW_PEAKS_PER_SCALE if peak_limit is None else peak_limit,
+        ):
             # matchTemplate coordinates refer to the padded descriptor canvas;
             # convert back to the tight source glyph bbox for the profile.
             canvas_x = (ax + feature_origin_x) / analysis_x
@@ -537,11 +591,17 @@ def candidate_rows(
             # Coarse correlation is already at a reduced resolution.  A
             # 3×3 source grid covers the documented ±12 px search area while
             # retaining a bounded calibration time; ECC/flow can later refine
-            # only the retained graph path.
+            # only the retained graph path. Use a cross-shaped local grid to
+            # keep source-resolution refinement bounded on a 4 GB machine.
             refinement_radius = max(4, int(round(12 * base_scale)))
-            for dx in (-refinement_radius, 0, refinement_radius):
-                for dy in (-refinement_radius, 0, refinement_radius):
-                    metrics = evaluate_box(frame, x + dx, y + dy, width, height, canonical)
+            for dx, dy in (
+                (0, 0),
+                (-refinement_radius, 0),
+                (refinement_radius, 0),
+                (0, -refinement_radius),
+                (0, refinement_radius),
+            ):
+                    metrics = evaluate_box(source_gray, x + dx, y + dy, width, height, canonical)
                     if metrics is None:
                         continue
                     corr, iou, contam, large = metrics
@@ -574,6 +634,10 @@ def candidate_rows(
                 "glyphIou": float(iou),
                 "contamination": float(contamination),
                 "largeOutsideComponent": bool(large),
+                # Preserve how well this candidate occupies the user's broad
+                # hint.  It is used only as a seed-selection tie-breaker;
+                # global candidates remain available to the trajectory graph.
+                "roiOverlap": roi_overlap_ratio(x, y, width, height, roi),
                 "baseScale": float(base_scale),
                 "score": float(local_quality),
             }
@@ -596,7 +660,7 @@ def candidate_rows(
     # a pixel-wise maximum would let unrelated high-contrast texture consume
     # the limited NMS budget before the real gray watermark is considered.
     if polarity == "positive":
-        selected.extend(candidate_rows(frame, frame_number, canonical, roi, "negative"))
+        selected.extend(candidate_rows(frame, frame_number, canonical, roi, "negative", peak_limit))
         selected.sort(key=lambda row: float(row["score"]), reverse=True)
         merged: list[dict[str, float | int | bool]] = []
         for row in selected:
@@ -627,6 +691,7 @@ def periodic_prior_candidate(
     therefore cannot be rendered from this prior alone.
     """
     _, _, _, base_scale = feature(frame)
+    source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prior_x, prior_y = periodic_position(frame_number)
     best: tuple[float, float, float, float, float, float, bool, float] | None = None
     for variant in (0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.25):
@@ -639,7 +704,7 @@ def periodic_prior_candidate(
         radius = max(6, int(round(24 * base_scale)))
         for dx in range(-radius, radius + 1, max(6, int(round(6 * base_scale)))):
             for dy in range(-radius, radius + 1, max(6, int(round(6 * base_scale)))):
-                metrics = evaluate_box(frame, base_x + dx, base_y + dy, width, height, canonical)
+                metrics = evaluate_box(source_gray, base_x + dx, base_y + dy, width, height, canonical)
                 if metrics is None:
                     continue
                 corr, iou, contamination, large = metrics
@@ -721,10 +786,20 @@ def write_contact_sheet(
 
 
 def choose_track(all_candidates: dict[int, list[dict[str, float | int | bool]]]) -> list[dict[str, float | int | bool]]:
+    # JSON object keys are strings after cache reload.  Normalize once at the
+    # graph boundary so temporal deltas are always numeric and diagnostics can
+    # safely call this helper with a deserialized cache as well as in-memory
+    # candidates.
+    all_candidates = {
+        int(frame): rows
+        for frame, rows in all_candidates.items()
+        if rows
+    }
     frames = sorted(all_candidates)
     if not frames:
         return []
     costs: list[list[float]] = []
+    lengths: list[list[int]] = []
     parents: list[list[int]] = []
     for index, frame in enumerate(frames):
         current = all_candidates[frame]
@@ -738,10 +813,28 @@ def choose_track(all_candidates: dict[int, list[dict[str, float | int | bool]]])
                 return 0.42
             if bool(candidate.get("userRoi", False)):
                 return 0.24
-            return 0.0
+            # The raw NCC score is intentionally only one term in the
+            # candidate ranking.  A busy background can produce a stronger
+            # raw response than the translucent glyph.  Give candidates with
+            # the canonical glyph geometry a small, bounded advantage so a
+            # smooth background branch cannot win merely by being static.
+            correlation = float(candidate.get("glyphCorrelation", 0.0))
+            iou = float(candidate.get("glyphIou", 0.0))
+            contamination = float(candidate.get("contamination", 1.0))
+            geometry = (
+                max(0.0, correlation - 0.35) * 2.4
+                + max(0.0, iou - 0.10) * 1.8
+                - max(0.0, contamination - 0.65) * 0.35
+            )
+            if hard_gate(candidate):
+                geometry += 1.25
+            elif correlation >= 0.58 and iou >= 0.30 and contamination <= 0.55:
+                geometry += 0.55
+            return max(0.0, min(2.2, geometry))
 
         frame_cost = [-float(candidate["score"]) * 6.0 - support_bonus(candidate) + 18.0 for candidate in current]
         frame_parent = [-1] * len(current)
+        frame_length = [1] * len(current)
         for candidate_index, candidate in enumerate(current):
             base = -float(candidate["score"]) * 6.0 - support_bonus(candidate)
             if index == 0:
@@ -757,7 +850,14 @@ def choose_track(all_candidates: dict[int, list[dict[str, float | int | bool]]])
                 # Motion is locally smooth.  Do not connect candidates across
                 # an implausible jump; the explicit restart cost above lets a
                 # later coherent segment seed a new trajectory instead.
-                max_jump = min(180.0, 45.0 * delta_frames)
+                # A six-frame sample can straddle a short occlusion/scene
+                # transition.  The former 180 px cap broke the real path at
+                # 732→780 on the 14_7 footage (the next visible glyph was
+                # ~200 px away) and let a static background branch win.  Keep
+                # the cap bounded, but allow the motion implied by a missing
+                # sample to be recovered by the graph; holdout/uncertainty
+                # gates still decide whether the resulting path is valid.
+                max_jump = min(320.0, 60.0 * delta_frames)
                 if delta_frames > 60 or distance > max_jump:
                     continue
                 jump_penalty = distance / max(24.0, 22.0 * delta_frames)
@@ -766,7 +866,9 @@ def choose_track(all_candidates: dict[int, list[dict[str, float | int | bool]]])
                 if value < frame_cost[candidate_index]:
                     frame_cost[candidate_index] = value
                     frame_parent[candidate_index] = previous_index
+                    frame_length[candidate_index] = lengths[index - 1][previous_index] + 1
         costs.append(frame_cost)
+        lengths.append(frame_length)
         parents.append(frame_parent)
     # Do not force the path to terminate at the last sampled frame.  The old
     # implementation only considered ``costs[-1]`` and therefore selected a
@@ -782,6 +884,11 @@ def choose_track(all_candidates: dict[int, list[dict[str, float | int | bool]]])
             for frame_index, frame_cost in enumerate(costs)
             for candidate_index in range(len(frame_cost))
         ),
+        # Keep the cumulative objective so a real trajectory spanning a large
+        # portion of the active interval is preferred.  Geometry bonuses above
+        # provide the discrimination against long, static texture branches;
+        # normalizing here would incorrectly select a short high-contrast
+        # fragment and starve the later dense refinement pass.
         key=lambda item: costs[item[0]][item[1]],
     )
     chosen: list[dict[str, float | int | bool]] = []
@@ -859,7 +966,20 @@ def choose_user_seeded_track(
     for frame in frames:
         user = [row for row in all_candidates[frame] if bool(row.get("userRoi", False)) and provisional_gate(row)]
         if user:
-            anchors.append(max(user, key=lambda row: float(row.get("score", 0.0))))
+            # A broad ROI is location evidence.  Prefer the candidate that
+            # actually occupies that evidence, then use image score only as a
+            # tie-breaker.  This prevents a bright background patch elsewhere
+            # in the ROI from replacing the glyph with a higher NCC score.
+            anchors.append(
+                max(
+                    user,
+                    key=lambda row: (
+                        float(row.get("roiOverlap", 0.0)),
+                        float(row.get("glyphIou", 0.0)),
+                        float(row.get("score", 0.0)),
+                    ),
+                )
+            )
     if not anchors:
         return []
 
@@ -938,6 +1058,15 @@ def choose_user_seeded_track(
         # blur, but a second consecutive weak-only step terminates propagation
         # and leaves the inactive tail untouched.
         weak_steps = 0
+        # A translucent glyph can remain below the image hard gate for several
+        # consecutive samples while crossing a bright face/robot/UI panel.
+        # Stop only after a bounded run of weak-but-continuous candidates; the
+        # motion and distance checks below still reject a background branch.
+        # The helper is intentionally independent of source metadata (it is
+        # also covered by unit tests with synthetic frame numbers).  Five
+        # six-frame samples is the conservative ~1 s allowance used by the
+        # 30-fps production profile.
+        max_weak_steps = 5
         for frame in indices:
             candidates = [row for row in all_candidates[frame] if provisional_gate(row)]
             if not candidates:
@@ -966,7 +1095,7 @@ def choose_user_seeded_track(
                 weak_steps = 0
             else:
                 weak_steps += 1
-                if weak_steps > 1:
+                if weak_steps > max_weak_steps:
                     break
             selected[frame] = candidate
             previous = candidate
@@ -980,7 +1109,58 @@ def choose_user_seeded_track(
         dt = max(1, int(last["frame"]) - int(previous["frame"]))
         velocity = ((float(last["x"]) - float(previous["x"])) / dt, (float(last["y"]) - float(previous["y"])) / dt)
         propagate((frame for frame in frames if frame > int(last["frame"])), last, velocity)
-    return [selected[frame] for frame in sorted(selected)]
+    # Keep provenance for every row that was selected from the ROI-constrained
+    # path.  These rows are still provisional image evidence, but they are the
+    # only path tied to a user-confirmed glyph location.  The dense refinement
+    # pass must not replace them with a higher-scoring subtitle/background
+    # branch that is tens of pixels away from the seeded path.
+    seeded_path: list[dict[str, float | int | bool]] = []
+    for frame in sorted(selected):
+        row = dict(selected[frame])
+        row["userSeededPath"] = True
+        seeded_path.append(row)
+    return seeded_path
+
+
+def merge_seeded_tracks(
+    tracks: list[list[dict[str, float | int | bool]]],
+    user_seed: list[dict[str, float | int | bool]],
+) -> list[list[dict[str, float | int | bool]]]:
+    """Merge ROI hints into global tracks without discarding global evidence.
+
+    A ROI is a location constraint at a few frames.  Treating it as the only
+    track caused the active interval to collapse to the span between those
+    anchors and forced the user into an endless loop.  Keep every coherent
+    global segment and inject the seeded rows into the closest segment; when
+    no segment is close, retain the seed as a separate hypothesis so the
+    normal quality gates can decide whether it is safe.
+    """
+    if not user_seed:
+        return tracks
+    merged = [list(segment) for segment in tracks if segment]
+    for seed_row in user_seed:
+        frame = int(seed_row["frame"])
+        best_index: int | None = None
+        best_distance = float("inf")
+        for index, segment in enumerate(merged):
+            nearest = min(segment, key=lambda row: abs(int(row["frame"]) - frame))
+            distance = abs(int(nearest["frame"]) - frame)
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        if best_index is not None and best_distance <= SAMPLE_STRIDE * 4:
+            segment = merged[best_index]
+            by_frame = {int(row["frame"]): row for row in segment}
+            by_frame[frame] = seed_row
+            merged[best_index] = [by_frame[key] for key in sorted(by_frame)]
+        else:
+            # Keep a seed cluster together; it will be joined by the graph
+            # only when motion continuity supports that decision.
+            if not merged or abs(int(merged[-1][-1]["frame"]) - frame) > SAMPLE_STRIDE * 4:
+                merged.append([seed_row])
+            else:
+                merged[-1].append(seed_row)
+    return [sorted(segment, key=lambda row: int(row["frame"])) for segment in merged if segment]
 
 
 def filter_static_background_segments(
@@ -1043,6 +1223,87 @@ def active_intervals_from_segments(
         else:
             merged.append([start, end])
     return [{"startFrame": start, "endFrame": end} for start, end in merged]
+
+
+def activity_intervals_from_candidates(
+    all_candidates: dict[int, list[dict[str, float | int | bool]]],
+    frame_count: int,
+    fps: float,
+    scan_start: int,
+    scan_end: int,
+) -> list[dict[str, int]]:
+    """Infer watermark activity independently from the selected trajectory.
+
+    The old implementation used the chosen graph path as both activity
+    detector and trajectory.  A bad branch could therefore make the active
+    interval collapse to a few ROI anchors.  Require temporal support from
+    canonical/ROI evidence, then apply hysteresis so blurred frames between
+    two clear observations stay active.
+    """
+    evidence_frames = []
+    for frame, rows in all_candidates.items():
+        if frame < scan_start or frame > scan_end:
+            continue
+        # Activity detection must not require the final hard gate.  On a
+        # bright split-screen/skin panel the real glyph commonly lands around
+        # correlation .38-.50 and IoU .10-.25 even though it is plainly
+        # visible.  Keep this as an activity hint only; the trajectory,
+        # holdout and post-render QA gates remain authoritative.
+        strong = any(
+            hard_gate(row)
+            or bool(row.get("userRoi", False))
+            or (
+                float(row.get("glyphCorrelation", 0.0)) >= 0.38
+                and float(row.get("glyphIou", 0.0)) >= 0.10
+                and float(row.get("contamination", 1.0)) <= 0.78
+                and provisional_gate(row)
+            )
+            for row in rows
+        )
+        if strong:
+            evidence_frames.append(int(frame))
+    if not evidence_frames:
+        return []
+    evidence_frames = sorted(set(evidence_frames))
+    bridge = max(SAMPLE_STRIDE * 2, int(round(fps * 0.8)))
+    groups: list[list[int]] = [[evidence_frames[0]]]
+    for frame in evidence_frames[1:]:
+        if frame - groups[-1][-1] <= bridge:
+            groups[-1].append(frame)
+        else:
+            groups.append([frame])
+    intervals: list[dict[str, int]] = []
+    for group in groups:
+        if len(group) < 2:
+            continue
+        intervals.append({
+            "startFrame": max(scan_start, group[0] - SAMPLE_STRIDE),
+            "endFrame": min(scan_end, group[-1] + SAMPLE_STRIDE),
+        })
+    return intervals
+
+
+def merge_intervals(
+    intervals: list[dict[str, int]],
+    bridge_frames: int,
+    scan_start: int,
+    scan_end: int,
+) -> list[dict[str, int]]:
+    ordered = sorted((
+        {
+            "startFrame": max(scan_start, int(item["startFrame"])),
+            "endFrame": min(scan_end, int(item["endFrame"])),
+        }
+        for item in intervals
+        if int(item["startFrame"]) <= int(item["endFrame"])
+    ), key=lambda item: item["startFrame"])
+    merged: list[dict[str, int]] = []
+    for item in ordered:
+        if merged and item["startFrame"] - merged[-1]["endFrame"] <= bridge_frames:
+            merged[-1]["endFrame"] = max(merged[-1]["endFrame"], item["endFrame"])
+        else:
+            merged.append(item)
+    return merged
 
 
 def frame_in_intervals(frame: int, intervals: list[dict[str, int]]) -> bool:
@@ -1153,6 +1414,9 @@ def refine_local_path(
     active_intervals: list[dict[str, int]],
     frame_width: int,
     frame_height: int,
+    radius: int = LOCAL_REFINE_RADIUS,
+    step: int = LOCAL_REFINE_STEP,
+    target_frames: set[int] | None = None,
 ) -> list[dict[str, float | int | bool]]:
     """Refine a seeded trajectory at source resolution with local masked NCC.
 
@@ -1165,13 +1429,14 @@ def refine_local_path(
     if len(seed_rows) < 2 or not active_intervals:
         return []
     ordered = sorted(seed_rows, key=lambda row: int(row["frame"]))
-    targets: set[int] = set()
-    for interval in active_intervals:
-        start = int(interval["startFrame"])
-        end = int(interval["endFrame"])
-        targets.update(range(start, end + 1, LOCAL_REFINE_STRIDE))
-        targets.add(start)
-        targets.add(end)
+    targets: set[int] = set(target_frames or set())
+    if not targets:
+        for interval in active_intervals:
+            start = int(interval["startFrame"])
+            end = int(interval["endFrame"])
+            targets.update(range(start, end + 1, LOCAL_REFINE_STRIDE))
+            targets.add(start)
+            targets.add(end)
     refined: list[dict[str, float | int | bool]] = []
     capture = cv2.VideoCapture(str(source))
     frame_number = 0
@@ -1184,16 +1449,17 @@ def refine_local_path(
                 frame_number += 1
                 continue
             px, py, predicted_scale, _, predicted_score = interpolate(ordered, frame_number)
+            source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             best: tuple[float, float, float, float, float, float, bool] | None = None
             for scale_factor in (0.94, 1.0, 1.06):
                 scale = max(0.55, min(1.55, predicted_scale * scale_factor))
                 box_width = CANONICAL_WIDTH * scale
                 box_height = CANONICAL_HEIGHT * scale
-                for dx in range(-LOCAL_REFINE_RADIUS, LOCAL_REFINE_RADIUS + 1, LOCAL_REFINE_STEP):
-                    for dy in range(-LOCAL_REFINE_RADIUS, LOCAL_REFINE_RADIUS + 1, LOCAL_REFINE_STEP):
+                for dx in range(-radius, radius + 1, max(1, step)):
+                    for dy in range(-radius, radius + 1, max(1, step)):
                         x = px + dx
                         y = py + dy
-                        metrics = evaluate_box(frame, x, y, box_width, box_height, canonical)
+                        metrics = evaluate_box(source_gray, x, y, box_width, box_height, canonical)
                         if metrics is None:
                             continue
                         corr, iou, contamination, large = metrics
@@ -1396,23 +1662,18 @@ def review_ranges_from_gaps(
     # not dozens of nearly identical frame selections.  Never merge different
     # failure classes: an unresolved active gap remains visible as such.
     clustered: list[dict[str, object]] = []
-    # Group by reason before clustering so an interleaved diagnostic range of
-    # another class cannot prevent two adjacent unresolved ranges from being
-    # merged (the previous ordering made this happen in long clips).
+    # Sort by physical range, not failure reason.  A single motion segment can
+    # produce both an unresolved-gap and weak-direct diagnostic; those reasons
+    # must still become one actionable ROI cluster.
     ordered_unique = sorted(
         unique,
-        key=lambda value: (
-            str(value.get("reason", "")),
-            int(value["startFrame"]),
-            int(value["endFrame"]),
-        ),
+        key=lambda value: (int(value["startFrame"]), int(value["endFrame"])),
     )
     for item in ordered_unique:
         if not clustered:
             clustered.append(dict(item))
             continue
         previous = clustered[-1]
-        same_reason = item.get("reason") == previous.get("reason")
         merged_start = min(int(previous["startFrame"]), int(item["startFrame"]))
         merged_end = max(int(previous["endFrame"]), int(item["endFrame"]))
         close_enough = int(item["startFrame"]) - int(previous["endFrame"]) <= REVIEW_MERGE_GAP
@@ -1421,9 +1682,13 @@ def review_ranges_from_gaps(
             int(previous["endFrame"]) < int(frame) < int(item["startFrame"])
             for frame in roi_evidence
         )
-        if same_reason and close_enough and within_cluster and not evidence_between:
+        if close_enough and within_cluster and not evidence_between:
             previous["startFrame"] = merged_start
             previous["endFrame"] = merged_end
+            # Preserve the strongest actionable reason while avoiding a
+            # duplicate range for each diagnostic category.
+            if previous.get("reason") != "UNRESOLVED_ACTIVE_RANGE" and item.get("reason") == "UNRESOLVED_ACTIVE_RANGE":
+                previous["reason"] = "UNRESOLVED_ACTIVE_RANGE"
             previous_suggestions = [int(frame) for frame in previous.get("suggestedFrames", [])]
             item_suggestions = [int(frame) for frame in item.get("suggestedFrames", [])]
             merged_suggestions: list[int] = []
@@ -1487,14 +1752,147 @@ def provisional_gate(row: dict[str, float | int | bool]) -> bool:
             and float(row.get("glyphIou", 0.0)) >= 0.12
             and float(row.get("contamination", 1.0)) <= 0.75
         )
-    # Global evidence can be weaker on motion-blurred frames.  A candidate is
-    # still retained for the graph at this lower tier; it cannot become a
-    # profile by itself because trajectory and direct-seed gates run later.
+    # Global evidence can be much weaker when the same gray glyph crosses a
+    # bright robot/skin/UI panel.  Keep a conservative ``near`` tier for the
+    # temporal graph so a real glyph is not discarded before motion can
+    # disambiguate it from background texture.  These rows are never counted
+    # as direct evidence; holdout, residual and QA gates still decide whether
+    # the resulting path is renderable.
     return (
-        float(row.get("glyphCorrelation", 0.0)) >= 0.48
-        and float(row.get("glyphIou", 0.0)) >= 0.20
-        and float(row.get("contamination", 1.0)) <= 0.65
+        float(row.get("glyphCorrelation", 0.0)) >= 0.30
+        and float(row.get("glyphIou", 0.0)) >= 0.05
+        and float(row.get("contamination", 1.0)) <= 0.90
     )
+
+
+def glyph_geometry_score(row: dict[str, float | int | bool]) -> float:
+    """Score canonical glyph evidence independently from raw NCC strength.
+
+    A text/texture background can have a high raw response but almost no
+    overlap with the Learna glyph.  This score is used only to choose seeds
+    and never relaxes the final mask/trajectory gates.
+    """
+    correlation = float(row.get("glyphCorrelation", 0.0))
+    iou = float(row.get("glyphIou", 0.0))
+    contamination = float(row.get("contamination", 1.0))
+    outside = 0.12 if bool(row.get("largeOutsideComponent", False)) else 0.0
+    return correlation + 0.85 * iou - 0.35 * contamination - outside
+
+
+def select_glyph_evidence(
+    all_candidates: dict[int, list[dict[str, float | int | bool]]],
+) -> list[dict[str, float | int | bool]]:
+    """Collect strong glyph-shaped observations before graph branch pruning.
+
+    The generic Viterbi path is intentionally conservative about jumps.  On a
+    busy shot that can let a smooth background branch win before the actual
+    glyph reappears.  Preserve strong canonical matches as independent seeds;
+    dense local refinement can then bridge the weak frames between them.
+    """
+    normalized = {int(frame): rows for frame, rows in all_candidates.items() if rows}
+    frames = sorted(normalized)
+    candidates_by_frame: dict[int, list[dict[str, float | int | bool]]] = {}
+    for frame in frames:
+        rows = [
+            row for row in normalized[frame]
+            if provisional_gate(row)
+            and (
+                hard_gate(row)
+                or (
+                    float(row.get("glyphCorrelation", 0.0)) >= 0.55
+                    and float(row.get("glyphIou", 0.0)) >= 0.25
+                    and float(row.get("contamination", 1.0)) <= 0.65
+                )
+            )
+        ]
+        if rows:
+            candidates_by_frame[frame] = sorted(rows, key=glyph_geometry_score, reverse=True)
+
+    selected: list[dict[str, float | int | bool]] = []
+    for frame in sorted(candidates_by_frame):
+        row = candidates_by_frame[frame][0]
+        # Do not admit an isolated background coincidence as a trajectory seed
+        # unless it passes the strict hard gate.  A neighbouring glyph-shaped
+        # observation is enough to establish temporal evidence; the neighbour
+        # check tolerates the six-frame sampling cadence and short blur gaps.
+        if not hard_gate(row):
+            supported = False
+            nearby_frames = [
+                other_frame
+                for other_frame in frames
+                if 0 < abs(other_frame - frame) <= SAMPLE_STRIDE * 10
+            ]
+            for other_frame in nearby_frames:
+                delta = abs(other_frame - frame)
+                for other in candidates_by_frame.get(other_frame, []):
+                    # A glyph can move quickly during a diagonal sweep, but
+                    # a several-hundred-pixel jump over one sampled interval
+                    # is almost always a background branch.  This tighter
+                    # velocity bound rejects isolated subtitle/UI matches
+                    # while still allowing sparse deep-scan evidence.
+                    max_jump = min(320.0, 12.0 * max(1, delta))
+                    if math.hypot(
+                        float(row["x"]) - float(other["x"]),
+                        float(row["y"]) - float(other["y"]),
+                    ) <= max_jump:
+                        supported = True
+                        break
+                if supported:
+                    break
+            if not supported:
+                continue
+        copy = dict(row)
+        copy["glyphEvidence"] = True
+        selected.append(copy)
+    # Remove one-frame branch spikes after the temporal support check.  A
+    # false subtitle/UI match can itself have a neighbouring false match, so
+    # checking only one side is insufficient.  Compare each node with the
+    # linear position implied by its nearest accepted neighbours; genuine
+    # diagonal motion remains inside this bounded velocity envelope, while a
+    # 500–1000 px teleport is rejected before trajectory fitting.
+    # A branch is removed below as a whole.  Do not run a per-node filter
+    # first: when a false node sits next to a genuine node, the false position
+    # would make the genuine node look like a spike and delete it as well.
+    # Collapse a short *run* of branch nodes as well.  The per-node check
+    # above cannot remove a three-frame false track because its immediate
+    # neighbours are false too.  If the path makes a large jump into a run
+    # and a similarly large jump back to nearly the same trajectory, the whole
+    # run is a reversible branch spike.  Genuine scene cuts are retained
+    # because their before/after endpoints remain far apart.
+    if len(selected) >= 3:
+        keep = [True] * len(selected)
+        index = 1
+        while index < len(selected) - 1:
+            previous = selected[index - 1]
+            if keep[index - 1]:
+                delta_in = int(selected[index]["frame"]) - int(previous["frame"])
+                jump_in = math.hypot(
+                    float(selected[index]["x"]) - float(previous["x"]),
+                    float(selected[index]["y"]) - float(previous["y"]),
+                )
+                if jump_in > max(180.0, min(420.0, 16.0 * max(1, delta_in))):
+                    end = index
+                    while end + 1 < len(selected):
+                        current = selected[end]
+                        following = selected[end + 1]
+                        delta_out = int(following["frame"]) - int(current["frame"])
+                        jump_out = math.hypot(
+                            float(following["x"]) - float(current["x"]),
+                            float(following["y"]) - float(current["y"]),
+                        )
+                        if jump_out > max(180.0, min(420.0, 16.0 * max(1, delta_out))):
+                            endpoint_distance = math.hypot(
+                                float(following["x"]) - float(previous["x"]),
+                                float(following["y"]) - float(previous["y"]),
+                            )
+                            if endpoint_distance <= 320.0:
+                                for remove_index in range(index, end + 1):
+                                    keep[remove_index] = False
+                            break
+                        end += 1
+            index += 1
+        selected = [row for index, row in enumerate(selected) if keep[index]]
+    return selected
 
 
 def extend_keys(keys: list[dict[str, float | int | bool]], first_frame: int, last_frame: int) -> list[dict[str, float | int | bool]]:
@@ -1597,15 +1995,22 @@ def main() -> None:
     descriptor_hash = hashlib.sha256(matching_mask.tobytes()).hexdigest()
     candidate_cache: dict[int, list[dict[str, float | int | bool]]] = {}
     cache_reusable = False
+    cache_has_deep_peaks = False
     try:
         cached = json.loads(candidate_cache_path.read_text(encoding="utf-8"))
         assert_finite_json(cached)
         cache_reusable = bool(
             isinstance(cached, dict)
-            and cached.get("version") == CANDIDATE_CACHE_VERSION
+            and int(cached.get("version", 0)) in (3, 4, CANDIDATE_CACHE_VERSION)
             and cached.get("sourceSha256") == sha256_file(source)
             and cached.get("descriptorSha256") == descriptor_hash
             and cached.get("scanRange") == {"startFrame": scan_start, "endFrame": scan_end}
+        )
+        cache_has_deep_peaks = bool(
+            cache_reusable
+            and cached.get("rawPeaksPerScale") == RAW_PEAKS_PER_SCALE
+            and cached.get("deepRawPeaksPerScale") == DEEP_RAW_PEAKS_PER_SCALE
+            and cached.get("deepScanStride") == DEEP_SCAN_STRIDE
         )
         if cache_reusable and isinstance(cached.get("candidates"), dict):
             candidate_cache = {
@@ -1658,10 +2063,17 @@ def main() -> None:
             # Re-run exact ROI frames so a new broad hint can improve a cached
             # global candidate.  All other frames already present in a valid
             # cache are reused byte-for-byte.
-            if cache_reusable and frame_number in all_candidates and frame_number not in roi_evidence:
+            deep_scan = (
+                frame_number in roi_evidence
+                or frame_number in (scan_start, scan_end)
+                or frame_number % DEEP_SCAN_STRIDE == 0
+            )
+            if cache_reusable and frame_number in all_candidates and frame_number not in roi_evidence and (
+                not deep_scan or cache_has_deep_peaks
+            ):
                 frame_number += 1
                 continue
-            if cache_reusable and frame_number in roi_evidence:
+            if cache_reusable and (frame_number in roi_evidence or (deep_scan and not cache_has_deep_peaks)):
                 all_candidates.pop(frame_number, None)
             # The broad user ROI is sampled on its exact frame, even when that
             # frame falls between the normal stride phases.  All other frames
@@ -1674,7 +2086,13 @@ def main() -> None:
                 # Every other sampled frame is global, so ROI never becomes a
                 # fixed position or a false trajectory prior.
                 search_roi = roi_evidence.get(frame_number)
-                candidates = candidate_rows(frame, frame_number, matching_mask, search_roi)
+                candidates = candidate_rows(
+                    frame,
+                    frame_number,
+                    matching_mask,
+                    search_roi,
+                    peak_limit=DEEP_RAW_PEAKS_PER_SCALE if deep_scan else RAW_PEAKS_PER_SCALE,
+                )
                 if candidates:
                     if frame_number in roi_evidence:
                         for candidate in candidates:
@@ -1698,6 +2116,9 @@ def main() -> None:
             "sourceSha256": sha256_file(source),
             "descriptorSha256": descriptor_hash,
             "scanRange": {"startFrame": scan_start, "endFrame": scan_end},
+            "rawPeaksPerScale": RAW_PEAKS_PER_SCALE,
+            "deepRawPeaksPerScale": DEEP_RAW_PEAKS_PER_SCALE,
+            "deepScanStride": DEEP_SCAN_STRIDE,
             "candidates": {
                 str(frame): [
                     {key: value for key, value in row.items() if key != "userRoi"}
@@ -1828,14 +2249,13 @@ def main() -> None:
     # validation, but it gives the user's confirmed glyph locations a real
     # influence on the fitted trajectory.
     user_seed = choose_user_seeded_track(track_candidates)
-    if len(user_seed) >= 2:
-        # In a user-assisted route the confirmed ROI anchors are the source
-        # of truth for the active path.  Keeping unrelated Viterbi segments
-        # as additional tracks lets a high-contrast subtitle/background chain
-        # create a second "active" interval after the watermark disappears.
-        # Use the seeded path exclusively; it still goes through the normal
-        # residual, gap and mask gates and therefore cannot bypass review.
-        tracks = [user_seed]
+    if len(user_seed) >= 1:
+        # ROI anchors constrain the global graph but never replace it.  The
+        # previous exclusive assignment collapsed activeIntervals to the ROI
+        # span and made every subsequent calibration request more ROI.  Keep
+        # all coherent global hypotheses and merge only physically adjacent
+        # seed rows; model selection/quality gates remain authoritative.
+        tracks = merge_seeded_tracks(tracks, user_seed)
     # A periodic prior is retained as another graph hypothesis only.  It must
     # never replace the free trajectory selected from image evidence: doing so
     # made a known 360-frame clip appear correct while silently misplacing a
@@ -1858,6 +2278,20 @@ def main() -> None:
         if provisional_gate(row)
     }
     measured_by_frame: dict[int, dict[str, float | int | bool]] = dict(user_seed_by_frame)
+    # Re-introduce strong glyph-shaped observations that the generic graph
+    # may have discarded while following a background branch.  These rows are
+    # still image evidence (not trajectory predictions), so they are safe
+    # seeds for the dense local pass and make long low-contrast sections
+    # recoverable without asking the user for another ROI.
+    glyph_evidence = select_glyph_evidence(all_candidates)
+    for row in glyph_evidence:
+        frame = int(row["frame"])
+        current = measured_by_frame.get(frame)
+        if current is None or (
+            not bool(current.get("userRoi", False))
+            and glyph_geometry_score(row) > glyph_geometry_score(current)
+        ):
+            measured_by_frame[frame] = row
     for segment in tracks:
         for row in segment:
             if not provisional_gate(row):
@@ -1866,12 +2300,29 @@ def main() -> None:
             if frame in measured_by_frame:
                 continue
             current = measured_by_frame.get(frame)
-            if current is None or float(row.get("score", 0.0)) > float(current.get("score", 0.0)):
+            # Only admit a graph row when it carries meaningful canonical
+            # geometry.  Raw-score-only rows are useful diagnostics but can
+            # be a subtitle/texture branch and must not steer interpolation.
+            if hard_gate(row) or glyph_geometry_score(row) >= 0.72:
+                if current is None or glyph_geometry_score(row) > glyph_geometry_score(current):
+                    measured_by_frame[frame] = row
                 measured_by_frame[frame] = row
     measured = [measured_by_frame[frame] for frame in sorted(measured_by_frame)]
     track = measured
-    active_intervals = active_intervals_from_segments(
+    track_intervals = active_intervals_from_segments(
         tracks, frame_count, fps, scan_start, scan_end
+    )
+    # Activity is derived from the complete candidate pool, not from the
+    # currently selected/ROI-seeded trajectory.  Unioning the two sources
+    # prevents a few user anchors from shrinking a long watermark interval.
+    activity_intervals = activity_intervals_from_candidates(
+        all_candidates, frame_count, fps, scan_start, scan_end
+    )
+    active_intervals = merge_intervals(
+        track_intervals + activity_intervals,
+        max(SAMPLE_STRIDE * 2, int(round(fps * 0.8))),
+        scan_start,
+        scan_end,
     )
     # V7 performs a dense, source-resolution local pass around the selected
     # path.  This is the important bridge between a handful of ROI seeds and
@@ -1884,6 +2335,8 @@ def main() -> None:
         active_intervals,
         width,
         height,
+        radius=LOCAL_REFINE_RADIUS,
+        step=LOCAL_REFINE_STEP,
     )
     if refined_rows:
         for row in refined_rows:
@@ -1891,17 +2344,88 @@ def main() -> None:
             existing = measured_by_frame.get(frame)
             # Prefer an image-refined row unless it is materially weaker than
             # a hard/direct observation already present at the same frame.
+            preserve_seed = bool(existing and existing.get("userSeededPath", False))
+            seed_distance = (
+                math.hypot(
+                    float(row.get("x", 0.0)) - float(existing.get("x", 0.0)),
+                    float(row.get("y", 0.0)) - float(existing.get("y", 0.0)),
+                )
+                if existing
+                else 0.0
+            )
+            # A local NCC peak can be numerically stronger while belonging to
+            # a subtitle or textured background.  Preserve the ROI-seeded
+            # trajectory unless the replacement is genuinely local; otherwise
+            # one branch spike poisons all interpolated frames until the next
+            # anchor and leaves the watermark visible in the render.
+            if preserve_seed and seed_distance > max(48.0, 0.30 * float(existing.get("width", CANONICAL_WIDTH))):
+                continue
             if existing is None or not hard_gate(existing) or float(row.get("score", 0.0)) >= float(existing.get("score", 0.0)) * 0.70:
                 measured_by_frame[frame] = row
         measured = [measured_by_frame[frame] for frame in sorted(measured_by_frame)]
         track = measured
+    # Second, bounded recovery pass.  Only frames still missing a strong
+    # refined/direct observation are searched with a wider window; this avoids
+    # the expensive all-frame/full-radius loop while recovering branch
+    # switches and turning points that caused repeated ROI requests.
+    known_refined_frames = {
+        int(row["frame"])
+        for row in measured
+        if bool(row.get("refined", False)) or hard_gate(row)
+    }
+    # The second pass is for actual unresolved gaps only.  Earlier versions
+    # treated every non-refined frame as a recovery target, effectively
+    # running another full-video search after the dense pass.  Interpolated
+    # frames already have a bounded trajectory transform; only a gap larger
+    # than the normal 18-frame policy needs the wide local window.
+    active_targets: set[int] = set()
+    for interval in active_intervals:
+        start = int(interval["startFrame"])
+        end = int(interval["endFrame"])
+        observed = sorted(
+            frame for frame in known_refined_frames if start <= frame <= end
+        )
+        for left, right in zip(observed, observed[1:]):
+            if right - left > MAX_GAP:
+                active_targets.update(range(left + 1, right, max(1, LOCAL_REFINE_STRIDE)))
+        if observed and observed[0] - start > MAX_GAP:
+            active_targets.update(range(start, observed[0], max(1, LOCAL_REFINE_STRIDE)))
+        if observed and end - observed[-1] > MAX_GAP:
+            active_targets.update(range(observed[-1] + 1, end + 1, max(1, LOCAL_REFINE_STRIDE)))
+    active_targets.difference_update(known_refined_frames)
+    if active_targets:
+        recovery_rows = refine_local_path(
+            source,
+            matching_mask,
+            measured,
+            active_intervals,
+            width,
+            height,
+            radius=48,
+            step=6,
+            target_frames=active_targets,
+        )
+        for row in recovery_rows:
+            frame = int(row["frame"])
+            existing = measured_by_frame.get(frame)
+            if existing is None or float(row.get("score", 0.0)) >= float(existing.get("score", 0.0)) * 0.60:
+                measured_by_frame[frame] = row
+        if recovery_rows:
+            measured = [measured_by_frame[frame] for frame in sorted(measured_by_frame)]
+            track = measured
     # Trim a terminal chain of background candidates after the last validated
     # glyph evidence.  This handles videos whose watermark disappears before
     # the file ends without assuming a fixed end frame.
+    # Do not trim activity at the last hard/direct candidate.  On a bright
+    # robot/skin panel the real Learna glyph often remains a provisional
+    # near-match for a long section; once the temporal graph has selected a
+    # coherent path, that path is valid evidence for the activity boundary.
+    # Restrict this to rows already admitted to ``measured`` (global/ROI path
+    # or image refinement), never arbitrary background peaks in the cache.
     validated_frames = [
-        int(frame)
-        for frame, rows in all_candidates.items()
-        if any(hard_gate(row) or bool(row.get("userRoi", False)) for row in rows)
+        int(row["frame"])
+        for row in measured
+        if provisional_gate(row)
     ]
     if validated_frames:
         last_validated = max(validated_frames)
@@ -1933,7 +2457,10 @@ def main() -> None:
     roi_measured = [row for row in measured if bool(row.get("userRoi", False))]
     confirmed_measured = [
         row for row in measured
-        if hard_gate(row) or bool(row.get("userRoi", False)) or bool(row.get("refined", False))
+        if hard_gate(row)
+        or bool(row.get("userRoi", False))
+        or bool(row.get("refined", False))
+        or bool(row.get("glyphEvidence", False))
     ]
     # Provisional global matches are useful for finding active intervals but
     # can jump to a subtitle/face branch on busy shots.  Once enough explicit
@@ -1975,7 +2502,11 @@ def main() -> None:
     active_count = sum(interval["endFrame"] - interval["startFrame"] + 1 for interval in active_intervals)
     holdout = holdout_metrics(confirmed_measured, 2.0)
     refined_frames = {int(row["frame"]) for row in measured if bool(row.get("refined", False))}
-    refined_coverage = min(1.0, len(refined_frames) / max(1, active_count))
+    expected_refined_samples = sum(
+        ((int(interval["endFrame"]) - int(interval["startFrame"])) // LOCAL_REFINE_STRIDE) + 1
+        for interval in active_intervals
+    )
+    refined_coverage = min(1.0, len(refined_frames) / max(1, expected_refined_samples))
     # Fit the affine prior only from independent global hard-gate rows.  The
     # periodic rows are image-validated bridge evidence and must not be able
     # to fit the model they were generated from.
@@ -2024,7 +2555,7 @@ def main() -> None:
     measured_coverage = min(1.0, len(measured) * SAMPLE_STRIDE / max(1, active_count))
     validated_frames = set(int(row["frame"]) for row in hard_measured)
     validated_frames.update(refined_frames)
-    validated_coverage = min(1.0, len(validated_frames) * LOCAL_REFINE_STRIDE / max(1, active_count))
+    validated_coverage = min(1.0, len(validated_frames) / max(1, expected_refined_samples))
     measured_span = (
         max(int(row["frame"]) for row in measured) - min(int(row["frame"]) for row in measured) + SAMPLE_STRIDE
         if measured
@@ -2038,7 +2569,13 @@ def main() -> None:
     # the remaining problem is path fitting (the current clip has p95 around
     # 15 px), so expose that diagnosis and leave the profile fail-closed until
     # the automatic refinement stage brings the residual below the gate.
-    roi_review_saturated = should_suppress_roi_review(
+    # ROI is a single submission batch.  Once any user batch has been
+    # submitted, do not expose a second recommendation list even if the user
+    # supplied fewer than three seeds.  This is the terminal anti-loop rule:
+    # the remaining work is automatic refinement or a review draft, never a
+    # fourth/fifth round of manual drawing.
+    roi_batch_submitted = roi_batch_is_terminal(len(roi_evidence))
+    roi_review_saturated = roi_batch_submitted or len(roi_evidence) >= ROI_BUDGET_MAX or should_suppress_roi_review(
         # Saturation is based on the evidence the user supplied, not only the
         # subset that happened to pass the provisional image gate.  A broad ROI
         # is intentionally a location hint, so its image score may be weak on
@@ -2054,7 +2591,11 @@ def main() -> None:
         residual_p95_tolerance,
         max_gap,
     )
-    review_ranges = [] if roi_review_saturated else raw_review_ranges
+    roi_budget_used = min(ROI_BUDGET_MAX, len(roi_evidence))
+    # Only one bounded batch is exposed to the UI.  Once the budget is
+    # exhausted, do not emit another list on a later retry: the remaining
+    # problem is an automatic refinement/holdout failure.
+    review_ranges = [] if roi_review_saturated else raw_review_ranges[: max(0, ROI_BUDGET_MAX - roi_budget_used)]
     # A sparse but geometrically stable fit is only actionable after the user
     # has supplied ROI evidence.  The automatic global route must not be able
     # to turn a short false-positive segment into READY merely because its
@@ -2239,6 +2780,7 @@ def main() -> None:
     if max_gap > MAX_GAP:
         failure_reasons.append("UNRESOLVED_ACTIVE_RANGE")
     if roi_review_saturated and not trajectory_passed:
+        failure_reasons.append("AUTOMATIC_REFINEMENT_EXHAUSTED")
         failure_reasons.append("TRAJECTORY_REFINEMENT_REQUIRED")
     if p95_residual is not None and p95_residual > residual_p95_tolerance:
         failure_reasons.append("TRAJECTORY_RESIDUAL_TOO_HIGH")
@@ -2265,12 +2807,30 @@ def main() -> None:
     trajectory_segment_frames = {
         frame for frame in trajectory_segment_frames if scan_start <= frame <= scan_end
     }
+    roi_records = [
+        {
+            "id": f"roi-{frame}",
+            "frame": int(frame),
+            "bbox": {
+                "x": float(value["x"]),
+                "y": float(value["y"]),
+                "width": float(value["width"]),
+                "height": float(value["height"]),
+            },
+            "source": "USER",
+            "createdAt": "",
+            "attemptId": "",
+            "acceptedByDetector": bool(any(bool(row.get("userRoi", False)) and int(row["frame"]) == frame for row in measured)),
+        }
+        for frame, value in sorted(roi_evidence.items())
+    ]
     profile = {
         "version": CALIBRATION_VERSION,
         "status": "READY" if trajectory_passed else "NEEDS_REVIEW",
+        "outcome": "READY" if trajectory_passed else ("NEEDS_REVIEW_DRAFT" if roi_review_saturated else "AWAITING_ROI_BATCH"),
         "preset": "LEARNA_AI_ADAPTIVE",
-        "detectorVersion": "learna-global-template-v7.0-local-refine",
-        "validationVersion": "holdout-v1",
+        "detectorVersion": "learna-global-template-v8.0-bounded-refine",
+        "validationVersion": "holdout-v2",
         "route": args.route,
         "sourceFingerprint": {
             "sha256": sha256_file(source),
@@ -2303,6 +2863,9 @@ def main() -> None:
         ),
         "editedMaskSha256": sha256_file(edited_mask_path) if edited_mask_path else None,
         "roiEvidenceFrames": sorted(roi_evidence),
+        "roiEvidence": roi_records,
+        "roiBudgetUsed": roi_budget_used,
+        "roiBudgetMax": ROI_BUDGET_MAX,
         "maskSha256": sha256_file(inference_path),
         "frameData": frame_data,
         "observationsPath": observed_path.relative_to(calibration_dir.parent).as_posix(),
@@ -2373,6 +2936,9 @@ def main() -> None:
             "rawReviewRanges": raw_review_ranges,
             "reviewRanges": review_ranges,
             "reviewRangesSuppressed": roi_review_saturated,
+            "roiBudgetUsed": roi_budget_used,
+            "roiBudgetMax": ROI_BUDGET_MAX,
+            "outcome": "READY" if trajectory_passed else ("NEEDS_REVIEW_DRAFT" if roi_review_saturated else "AWAITING_ROI_BATCH"),
             "scanRange": {"startFrame": scan_start, "endFrame": scan_end},
             "excludedFrameCount": frame_count - scan_length,
             "outsideRangeUnchecked": scan_length != frame_count,

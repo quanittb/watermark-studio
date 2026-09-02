@@ -126,6 +126,12 @@ class CalibrationV6ReviewTests(unittest.TestCase):
             )
         )
 
+    def test_roi_batch_is_terminal_after_first_submission(self) -> None:
+        """A one-shot batch must never start a second ROI recommendation loop."""
+        self.assertFalse(CALIBRATION.roi_batch_is_terminal(0))
+        self.assertTrue(CALIBRATION.roi_batch_is_terminal(1))
+        self.assertTrue(CALIBRATION.roi_batch_is_terminal(3))
+
     def test_roi_review_uses_explicit_evidence_count_not_accepted_rows(self) -> None:
         """Weak ROI image scores must not restart the manual-ROI loop."""
         self.assertTrue(
@@ -233,6 +239,26 @@ class CalibrationV6ReviewTests(unittest.TestCase):
         track = CALIBRATION.choose_user_seeded_track(candidates)
         self.assertTrue(track)
         self.assertTrue(all(abs(float(row["x"]) - (100.0 + row["frame"])) < 1.0 for row in track))
+
+    def test_roi_seed_is_merged_without_discarding_global_segments(self) -> None:
+        global_segment = [candidate(frame, True) for frame in range(0, 121, 6)]
+        global_segment[0]["x"] = 100.0
+        seed = [{**candidate(60, False), "x": 190.0, "userRoi": True}]
+        merged = CALIBRATION.merge_seeded_tracks([global_segment], seed)
+        frames = {int(row["frame"]) for row in merged[0]}
+        self.assertIn(0, frames)
+        self.assertIn(120, frames)
+        self.assertIn(60, frames)
+
+    def test_activity_intervals_are_independent_of_roi_seed_span(self) -> None:
+        rows = {
+            frame: [candidate(frame, True)]
+            for frame in range(0, 181, 6)
+        }
+        intervals = CALIBRATION.activity_intervals_from_candidates(rows, 200, 30.0, 0, 199)
+        # Activity hysteresis extends the final sampled evidence by one
+        # detector stride so a blurred transition is not clipped.
+        self.assertEqual(intervals, [{"startFrame": 0, "endFrame": 186}])
 
 
 if __name__ == "__main__":

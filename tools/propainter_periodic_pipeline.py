@@ -73,7 +73,7 @@ def crop_origin(x: float, y: float, frame_width: int, frame_height: int) -> tupl
 
 
 def profile_bounds(bbox: dict[str, float], frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
-    """Use the profile's calibrated box dimensions, including V7 padding."""
+    """Use the profile's calibrated box dimensions, including V8 padding."""
     x0 = max(0, int(round(float(bbox["x"]))))
     y0 = max(0, int(round(float(bbox["y"]))))
     x1 = min(frame_width, int(round(float(bbox["x"]) + float(bbox["width"]))))
@@ -90,15 +90,16 @@ def prepare(args: argparse.Namespace) -> None:
     profile = None
     if args.profile is not None:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
+        draft_allowed = profile.get("outcome") == "NEEDS_REVIEW_DRAFT"
         if (
-            profile.get("version") != 7
-            or profile.get("status") != "READY"
+            profile.get("version") != 8
+            or (profile.get("status") != "READY" and not draft_allowed)
             or profile.get("preset") != "LEARNA_AI_ADAPTIVE"
-            or profile.get("qualityGate", {}).get("status") != "PASSED"
+            or (profile.get("qualityGate", {}).get("status") != "PASSED" and not draft_allowed)
         ):
-            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV7")
-        if profile.get("trajectoryGate", {}).get("status") != "PASSED":
-            raise RuntimeError("CalibrationProfileV7 trajectory quality gate did not pass")
+            raise RuntimeError("Best-quality preparation requires a READY CalibrationProfileV8 or a bounded review draft")
+        if profile.get("trajectoryGate", {}).get("status") != "PASSED" and not draft_allowed:
+            raise RuntimeError("CalibrationProfileV8 trajectory quality gate did not pass")
         if int(profile.get("frameCount", 0)) != int(project["video"]["frameCount"]):
             raise RuntimeError("Calibration profile frame count does not match the source video")
     mask_reference = profile.get("inferenceMaskPath") if profile else project["watermark"]["templates"]["mask"]

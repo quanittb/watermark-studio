@@ -73,6 +73,10 @@ export interface CalibrationProfile {
   contactSheetPath?: string | null;
   activeIntervals?: Array<{ startFrame: number; endFrame: number }>;
   roiEvidenceFrames?: number[];
+  roiEvidence?: RoiEvidenceRecord[];
+  roiBudgetUsed?: number;
+  roiBudgetMax?: number;
+  outcome?: 'READY' | 'AUTO_REFINEMENT_REQUIRED' | 'AWAITING_ROI_BATCH' | 'NEEDS_REVIEW_DRAFT' | 'FAILED_RUNTIME' | string;
   frameData?: Array<{
     frame: number;
     bbox: BoundingBox;
@@ -162,6 +166,18 @@ export interface WatermarkProject {
   anchors: ManualAnchor[];
   tracking: TrackingData | null;
   removal: RemovalConfig | null;
+  roiEvidence?: RoiEvidenceRecord[];
+}
+
+export interface RoiEvidenceRecord {
+  id: string;
+  frame: number;
+  bbox: BoundingBox;
+  source: 'USER' | 'MIGRATED_V7' | 'AUTO_RECOMMENDED' | string;
+  createdAt: string;
+  attemptId: string;
+  acceptedByDetector?: boolean;
+  rejectionReason?: string | null;
 }
 
 export type TrackingStatus = 'AUTO_GOOD' | 'AUTO_WEAK' | 'NEED_REVIEW' | 'MANUAL' | 'INTERPOLATED' | 'OCCLUDED';

@@ -26,6 +26,7 @@ import {
   listProjects,
   markOccludedRange,
   openVideo,
+  persistedRoiEvidence,
   regenJob,
   revalidateReviewJob,
   removeProject,
@@ -105,9 +106,7 @@ const defaultRemoval: RemovalConfig = {
 // Six explicit anchors are enough to cover the normal Learna motion phases.
 // Saturation stops an endless ROI loop; it never unlocks a profile that fails
 // trajectory/holdout/refinement gates.
-const ROI_SATURATION_MIN_EVIDENCE = 6;
-const ROI_SATURATION_MIN_CONFIRMED_COVERAGE = 0.15;
-const ROI_SATURATION_MIN_PATH_COVERAGE = 0.70;
+const ROI_BUDGET_MAX = 3;
 const defaultBestReplacement: BestQualityReplacement = {
   kind: "text",
   text: "",
@@ -212,6 +211,26 @@ function readStoredRoiEvidence(projectId: string): Array<RoiHint & { frame: numb
   } catch {
     return [];
   }
+}
+
+function mergeStoredRoiEvidence(
+  project: WatermarkProject,
+): Array<RoiHint & { frame: number }> {
+  // Backend project.json is authoritative for an existing frame.  The old
+  // order let stale localStorage overwrite a corrected source-coordinate box
+  // after reload, which made the UI report a different ROI budget than the
+  // calibration profile.  Local-only frames are still retained for a pending
+  // draw that has not yet been submitted to the backend.
+  const persisted = persistedRoiEvidence(project);
+  const localOnly = readStoredRoiEvidence(project.id).filter(
+    (item) => !persisted.some((saved) => saved.frame === item.frame),
+  );
+  const merged = [...persisted, ...localOnly];
+  const byFrame = new Map<number, RoiHint & { frame: number }>();
+  for (const item of merged) {
+    if (typeof item.frame === "number") byFrame.set(item.frame, item);
+  }
+  return Array.from(byFrame.values()).sort((left, right) => left.frame - right.frame);
 }
 
 async function openArtifact(path: string): Promise<void> {
@@ -427,23 +446,9 @@ export default function App() {
     calibrationGate?.roiEvidenceFrames ?? 0,
     calibrationEvidenceFrames.size,
   );
-  const calibrationConfirmedCoverage = calibrationGate?.confirmedCoverage ?? 0;
-  const calibrationMeasuredCoverage = calibrationGate?.measuredCoverage ?? 0;
-  const calibrationResidualP95 = calibrationGate?.residualP95 ?? null;
-  const calibrationResidualTolerance = project
-    ? 3 * project.video.width / 1080
-    : 3;
-  const calibrationMaxGap = calibrationGate?.maxObservationGap
-    ?? calibrationGate?.maxInterpolationGap
-    ?? 0;
   const roiReviewSaturated = Boolean(
-    calibrationRoiCount >= ROI_SATURATION_MIN_EVIDENCE
-    && calibrationConfirmedCoverage >= ROI_SATURATION_MIN_CONFIRMED_COVERAGE
-    && calibrationMeasuredCoverage >= ROI_SATURATION_MIN_PATH_COVERAGE
-    && (
-      calibrationMaxGap > 18
-      || (calibrationResidualP95 != null && calibrationResidualP95 > calibrationResidualTolerance)
-    ),
+    calibrationRoiCount >= ROI_BUDGET_MAX
+    || project?.calibration?.outcome === "NEEDS_REVIEW_DRAFT"
   );
   // Once the profile has broad evidence but still has a poor fit, showing the
   // same weak clusters again only creates an endless manual-ROI loop.  The
@@ -496,7 +501,7 @@ export default function App() {
     return labels[problem] ?? problem;
   };
   const dialogSteps = operationDialog?.task === "calibrating"
-    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V7"]
+    ? ["Validate source", "Validate scan range", "Global template scan", "Fit trajectory", "Refine active frames", "Build consensus mask", "Validate V8"]
     : operationDialog?.task === "sampling"
       ? ["Read source", "Scan candidates", "Score glyph", "Build contact sheet"]
       : ["Prepare profile", "ProPainter FP32", "Encode output", "Verify QA"];
@@ -670,7 +675,7 @@ export default function App() {
         if (disposed) return;
         setProject(savedProject);
         setScanRange(readStoredScanRange(savedProject));
-        setRoiEvidence(readStoredRoiEvidence(savedProject.id));
+        setRoiEvidence(mergeStoredRoiEvidence(savedProject));
         setSelection(
           savedProject.tracking
             ? null
@@ -816,7 +821,7 @@ export default function App() {
     );
     setProject(nextProject);
     setScanRange(readStoredScanRange(nextProject));
-    setRoiEvidence(readStoredRoiEvidence(nextProject.id));
+    setRoiEvidence(mergeStoredRoiEvidence(nextProject));
     setSelection(null);
     selectionFrameRef.current = null;
     lockedBestSampleFrameRef.current = null;
@@ -852,7 +857,7 @@ export default function App() {
       ]);
       activateProject(nextProject);
       setMessage(
-        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V7.",
+        "Video loaded. Run Auto-find & calibrate to create a verified Calibration V8.",
       );
     } catch (openError) {
       setError(getErrorMessage(openError));
@@ -951,9 +956,13 @@ export default function App() {
     const surface = selectionSurfaceRef.current;
     if (!surface) return null;
     const bounds = surface.getBoundingClientRect();
+    // Keep pointer coordinates normalized to the actual, transformed overlay.
+    // Using the cached contentRect here made a scrolled/zoomed preview map a
+    // valid drag to the wrong source Y (the overlay and cached letterbox box
+    // can differ after layout/scroll changes).
     return {
-      x: clamp(event.clientX - bounds.left, 0, bounds.width),
-      y: clamp(event.clientY - bounds.top, 0, bounds.height),
+      x: clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1),
+      y: clamp((event.clientY - bounds.top) / Math.max(1, bounds.height), 0, 1),
     };
   };
 
@@ -961,16 +970,16 @@ export default function App() {
     start: Point,
     end: Point,
   ): BoundingBox | null => {
-    if (!project || !contentRect) return null;
+    if (!project) return null;
     const left = Math.min(start.x, end.x);
     const top = Math.min(start.y, end.y);
     return {
-      x: (left / contentRect.width) * project.video.width,
-      y: (top / contentRect.height) * project.video.height,
+      x: left * project.video.width,
+      y: top * project.video.height,
       width:
-        (Math.abs(end.x - start.x) / contentRect.width) * project.video.width,
+        Math.abs(end.x - start.x) * project.video.width,
       height:
-        (Math.abs(end.y - start.y) / contentRect.height) * project.video.height,
+        Math.abs(end.y - start.y) * project.video.height,
     };
   };
 
@@ -1273,16 +1282,30 @@ export default function App() {
   };
 
   const queueBestQuality = async () => {
-    if (!project || isBusy || project.calibration?.quality.status !== "READY" || !project.calibration.scanRange) return;
+    if (!project || isBusy || !project.calibration?.scanRange) return;
+    const ready = project.calibration.quality.status === "READY";
+    // Older persisted metadata can expose the terminal draft outcome one
+    // render behind.  Once the V8 budget is exhausted, a NEEDS_REVIEW
+    // profile is still explicitly eligible for a review draft; this does
+    // not weaken the backend final-quality gate.
+    const reviewDraft = project.calibration.outcome === "NEEDS_REVIEW_DRAFT"
+      || (project.calibration.quality.status === "NEEDS_REVIEW"
+        && Math.max(
+          project.calibration.roiBudgetUsed ?? 0,
+          project.calibration.roiEvidenceFrames?.length ?? 0,
+        ) >= ROI_BUDGET_MAX);
+    if (!ready && !reviewDraft) return;
     try {
-      const job = await enqueueBestQualityJob(project.id, outputRoot || null, outputName || null, bestReplacement);
+      const job = await enqueueBestQualityJob(project.id, outputRoot || null, outputName || null, bestReplacement, reviewDraft);
       setJobs((current) => [
         ...current.filter((item) => item.id !== job.id),
         job,
       ]);
       navigate("queue");
       setMessage(
-        `Queued ${project.source.fileName} for sequential Best-quality rendering.`,
+        reviewDraft
+          ? `Đã xếp hàng review draft cho ${project.source.fileName}; final vẫn khóa cho đến khi QA đạt.`
+          : `Queued ${project.source.fileName} for sequential Best-quality rendering.`,
       );
     } catch (queueError) {
       setError(getErrorMessage(queueError));
@@ -1312,14 +1335,23 @@ export default function App() {
       const updatedProject = await autoCalibrateBestQuality(project.id, roi, null, evidence, scanRange);
       setProject(updatedProject);
       setProjects((current) => current.map((item) => item.id === updatedProject.id ? updatedProject : item));
+      // Backend persistence is authoritative after every attempt.  Keeping
+      // the local list in sync prevents a reload/retry from resurrecting an
+      // old ROI recommendation list or losing migrated V7 geometry.
+      const persistedEvidence = persistedRoiEvidence(updatedProject);
+      setRoiEvidence(persistedEvidence);
+      window.localStorage.setItem(
+        roiEvidenceStorageKey(updatedProject.id),
+        JSON.stringify(persistedEvidence),
+      );
       const status = updatedProject.calibration?.quality.status;
       if (status === "READY") {
         setRoiFallbackArmed(false);
         setSelection(null);
         setRoiEvidence([]);
         window.localStorage.removeItem(roiEvidenceStorageKey(updatedProject.id));
-        setMessage(`CalibrationProfileV7 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
-        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V7 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
+        setMessage(`CalibrationProfileV8 đã vượt quality gate trong phạm vi ${scanRange.startFrame}–${scanRange.endFrame}; có thể đưa job vào hàng đợi.`);
+        setOperationDialog({ task: "calibrating", status: "success", title: "Calibration V8 đã đạt", detail: "Profile READY. Bạn có thể đưa video vào hàng đợi render." });
       } else {
         const reasons = updatedProject.calibration?.trajectoryGate?.failureReasons?.join(", ") || "TRAJECTORY_UNDERCONSTRAINED";
         const gate = updatedProject.calibration?.trajectoryGate;
@@ -1339,26 +1371,26 @@ export default function App() {
           evidence.length,
           roiEvidence.length,
         );
+        const terminalDraft = updatedProject.calibration?.outcome === "NEEDS_REVIEW_DRAFT";
         const refinementRequired = gate?.failureReasons?.includes("TRAJECTORY_REFINEMENT_REQUIRED")
           || Boolean(
-            roiCount >= ROI_SATURATION_MIN_EVIDENCE
-            && (gate?.confirmedCoverage ?? 0) >= ROI_SATURATION_MIN_CONFIRMED_COVERAGE
-            && (gate?.measuredCoverage ?? 0) >= ROI_SATURATION_MIN_PATH_COVERAGE
-            && (
-              (gate?.maxObservationGap ?? gate?.maxInterpolationGap ?? 0) > 18
-              || ((gate?.residualP95 ?? null) != null && (gate?.residualP95 ?? 0) > 3 * (project.video.width / 1080))
-            ),
-          );
-        const guidance = refinementRequired
-          ? `Đã đủ evidence đại diện (${roiCount} frame); không cần khoanh thêm ROI. Các cụm yếu còn lại được giữ trong diagnostics, còn profile cần refine quỹ đạo tự động trước khi được phép render.`
+            roiCount >= ROI_BUDGET_MAX
+          )
+          || terminalDraft;
+        const guidance = terminalDraft
+          ? `Hệ thống đã kết thúc hai lượt tự động và lượt ROI hiện tại; không cần khoanh thêm ROI. Profile được giữ ở NEEDS_REVIEW_DRAFT để tạo video .review.mp4, QA và danh sách frame/range cần kiểm tra; Final vẫn bị khóa cho tới khi QA đạt.`
+          : refinementRequired
+          ? `Đã đủ evidence đại diện (${roiCount} frame); không cần khoanh thêm ROI. Các cụm yếu còn lại được giữ trong diagnostics, còn profile cần refine quỹ đạo tự động trước khi được phép render. Nếu đã dùng đủ 3 ROI, hệ thống sẽ kết thúc ở NEEDS_REVIEW_DRAFT và tạo video .review.mp4 để kiểm tra.`
           : reviewRanges
           ? `Danh sách đã gom thành ${actionableRanges.length} cụm đại diện chưa có evidence. Mỗi cụm chỉ cần thêm 1 ROI ở frame ưu tiên (không cần chọn tất cả frame); chỉ thêm khi watermark còn xuất hiện, phần sau active interval không cần chọn.`
-          : roiCount >= 12
+          : roiCount >= ROI_BUDGET_MAX
             ? "Bạn đã cung cấp đủ ROI evidence đại diện; không cần khoanh thêm. Quỹ đạo còn cần bước refine tự động trước khi được phép render."
             : "Profile này chưa chứa reviewRanges (lần quét cũ hoặc chưa gửi ROI evidence). Hãy đóng dialog, thêm ROI ở vài đoạn watermark còn nhìn thấy rồi chạy lại để hệ thống tính gợi ý chính xác.";
         setMessage(
-          refinementRequired
-            ? "Đã đủ ROI evidence đại diện; không yêu cầu khoanh thêm. Hệ thống sẽ giữ profile NEEDS_REVIEW cho đến khi refine quỹ đạo và holdout đạt."
+          terminalDraft
+            ? "Đã hết lượt tự động/ROI cho phép; không yêu cầu khoanh thêm. Hệ thống sẽ tạo review draft và giữ final ở trạng thái khóa cho tới khi QA đạt."
+            : refinementRequired
+              ? "Đã đủ ROI evidence đại diện; không yêu cầu khoanh thêm. Hệ thống sẽ giữ profile NEEDS_REVIEW cho đến khi refine quỹ đạo và holdout đạt."
             : "Chưa tìm được quỹ đạo đủ tin cậy. Hãy khoanh ROI tương đối rồi chạy lại; Render vẫn bị khóa.",
         );
         const hardMeasured = gate?.hardMeasuredFrames ?? 0;
@@ -1519,8 +1551,23 @@ export default function App() {
   };
 
   const addRoiEvidence = () => {
+    const replacingExistingEvidence = Boolean(
+      project && roiEvidence.some((item) => item.frame === currentFrame),
+    );
+    if (project?.calibration?.outcome === "NEEDS_REVIEW_DRAFT" && !replacingExistingEvidence) {
+      setMessage(language === "vi"
+        ? "Calibration đã kết thúc ở review draft; không cần khoanh thêm ROI. Hãy mở draft/QA hoặc chạy lại sau khi điều chỉnh phạm vi."
+        : "Calibration ended in a review draft; no more ROI is needed. Open the draft/QA or rerun after adjusting the range.");
+      return;
+    }
     if (!selection || !project || selectionFrameRef.current !== currentFrame || selection.width < 32 || selection.height < 16) {
       setMessage("ROI đã cũ hoặc chưa đủ rộng. Hãy dừng video và vẽ lại trên đúng frame đang xem.");
+      return;
+    }
+    if (!roiEvidence.some((item) => item.frame === currentFrame) && roiEvidence.length >= ROI_BUDGET_MAX) {
+      setMessage(language === "vi"
+        ? "Đã dùng hết 3 ROI evidence. Không cần khoanh thêm; hãy chạy tiếp để hệ thống tự refine và tạo review draft nếu gate chưa đạt."
+        : "The 3-ROI evidence budget is exhausted. Continue calibration; the system will refine automatically and create a review draft if the gate still fails.");
       return;
     }
     setRoiEvidence((current) => {
@@ -1680,8 +1727,8 @@ export default function App() {
       });
       const editedMaskPath = await saveCalibrationMaskEdit(project.id, Array.from(new Uint8Array(await blob.arrayBuffer())));
       // The sample editor is only an evidence/descriptor step.  Always finish
-      // through the same V7 adaptive calibration service used by the main
-      // Best-quality button so a legacy V4 profile can never reach Queue.
+      // through the same V8 adaptive calibration service used by the main
+      // Best-quality button so a legacy profile can never reach Queue.
       const updatedProject = await autoCalibrateBestQuality(
         project.id,
         { ...selectedBestQualitySample.bbox, frame: selectedBestQualitySample.frame },
@@ -1690,6 +1737,7 @@ export default function App() {
         scanRange,
       );
       setProject(updatedProject);
+      setRoiEvidence(mergeStoredRoiEvidence(updatedProject));
       setSelection(updatedProject.watermark.anchor?.bbox ?? selection);
       setBestQualitySamples([]);
       setSelectedBestQualitySample(null);
@@ -1698,8 +1746,8 @@ export default function App() {
       setInspectionMode(false);
       setMessage(
         updatedProject.calibration?.quality.status === "READY"
-          ? "CalibrationProfileV7 đã vượt quality gate; có thể đưa job vào hàng đợi."
-          : "Mask đã lưu. Calibration V7 chưa vượt quality gate; hãy bổ sung ROI hoặc quét lại trước khi Queue.",
+          ? "CalibrationProfileV8 đã vượt quality gate; có thể đưa job vào hàng đợi."
+          : "Mask đã lưu. Calibration V8 chưa vượt quality gate; hãy chạy tiếp refine hoặc đưa review draft vào Queue.",
       );
     } catch (saveError) {
       setError(getErrorMessage(saveError));
@@ -1824,7 +1872,15 @@ export default function App() {
                   className="button secondary"
                   onClick={() => void queueBestQuality()}
                   disabled={
-                    project?.calibration?.quality.status !== "READY" || !project?.calibration?.scanRange || isBusy
+                    (!project?.calibration?.scanRange
+                      || (project.calibration.quality.status !== "READY"
+                        && project.calibration.outcome !== "NEEDS_REVIEW_DRAFT"
+                        && !(project.calibration.quality.status === "NEEDS_REVIEW"
+                          && Math.max(
+                            project.calibration.roiBudgetUsed ?? 0,
+                            project.calibration.roiEvidenceFrames?.length ?? 0,
+                          ) >= ROI_BUDGET_MAX))
+                      || isBusy)
                   }
                 >
                   {t("queueRender")}
@@ -1924,7 +1980,7 @@ export default function App() {
                     <div><span>FFmpeg</span><strong>{runtimeHealth?.ffmpegPath && runtimeHealth?.ffprobePath ? "✓ Ready" : "✗ Missing"}</strong><small>{runtimeHealth?.workspaceRoot ?? "—"}</small></div>
                   </div>
                   {runtimeHealth && runtimeHealth.problems.length > 0 && <div className="runtime-problems"><strong>{language === "vi" ? "Cần xử lý trước khi Calibration/Render:" : "Fix before Calibration/Render:"}</strong><ul>{runtimeHealth.problems.map((problem) => <li key={problem}>{runtimeProblemLabel(problem)}</li>)}</ul></div>}
-                  {runtimeHealth?.status === "READY" && <small className="runtime-ready-note">{language === "vi" ? "Runtime đạt preflight; Queue chỉ mở khi profile V7 cũng vượt quality gate." : "Runtime preflight passed; Queue also requires a V7 profile that passes the quality gate."}</small>}
+              {runtimeHealth?.status === "READY" && <small className="runtime-ready-note">{language === "vi" ? "Runtime đạt preflight; Queue chỉ mở khi profile V8 cũng vượt quality gate." : "Runtime preflight passed; Queue also requires a V8 profile that passes the quality gate."}</small>}
                 </div>
                 <small className="settings-note">{language === "vi" ? "GPU mạnh hơn sẽ tăng resolution/context. Mỗi GPU vẫn chỉ chạy một job ProPainter để giữ chất lượng và tránh OOM." : "A stronger GPU increases resolution/context. Each GPU still runs one ProPainter job to preserve quality and avoid OOM."}</small>
               </>}
@@ -2726,16 +2782,20 @@ export default function App() {
                   ) : (
                     loadingTask !== "sampling" && loadingTask !== "calibrating" && (<>
                       {project?.calibration?.quality.status === "READY" && project.calibration.scanRange ? (
-                        <small className="calibration-ready-note">Calibration V7 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
+                        <small className="calibration-ready-note">Calibration V8 đã đạt. Không cần chọn sample thủ công; bạn có thể đưa job vào Queue.</small>
                       ) : project?.calibration?.quality.status === "READY" ? (
-                        <small className="scan-range-caution">Profile cũ chưa có phạm vi quét hoặc chưa được V7 xác thực; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
+                        <small className="scan-range-caution">Profile cũ chưa có phạm vi quét hoặc chưa được V8 xác thực; hãy chạy lại Auto-find & calibrate trước khi Queue.</small>
                       ) : <small>{t("noValidSample")}</small>}
                       {roiFallbackArmed && <small className="review-queue">{t("roiFallbackActive")}</small>}
-                      <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>{language === "vi" ? "Khoanh ROI tương đối" : "Draw relative ROI"}</button>
+                      {(roiEvidence.length < ROI_BUDGET_MAX || roiEvidence.some((item) => item.frame === currentFrame)) ? (
+                        <button className="button secondary full" onClick={beginRoiFallback} disabled={isBusy}>{language === "vi" ? "Khoanh ROI tương đối" : "Draw relative ROI"}</button>
+                      ) : (
+                        <small className="scan-range-caution">{language === "vi" ? "Đã dùng đủ 3 ROI evidence; không cần khoanh thêm. Hãy chạy tiếp để tự refine hoặc tạo review draft." : "The 3-ROI evidence budget is exhausted; no more drawing is needed. Continue for automatic refinement or a review draft."}</small>
+                      )}
                       {roiFallbackArmed && <>
                         {selection && <button className="button secondary full" onClick={addRoiEvidence} disabled={isBusy}>{language === "vi" ? "Thêm ROI evidence frame này" : "Add ROI evidence for this frame"}</button>}
                         {(selection || roiEvidence.length > 0) && <small className="roi-evidence-count">{language === "vi" ? `Đã có ${roiEvidence.length} frame evidence. Nên thêm các đoạn chuyển động khác nhau.` : `${roiEvidence.length} evidence frame(s) saved. Add frames from different motion segments.`}</small>}
-                        {roiEvidence.length > 0 && <button className="button secondary full" onClick={() => void runAdaptiveCalibration()} disabled={isBusy}>{t("roiFit")}</button>}
+                        {roiEvidence.length > 0 && <button className="button secondary full" onClick={() => void runAdaptiveCalibration()} disabled={isBusy}>{roiEvidence.length >= ROI_BUDGET_MAX ? (language === "vi" ? "Tiếp tục tự động refine" : "Continue automatic refinement") : t("roiFit")}</button>}
                       </>}
                       <button className="button secondary full" onClick={() => void findBestQualitySamples(true)} disabled={isBusy}>{t("scanAnotherPhase")}</button>
                     </>)
@@ -2750,7 +2810,7 @@ export default function App() {
                       onClick={() => void saveBestQualitySample()}
                       disabled={isBusy || !maskEditorReady}
                     >
-                      Save mask & run Calibration V7
+                      Save mask & run Calibration V8
                     </button>
                     </div>
                   )}
