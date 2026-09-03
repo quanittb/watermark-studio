@@ -415,14 +415,21 @@ where
     progress("Decoding final output for QA", 4, 5);
     check_cancel(cancel)?;
     ffmpeg::verify_video_decode(&draft)?;
-    if let Err(first_qa_error) = run_quality_qa(
+    let trajectory_requires_fallback = trajectory_requires_opaque_fallback(&profile_path)?;
+    let first_qa_result = run_quality_qa(
         &python_runtime,
         &qa_script,
         project,
         &profile_path,
         &draft,
         cancel,
-    ) {
+    );
+    if trajectory_requires_fallback || first_qa_result.is_err() {
+        let first_qa_error = first_qa_result.err().unwrap_or_else(|| {
+            AppError::QualityNeedsReview(
+                "Calibration trajectory did not pass; running bounded opaque fallback.".to_string(),
+            )
+        });
         // A failed inpaint is not silently promoted.  Instead perform one
         // deterministic, opaque badge pass over the exact frames identified
         // by the independent full-frame QA.  This guarantees that gaps
@@ -565,6 +572,20 @@ where
 
     progress("Best-quality render complete", 5, 5);
     Ok(output)
+}
+
+fn trajectory_requires_opaque_fallback(profile_path: &Path) -> Result<bool, AppError> {
+    let body = fs::read_to_string(profile_path)?;
+    let profile: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        AppError::CalibrationCorrupt(format!("Calibration profile JSON is invalid: {error}"))
+    })?;
+    let status = profile
+        .get("trajectoryGate")
+        .and_then(|gate| gate.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    Ok(!matches!(status.as_str(), "READY" | "PASSED"))
 }
 
 struct WorkspaceCleanup(PathBuf);

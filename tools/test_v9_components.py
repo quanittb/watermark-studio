@@ -17,6 +17,7 @@ import numpy as np
 
 import calibrate_trajectory_v9 as v9
 import quality_qa_v9 as qa
+import apply_opaque_badge as badge
 
 
 class V9ComponentTests(unittest.TestCase):
@@ -52,6 +53,24 @@ class V9ComponentTests(unittest.TestCase):
         background = {"x": 80, "y": 300, "width": 230, "height": 70}
         self.assertTrue(qa.detections_match(source, same))
         self.assertFalse(qa.detections_match(source, background))
+
+    def test_badge_coverage_requires_the_source_glyph_to_be_inside_plate(self) -> None:
+        source = {"x": 700, "y": 1400, "width": 190, "height": 58}
+        covering_plate = {"x": 690, "y": 1390, "width": 210, "height": 78}
+        misplaced_plate = {"x": 40, "y": 200, "width": 210, "height": 78}
+        self.assertGreaterEqual(qa.box_intersection_ratio(source, covering_plate), 0.99)
+        self.assertLess(qa.box_intersection_ratio(source, misplaced_plate), 0.01)
+
+    def test_disconnected_badge_path_is_rejected(self) -> None:
+        first = {"x": 100, "y": 500, "width": 190, "height": 58, "rawScore": 0.8, "glyphCorrelation": 0.6, "glyphIou": 0.3, "contamination": 0.2}
+        later = {"x": 700, "y": 1200, "width": 190, "height": 58, "rawScore": 0.8, "glyphCorrelation": 0.6, "glyphIou": 0.3, "contamination": 0.2}
+        result = badge._fit_fallback_path(
+            [(0, [first]), (120, []), (240, [later])],
+            300,
+            set(range(0, 241)),
+            first,
+        )
+        self.assertEqual(result, {})
 
     def test_outside_mask_ssim_excludes_removed_glyph(self) -> None:
         canonical = qa.v6.load_canonical()

@@ -98,15 +98,20 @@ def _qa_templates(canonical: np.ndarray, base: float, ax: float, ay: float) -> l
     return cached
 
 
-def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | None:
-    """Search the whole frame at a bounded analysis resolution and refine peaks.
+def detect_candidates_fast(
+    frame: np.ndarray,
+    canonical: np.ndarray,
+    limit: int = 8,
+    peaks_per_scale: int = 4,
+) -> list[dict[str, Any]]:
+    """Return distinct full-frame Learna proposals at bounded cost.
 
     QA still reads every source/output frame and evaluates each selected box at
     source resolution.  The proposal pass uses the same 405x720 analysis
     resolution as calibration so small, blurred glyphs are not lost during a
     second resize; the bounded five-scale pyramid is the performance limit.
     """
-    best: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     positive_feature, negative_feature, ax, ay, base = _qa_features(frame)
     templates = _qa_templates(canonical, base, ax, ay)
@@ -122,7 +127,9 @@ def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | No
             # survive a stronger subtitle/texture peak at the same scale.
             # The analysis pyramid is bounded, so four peaks remains cheaper
             # than the former full-resolution twelve-scale scan.
-            for raw, (tx, ty) in v6.top_matches(response, template.shape[1], template.shape[0], 4):
+            for raw, (tx, ty) in v6.top_matches(
+                response, template.shape[1], template.shape[0], max(1, peaks_per_scale)
+            ):
                 x = tx / ax + v6.MASK_BORDER_X * base * scale
                 y = ty / ay + v6.MASK_BORDER_Y * base * scale
                 width = v6.CANONICAL_WIDTH * base * scale
@@ -137,9 +144,31 @@ def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | No
                 # actual letter geometry agrees with Learna AI.
                 score = float(corr + 2.0 * iou - 0.55 * contamination - (0.18 if large else 0.0))
                 candidate = {"x": float(x), "y": float(y), "width": float(width), "height": float(height), "rawScore": float(raw), "glyphCorrelation": float(corr), "glyphIou": float(iou), "contamination": float(contamination), "geometryScore": score, "polarity": polarity}
-                if best is None or (candidate["geometryScore"] + candidate["rawScore"] * 0.2) > (best["geometryScore"] + best["rawScore"] * 0.2):
-                    best = candidate
-    return best
+                candidates.append(candidate)
+    candidates.sort(
+        key=lambda item: float(item["geometryScore"]) + 0.2 * float(item["rawScore"]),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if any(
+            float(np.hypot(
+                float(candidate["x"]) - float(other["x"]),
+                float(candidate["y"]) - float(other["y"]),
+            )) < max(float(candidate["width"]), float(candidate["height"])) * 0.45
+            for other in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= max(1, limit):
+            break
+    return selected
+
+
+def detect_fast(frame: np.ndarray, canonical: np.ndarray) -> dict[str, Any] | None:
+    """Search the whole frame at a bounded analysis resolution and refine peaks."""
+    candidates = detect_candidates_fast(frame, canonical, limit=1)
+    return candidates[0] if candidates else None
 
 
 def _ssim_valid(a: np.ndarray, b: np.ndarray, valid: np.ndarray) -> float:
@@ -242,6 +271,33 @@ def detections_match(source_row: dict[str, Any] | None, output_row: dict[str, An
     return iou >= 0.08 or distance <= max(48.0, 0.65 * max(sw, ow, sh, oh))
 
 
+def box_intersection_ratio(
+    first: dict[str, Any] | None,
+    second: dict[str, Any] | None,
+) -> float:
+    """Return intersection over the first box's area.
+
+    Badge QA uses this only to prove that an opaque replacement plate covers
+    the independently detected source glyph.  It must not be confused with
+    calibration IoU: a plate is intentionally larger than the glyph.
+    """
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return 0.0
+    try:
+        fx, fy = float(first.get("x", 0.0)), float(first.get("y", 0.0))
+        fw, fh = float(first.get("width", 0.0)), float(first.get("height", 0.0))
+        sx, sy = float(second.get("x", 0.0)), float(second.get("y", 0.0))
+        sw, sh = float(second.get("width", 0.0)), float(second.get("height", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    first_area = max(0.0, fw) * max(0.0, fh)
+    if first_area <= 0.0 or sw <= 0.0 or sh <= 0.0:
+        return 0.0
+    ix = max(0.0, min(fx + fw, sx + sw) - max(fx, sx))
+    iy = max(0.0, min(fy + fh, sy + sh) - max(fy, sy))
+    return (ix * iy) / first_area
+
+
 def panel(frame: int, source: np.ndarray, output: np.ndarray, source_row: dict[str, Any] | None, output_row: dict[str, Any] | None, active: bool) -> np.ndarray:
     row = source_row or output_row or {"x": 0, "y": 0, "width": 256, "height": 80}
     x0 = max(0, int(round(float(row.get("x", 0)) - 20)))
@@ -313,12 +369,20 @@ def main() -> None:
     previous_badge = False
     badge_manifest_path = a.output.with_suffix(".badge-manifest.json")
     badge_frames: set[int] = set()
+    badge_boxes: dict[int, dict[str, Any]] = {}
+    badge_cover_missing: list[int] = []
     if badge_manifest_path.is_file():
         try:
             badge_payload = json.loads(badge_manifest_path.read_text(encoding="utf-8"))
             badge_frames = {int(value) for value in badge_payload.get("appliedFrames", [])}
+            badge_boxes = {
+                int(frame): value
+                for frame, value in (badge_payload.get("appliedBoxes") or {}).items()
+                if isinstance(value, dict)
+            }
         except (OSError, ValueError, TypeError):
             badge_frames = set()
+            badge_boxes = {}
     decoded = 0
     try:
         for frame in range(frame_count):
@@ -336,8 +400,39 @@ def main() -> None:
             # that frame inactive.  Frames outside the range remain explicit
             # passthrough and are reported as unchecked by policy.
             in_scan = start <= frame <= end
-            residual = bool(in_scan and source_present and detections_match(source_row, output_row) and output_row["geometryScore"] >= RESIDUAL_GEOMETRY and output_row["rawScore"] >= RESIDUAL_RAW)
             badge_applied = frame in badge_frames
+            # The opaque QuanPH plate intentionally replaces the full source
+            # glyph.  Its artwork may still correlate with the Learna
+            # descriptor, so do not classify the intentional plate as an old
+            # watermark residual; manifest coverage and source-side detection
+            # remain hard gates for these frames.
+            badge_box = badge_boxes.get(frame)
+            badge_cover_ratio = box_intersection_ratio(source_row, badge_box)
+            badge_cover_valid = bool(
+                badge_applied
+                and badge_box
+                and source_present
+                and badge_cover_ratio >= 0.80
+            )
+            if badge_applied and not badge_cover_valid and in_scan and (source_present or active):
+                badge_cover_missing.append(frame)
+            # The intentional opaque plate may contain artwork that resembles
+            # the canonical glyph.  Ignore an output candidate only when it
+            # is inside a plate proven to cover the source glyph; a misplaced
+            # plate must remain a residual/failure.
+            output_inside_badge = bool(
+                badge_cover_valid
+                and output_row
+                and box_intersection_ratio(output_row, badge_box) >= 0.55
+            )
+            residual = bool(
+                in_scan
+                and source_present
+                and not output_inside_badge
+                and detections_match(source_row, output_row)
+                and output_row["geometryScore"] >= RESIDUAL_GEOMETRY
+                and output_row["rawScore"] >= RESIDUAL_RAW
+            )
             # The opaque badge is an intentional replacement plate. It must be
             # excluded from the inpaint outside-mask similarity/flicker gate;
             # the independent residual detector remains a hard gate there.
@@ -357,7 +452,7 @@ def main() -> None:
                 flicker = float(np.mean(np.abs(output.astype(np.float32) - previous_output.astype(np.float32))) / 255.0)
             previous_output = output.copy()
             previous_badge = badge_applied
-            row = {"frame": frame, "active": active, "maskRequired": bool(frame_data[frame].get("maskRequired", False)), "sourceDetection": source_row, "outputDetection": output_row, "sourcePresent": source_present, "residual": residual, "outsideMaskSsim": ssim, "temporalFlicker": flicker, "maskApplied": bool(frame_data[frame].get("maskRequired", False)), "badgeApplied": badge_applied}
+            row = {"frame": frame, "active": active, "maskRequired": bool(frame_data[frame].get("maskRequired", False)), "sourceDetection": source_row, "outputDetection": output_row, "sourcePresent": source_present, "residual": residual, "outsideMaskSsim": ssim, "temporalFlicker": flicker, "maskApplied": bool(frame_data[frame].get("maskRequired", False)), "badgeApplied": badge_applied, "badgeCoverageRatio": badge_cover_ratio, "badgeCoverageValid": badge_cover_valid}
             rows.append(row)
             # Keep contact-sheet source/output pixels bounded.  A bad render
             # can legitimately flag every active frame; retaining every full
@@ -390,7 +485,12 @@ def main() -> None:
         if row["temporalFlicker"] > MAX_FLICKER: reasons.append("temporal_flicker")
         if not row["maskApplied"]: reasons.append("mask_not_applied")
         failed_reasons[str(row["frame"])] = reasons
-    metrics = {"decodedFrames": decoded, "activeFrames": len(required), "maskApplicationCoverage": (sum(bool(row["maskApplied"]) for row in required) / len(required) if required else 0.0), "residualPassCoverage": (sum(not row["residual"] for row in required) / len(required) if required else 0.0), "oldLearnaResidualDetections": sum(bool(row["residual"]) for row in required), "failedFrames": failed_frames, "unmeasurableFrames": [], "failureReasons": failed_reasons, "minOutsideMaskSsim": min((row["outsideMaskSsim"] for row in required), default=1.0), "maxTemporalFlicker": max((row["temporalFlicker"] for row in required), default=0.0), "coverageRate": (sum(not row["residual"] for row in required) / len(required) if required else 0.0), "scanRangeCoverage": len(required) / max(1, end - start + 1), "activeIntervals": intervals, "excludedFrameCount": frame_count - (end - start + 1), "outsideRangeUnchecked": start != 0 or end != frame_count - 1}
+    for frame in badge_cover_missing:
+        failed_reasons.setdefault(str(frame), []).append("badge_does_not_cover_source")
+    failed_frames = sorted(set(failed_frames).union(badge_cover_missing))
+    badge_rows = [row for row in required if row.get("badgeApplied")]
+    valid_badges = sum(bool(row.get("badgeCoverageValid")) for row in badge_rows)
+    metrics = {"decodedFrames": decoded, "activeFrames": len(required), "maskApplicationCoverage": (sum(bool(row["maskApplied"]) for row in required) / len(required) if required else 0.0), "residualPassCoverage": (sum(not row["residual"] for row in required) / len(required) if required else 0.0), "oldLearnaResidualDetections": sum(bool(row["residual"]) for row in required), "failedFrames": failed_frames, "unmeasurableFrames": [], "failureReasons": failed_reasons, "badgeCoverageMissingFrames": sorted(set(badge_cover_missing)), "badgeCoverageValidRate": (valid_badges / len(badge_rows) if badge_rows else 1.0), "minOutsideMaskSsim": min((row["outsideMaskSsim"] for row in required), default=1.0), "maxTemporalFlicker": max((row["temporalFlicker"] for row in required), default=0.0), "coverageRate": (sum(not row["residual"] for row in required) / len(required) if required else 0.0), "scanRangeCoverage": len(required) / max(1, end - start + 1), "activeIntervals": intervals, "excludedFrameCount": frame_count - (end - start + 1), "outsideRangeUnchecked": start != 0 or end != frame_count - 1}
     manifest_path = a.output.with_suffix(".render-manifest.json")
     manifest_ok = manifest_path.is_file()
     if manifest_ok:
